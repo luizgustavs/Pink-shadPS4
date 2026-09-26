@@ -17,9 +17,9 @@ namespace Serialization {
 // descriptors, DMA fault bitmap uses bounds checks and atomics. ShaderMetaVersion 6: meta records the codegen
 // settings key; Info gains uses_loop_cap. ShaderMetaVersion 7: HwFragmentRuntimeInfo gains
 // early_fragment_tests, InfoPersistent gains sharp_tables and ImageResource the descriptor array fields (all
-// stored raw)
+// stored raw). ShaderMetaVersion 8: SharpFetch gains summary and FetchShaderData changes layout (#5112)
 static constexpr u32 ShaderBinaryVersion = 6u;
-static constexpr u32 ShaderMetaVersion = 7u;
+static constexpr u32 ShaderMetaVersion = 8u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 
@@ -34,7 +34,8 @@ u64 CodegenSettingsKey() {
            (u64{EmulatorSettings.IsLdsBarrierUniformReadlane()} << 33) |
            (u64{EmulatorSettings.IsEarlyFragmentTestsFromZOrder()} << 34) |
            (u64{Shader::DynamicTsharpArraySize()} << 35) | // 7 bits, at most 64
-           (u64{EmulatorSettings.IsWave64UniformBranches()} << 42);
+           (u64{EmulatorSettings.IsWave64UniformBranches()} << 42) |
+           (u64{EmulatorSettings.IsInlineFetchShader()} << 43);
 }
 } // namespace
 
@@ -119,7 +120,6 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
 }
 
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
-                    std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                     Shader::StageSpecialization& spec, size_t& perm_idx) {
     Serialization::Reader meta{ar};
 
@@ -149,8 +149,6 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     if (!info.Deserialize(ar)) {
         return false;
     }
-
-    fetch_shader_data = spec.fetch_shader_data;
     return true;
 }
 
@@ -278,7 +276,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
     infos.fill(nullptr);
     modules.fill(nullptr);
-    fetch_shader.reset();
+    fetch_shader = nullptr;
 
     return true;
 }
@@ -288,7 +286,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
     size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, fetch_shader, spec, perm_idx)) {
+    if (!LoadShaderMeta(ar, program->info, spec, perm_idx)) {
         return false;
     }
 
@@ -332,6 +330,9 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 
     infos[stage] = &it_pgm.value()->info;
     modules[stage] = module;
+    if (auto& fetch = it_pgm.value()->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
+        fetch_shader = &fetch;
+    }
 
     return true;
 }
@@ -495,9 +496,9 @@ void StageSpecialization::Serialize(Serialization::Archive& ar) const {
 
     spec.Write(bitset.to_string());
 
-    if (fetch_shader_data) {
-        spec.Write(sizeof(*fetch_shader_data));
-        fetch_shader_data->Serialize(ar);
+    if (!fetch_shader_data.Empty()) {
+        spec.Write(sizeof(fetch_shader_data));
+        fetch_shader_data.Serialize(ar);
     } else {
         spec.Write(size_t{0});
     }

@@ -11,6 +11,7 @@
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/error.h"
+#include "common/multi_level_page_table.h"
 #include "common/perf_stats.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
@@ -265,7 +266,7 @@ struct PageManager::Impl {
         static constexpr size_t PAGE_BITS = PM_PAGE_BITS;
         static constexpr bool NULL_CHECK = false;
     };
-    MultiLevelPageTable<PageTraits> cached_pages;
+    Common::MultiLevelPageTable<PageTraits> cached_pages;
     struct MutexTraits {
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
         using Entry = Common::AdaptiveMutex;
@@ -277,7 +278,7 @@ struct PageManager::Impl {
         static constexpr size_t PAGE_BITS = PM_PAGE_BITS;
         static constexpr bool NULL_CHECK = false;
     };
-    MultiLevelPageTable<MutexTraits> locks;
+    Common::MultiLevelPageTable<MutexTraits> locks;
 };
 
 #ifdef __linux__

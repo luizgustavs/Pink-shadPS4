@@ -459,6 +459,7 @@ struct GPUSettings {
     // Record GPU commands and submits to identify the first unfinished submit after device loss
     // Add NVIDIA checkpoints when available; recording adds a small cost per command
     Setting<bool> gpu_checkpoints{false};
+    Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -499,6 +500,7 @@ struct GPUSettings {
             make_override<GPUSettings>("wave64_uniform_branches",
                                        &GPUSettings::wave64_uniform_branches),
             make_override<GPUSettings>("gpu_checkpoints", &GPUSettings::gpu_checkpoints),
+            make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
 };
@@ -808,6 +810,7 @@ public:
     SETTING_FORWARD(m_gpu, DynamicTsharpArraySize, dynamic_tsharp_array_size)
     SETTING_FORWARD_BOOL(m_gpu, Wave64UniformBranches, wave64_uniform_branches)
     SETTING_FORWARD_BOOL(m_gpu, GpuCheckpoints, gpu_checkpoints)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {
