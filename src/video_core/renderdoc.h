@@ -21,6 +21,9 @@ void EndCapture();
 /// Triggers capturing process.
 void TriggerCapture();
 
+/// Triggers the captures scheduled by SHADPS4_RDOC_CAPTURE_AT. Called once per presented frame
+void PollScheduledCaptures();
+
 /// Sets output directory for captures
 void SetOutputDir(const std::filesystem::path& path, const std::string& prefix);
 

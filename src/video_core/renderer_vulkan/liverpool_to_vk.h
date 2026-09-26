@@ -63,6 +63,9 @@ std::span<const SurfaceFormatInfo> SurfaceFormats();
 
 vk::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format);
 
+/// Like SurfaceFormat, but returns eUndefined for an unknown pair instead of asserting
+vk::Format TrySurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format);
+
 struct DepthFormatInfo {
     AmdGpu::DepthBuffer::ZFormat z_format;
     AmdGpu::DepthBuffer::StencilFormat stencil_format;

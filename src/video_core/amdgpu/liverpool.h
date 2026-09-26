@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
@@ -191,6 +192,8 @@ private:
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
     void ProcessCommands();
+    /// Perf stats: a label written by the submission `qid` is processing (label_lag_ms)
+    void RecordLabelLag(u32 qid);
     void Process(std::stop_token stoken);
 
     struct GpuQueue {
@@ -200,6 +203,8 @@ private:
         std::vector<u32> dcb_buffer;
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
+        // With SHADPS4_PERF_STATS: when the guest submitted each entry of `submits`
+        std::queue<std::chrono::steady_clock::time_point> submit_times{};
         ComputeProgram cs_state{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};

@@ -6,7 +6,12 @@
 #include "core/emulator_settings.h"
 #include "video_core/renderdoc.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <string>
+#include <vector>
 #include <renderdoc_app.h>
 
 #ifdef _WIN32
@@ -19,6 +24,13 @@
 
 namespace VideoCore {
 
+/// Offline RenderDoc loading: the setting, or SHADPS4_RDOC_CAPTURE_AT for scripted captures (so harness runs
+/// keep the reference configuration)
+static bool WantsRenderDoc() {
+    return EmulatorSettings.IsRenderdocEnabled() ||
+           std::getenv("SHADPS4_RDOC_CAPTURE_AT") != nullptr;
+}
+
 enum class CaptureState {
     Idle,
     Triggered,
@@ -27,6 +39,8 @@ enum class CaptureState {
 static CaptureState capture_state{CaptureState::Idle};
 static std::atomic<u32> screenshot_game_only_count{0};
 static std::atomic<u32> screenshot_with_overlays_count{0};
+// Reference for SHADPS4_RDOC_CAPTURE_AT; initialized during static init, i.e. process launch
+static const auto process_start = std::chrono::steady_clock::now();
 
 RENDERDOC_API_1_6_0* rdoc_api{};
 
@@ -35,7 +49,7 @@ void LoadRenderDoc() {
 
     // Check if we are running by RDoc GUI
     HMODULE mod = GetModuleHandleA("renderdoc.dll");
-    if (!mod && EmulatorSettings.IsRenderdocEnabled()) {
+    if (!mod && WantsRenderDoc()) {
         // If enabled in config, try to load RDoc runtime in offline mode
         HKEY h_reg_key;
         LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
@@ -71,7 +85,7 @@ void LoadRenderDoc() {
 #endif
     // Check if we are running by RDoc GUI
     void* mod = dlopen(RENDERDOC_LIB, RTLD_NOW | RTLD_NOLOAD);
-    if (!mod && EmulatorSettings.IsRenderdocEnabled()) {
+    if (!mod && WantsRenderDoc()) {
         // If enabled in config, try to load RDoc runtime in offline mode
         if ((mod = dlopen(RENDERDOC_LIB, RTLD_NOW))) {
             const auto RENDERDOC_GetAPI =
@@ -110,9 +124,63 @@ void EndCapture() {
     }
 
     if (capture_state == CaptureState::InProgress) {
-        rdoc_api->EndFrameCapture(nullptr, nullptr);
+        const u32 ok = rdoc_api->EndFrameCapture(nullptr, nullptr);
         capture_state = CaptureState::Idle;
+        // Report the file so scripts can collect it
+        const u32 count = rdoc_api->GetNumCaptures();
+        // GetCapture writes the whole path, so ask for its length (with the terminator) first
+        u32 length = 0;
+        std::string path;
+        if (ok && count > 0 && rdoc_api->GetCapture(count - 1, nullptr, &length, nullptr) == 1 &&
+            length != 0) {
+            path.resize(length);
+        }
+        if (!path.empty() && rdoc_api->GetCapture(count - 1, path.data(), &length, nullptr) == 1) {
+            path.erase(path.find_last_not_of('\0') + 1);
+            LOG_WARNING(Render, "RenderDoc capture written: {}", path);
+        } else {
+            LOG_WARNING(Render, "RenderDoc capture ended (ok={}, captures={})", ok, count);
+        }
     }
+}
+
+void PollScheduledCaptures() {
+    // SHADPS4_RDOC_CAPTURE_AT=<sec>[,<sec>...]: trigger a capture of the next guest frame once each time mark
+    // (seconds since launch) passes. Loads RenderDoc offline when it is installed
+    static std::vector<double> marks = [] {
+        std::vector<double> values;
+        if (const char* env = std::getenv("SHADPS4_RDOC_CAPTURE_AT")) {
+            const std::string text{env};
+            size_t start = 0;
+            while (start < text.size()) {
+                const size_t end = text.find(',', start);
+                const std::string item = text.substr(start, end - start);
+                if (!item.empty()) {
+                    values.push_back(std::strtod(item.c_str(), nullptr));
+                }
+                if (end == std::string::npos) {
+                    break;
+                }
+                start = end + 1;
+            }
+            std::sort(values.begin(), values.end(), std::greater<>{});
+        }
+        return values;
+    }();
+    if (marks.empty() || !rdoc_api || capture_state != CaptureState::Idle) {
+        return;
+    }
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - process_start).count();
+    if (elapsed < marks.back()) {
+        return;
+    }
+    // Skip marks that passed while a capture was running; one capture per poll
+    while (!marks.empty() && marks.back() <= elapsed) {
+        marks.pop_back();
+    }
+    LOG_WARNING(Render, "RenderDoc scheduled capture triggered at {:.1f}s", elapsed);
+    TriggerCapture();
 }
 
 void TriggerCapture() {

@@ -491,7 +491,9 @@ struct Sampler {
         case AnisoRatio::Sixteen:
             return 16.0f;
         default:
-            UNREACHABLE();
+            // Bits 9-11 hold 3 bits but only 0-4 have a defined ratio. Hardware treats 5-7 as the maximum and
+            // SotC emits them; falling back to 16x keeps the sampler valid
+            return 16.0f;
         }
     }
 };

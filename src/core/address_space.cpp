@@ -1,13 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
 #include <map>
+#include <boost/icl/interval_map.hpp>
 #include <fmt/format.h>
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/error.h"
+#include "common/perf_stats.h"
 #include "core/address_space.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/memory.h"
@@ -312,6 +316,7 @@ struct AddressSpace::Impl {
     }
 
     void SplitRegion(VAddr virtual_addr, u64 size) {
+        Common::PerfStats::Add(Common::PerfStats::Id::Splits);
         // First, get the region this range covers
         auto it = std::prev(regions.upper_bound(virtual_addr));
 
@@ -319,6 +324,12 @@ struct AddressSpace::Impl {
         // containing the full requested range. If not, then something is mapped here.
         ASSERT_MSG(it->second.base + it->second.size >= virtual_addr + size,
                    "Cannot fit region into one placeholder");
+
+        // Every piece of a mapped region is mapped again below with the region's map-time protection, which
+        // loses the protections applied later through Protect()
+        const VAddr split_base = it->second.base;
+        const u64 split_size = it->second.size;
+        const bool split_mapped = it->second.is_mapped;
 
         // If the region is mapped, we need to unmap first before we can modify the placeholders.
         if (it->second.is_mapped) {
@@ -395,6 +406,84 @@ struct AddressSpace::Impl {
         if (it->second.is_mapped) {
             MapRegion(&it->second);
         }
+
+        if (split_mapped) {
+            RestoreProtections(split_base, split_size);
+        }
+    }
+
+    /// Records protections that differ from the map-time protection of their region, so that
+    /// RestoreProtections can apply them again after a split remaps the region
+    void RecordProtection(VAddr addr, u64 size, DWORD flags, DWORD map_flags) {
+        if (!EmulatorSettings.IsPreserveSplitProtection()) {
+            return;
+        }
+        const auto interval = boost::icl::interval<VAddr>::right_open(addr, addr + size);
+        // interval_map combines overlapping values; erase first so the new flags replace them
+        protection_overrides.erase(interval);
+        if (flags != map_flags) {
+            protection_overrides.add({interval, flags});
+        }
+    }
+
+    void RestoreProtections(VAddr base, u64 size) {
+        if (!EmulatorSettings.IsPreserveSplitProtection()) {
+            return;
+        }
+        // VirtualProtect cannot span two views, and the split left one view per piece
+        u64 restored = 0;
+        const VAddr end = base + size;
+        for (auto it = std::prev(regions.upper_bound(base)); it != regions.end() && it->first < end;
+             ++it) {
+            const auto& region = it->second;
+            if (!region.is_mapped) {
+                continue;
+            }
+            const auto piece = boost::icl::interval<VAddr>::right_open(
+                std::max(region.base, base), std::min(region.base + region.size, end));
+            for (const auto& [interval, flags] : protection_overrides & piece) {
+                const VAddr start = boost::icl::first(interval);
+                const u64 length = boost::icl::last_next(interval) - start;
+                DWORD old_flags{};
+                if (!VirtualProtectEx(process, LPVOID(start), length, flags, &old_flags)) {
+                    LOG_ERROR(Core, "Failed to restore protection {:#x} for {:#x}+{:#x}: {}",
+                              flags, start, length, Common::GetLastErrorMsg());
+                    continue;
+                }
+                ++restored;
+            }
+        }
+        ReportRestore(base, size, restored);
+    }
+
+    static void ReportRestore(VAddr base, u64 size, u64 restored) {
+        static std::atomic_flag first_report;
+        static std::atomic<u64> splits{0};
+        static std::atomic<u64> ranges{0};
+        static std::atomic<s64> last_report_s{0};
+        if (restored == 0) {
+            return;
+        }
+        if (!first_report.test_and_set()) {
+            LOG_WARNING(Core,
+                        "Workaround preserve_split_protection: restored {} protection ranges "
+                        "after splitting {:#x}+{:#x}",
+                        restored, base, size);
+        }
+        splits.fetch_add(1, std::memory_order_relaxed);
+        ranges.fetch_add(restored, std::memory_order_relaxed);
+        const s64 now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+        s64 last = last_report_s.load(std::memory_order_relaxed);
+        if (last == 0) {
+            last_report_s.compare_exchange_strong(last, now_s);
+        } else if (now_s - last >= 60 && last_report_s.compare_exchange_strong(last, now_s)) {
+            LOG_WARNING(Core,
+                        "Workaround preserve_split_protection: {} splits restored {} protection "
+                        "ranges in the last minute",
+                        splits.exchange(0), ranges.exchange(0));
+        }
     }
 
     void* Map(VAddr virtual_addr, PAddr phys_addr, u64 size, ULONG prot, s32 fd = -1) {
@@ -417,6 +506,8 @@ struct AddressSpace::Impl {
         region.phys_base = phys_addr;
         region.prot = prot;
         region.fd = fd;
+        protection_overrides.erase(
+            boost::icl::interval<VAddr>::right_open(virtual_addr, virtual_addr + size));
         return MapRegion(&region);
     }
 
@@ -502,6 +593,8 @@ struct AddressSpace::Impl {
             remaining_size -= size_to_unmap;
             current_addr += size_to_unmap;
         }
+        protection_overrides.erase(
+            boost::icl::interval<VAddr>::right_open(virtual_addr, virtual_addr + *size));
 
         // Coalesce any free space produced from these unmaps.
         CoalesceFreeRegions(virtual_addr);
@@ -550,7 +643,7 @@ struct AddressSpace::Impl {
         const VAddr virtual_end = virtual_addr + size;
         auto it = --regions.upper_bound(virtual_addr);
         ASSERT_MSG(it != regions.end(), "addr {:#x} out of bounds", virtual_addr);
-        for (; it->first < virtual_end; it++) {
+        for (; it != regions.end() && it->first < virtual_end; it++) {
             if (!it->second.is_mapped) {
                 continue;
             }
@@ -564,6 +657,7 @@ struct AddressSpace::Impl {
                     "{:#x}, error {}",
                     virtual_addr, size, Common::GetLastErrorMsg());
             }
+            RecordProtection(range_addr, range_size, new_flags, region.prot);
         }
     }
 
@@ -587,6 +681,9 @@ struct AddressSpace::Impl {
     u8* user_base{};
     u64 user_size{};
     std::map<VAddr, MemoryRegion> regions;
+    // Protections set through Protect() that differ from their region's map-time protection (per-game
+    // preserve_split_protection only)
+    boost::icl::interval_map<VAddr, DWORD> protection_overrides;
 };
 #else
 

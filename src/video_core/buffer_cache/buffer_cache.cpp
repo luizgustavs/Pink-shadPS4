@@ -2,12 +2,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <cstring>
+#include <optional>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
+#include "common/guest_write_journal.h"
+#include "common/perf_stats.h"
 #include "core/debug_state.h"
+#include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/buffer_cache/bpe_heap_guard.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
@@ -54,6 +61,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       memory_tracker{std::make_unique<MemoryTracker>(tracker)},
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
+      loop_cap_buffer{instance, 0, 256, MemoryType::HostCached, "Loop Cap Buffer"},
       memory_semaphore{instance} {
     const vk::BufferCreateInfo probe_ci = {
         .flags =
@@ -82,9 +90,19 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         (blocks_per_arena_page * NUM_ARENA_PAGES) * sizeof(vk::DeviceAddress);
     fault_manager = std::make_unique<FaultManager>(instance, scheduler, *this, block_shift,
                                                    blocks_per_arena_page * NUM_ARENA_PAGES);
+    // Shaders atomically set bits in the fault bitmap. Device-local allocation contents are undefined, so the
+    // initial state must be made explicitly empty
+    const auto* fault_buffer = fault_manager->GetFaultBuffer();
+    runtime.FillBuffer(fault_buffer, 0u, fault_buffer->SizeBytes(), 0u);
     bda_pagetable_buffer = std::make_unique<Buffer>(
         instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
+
+    std::memset(loop_cap_buffer.mapped_data.data(), 0, loop_cap_buffer.mapped_data.size());
+    loop_cap_buffer.Flush(0, loop_cap_buffer.SizeBytes());
+    if (const u32 cap = EmulatorSettings.GetComputeLoopCap()) {
+        LOG_WARNING(Render_Vulkan, "Workaround compute_loop_cap enabled: {} back edges", cap);
+    }
 }
 
 BufferCache::~BufferCache() = default;
@@ -93,17 +111,88 @@ void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
     }
+    ReportLoopCapHits();
     DebugState.num_batches_per_frame = std::exchange(num_flushes_per_frame, 0u);
+}
+
+static void ReportHeapGuardHit(VAddr addr, u64 bytes) {
+    // Only the GPU command processor thread downloads memory
+    static u64 hits = 0;
+    static u64 total = 0;
+    static auto last_report = std::chrono::steady_clock::now();
+    ++hits;
+    total += bytes;
+    const auto now = std::chrono::steady_clock::now();
+    if (hits == 1) {
+        LOG_WARNING(Render, "Workaround bpe_heap_guard: kept CPU heap metadata under a readback "
+                            "at {:#x} ({:#x} differing bytes)",
+                    addr, bytes);
+        last_report = now;
+    } else if (now - last_report >= std::chrono::minutes{1}) {
+        LOG_WARNING(Render,
+                    "Workaround bpe_heap_guard: {} readbacks kept heap metadata so far ({:#x} "
+                    "bytes), last at {:#x}",
+                    hits, total, addr);
+        last_report = now;
+    }
+}
+
+void BufferCache::ReportLoopCapHits() {
+    const u32 cap = EmulatorSettings.GetComputeLoopCap();
+    if (cap == 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - loop_cap_last_check < std::chrono::seconds{1}) {
+        return;
+    }
+    loop_cap_last_check = now;
+    // The shaders only increment the counter, so the CPU never writes it back and cannot lose hits that land
+    // between the read and a reset
+    loop_cap_buffer.Invalidate(0, loop_cap_buffer.SizeBytes());
+    std::array<u32, 2> words{};
+    std::memcpy(words.data(), loop_cap_buffer.mapped_data.data(), sizeof(words));
+    const u32 new_hits = words[0] - loop_cap_hits_reported;
+    if (new_hits != 0 && loop_cap_hits_reported == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "Workaround compute_loop_cap hit: cs {:#x} stopped after {} back edges",
+                    words[1], cap);
+        loop_cap_last_report = now;
+    }
+    loop_cap_hits_reported = words[0];
+    loop_cap_hits_minute += new_hits;
+    if (loop_cap_hits_minute != 0 && now - loop_cap_last_report >= std::chrono::minutes{1}) {
+        LOG_WARNING(Render_Vulkan,
+                    "Workaround compute_loop_cap: {} capped invocations in the last minute "
+                    "(total {}, last cs {:#x})",
+                    loop_cap_hits_minute, loop_cap_hits_reported, words[1]);
+        loop_cap_hits_minute = 0;
+        loop_cap_last_report = now;
+    }
 }
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
+        Common::PerfStats::Add(Common::PerfStats::Id::FaultWriteReadback);
         ReadMemory(device_addr, size, true, assume_locks);
+    });
+}
+
+void BufferCache::ReleaseCpuAuthoritativeRange(VAddr device_addr, u64 size) {
+    // A released stack range goes back to normal tracking as CPU-modified: whatever the GPU wrote there
+    // before it became a stack is stale
+    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::CpuAuthoritativeRelease,
+                                      device_addr, size);
+    liverpool->SendCommand([this, device_addr, size] {
+        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, true);
+        gpu_modified_ranges.Subtract(device_addr, size);
     });
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
     const auto flush_request = [this, device_addr, size, is_write] {
+        const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Readbacks,
+                                                        Common::PerfStats::Id::ReadbackNs};
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
@@ -146,12 +235,19 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             constexpr u64 mask = ~(align - 1ULL);
             total_size_bytes += (new_size + align - 1) & mask;
         };
-        gpu_modified_ranges.ForEachInRange(address, size, add_download);
+        // Stack pages are CPU-authoritative (cpu_authoritative_stacks): never download over them
+        gpu_modified_ranges.ForEachInRange(address, size, [&](VAddr start, VAddr end) {
+            for (const auto& [lo, len] : memory->SubtractStackRanges(start, end - start)) {
+                add_download(lo, lo + len);
+            }
+        });
         gpu_modified_ranges.Subtract(address, size);
     });
     if (total_size_bytes == 0) {
+        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
         return;
     }
+    Common::PerfStats::Add(Common::PerfStats::Id::ReadbackBytes, total_size_bytes);
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
@@ -160,10 +256,35 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     scheduler.Finish();
 
     download.buffer->Invalidate(download.offset, download.size);
+    // Per-game bpe_heap_guard: GPU output of dispatches running on stale descriptors must not overwrite the
+    // allocator metadata of the game's heap (SotC AVs at eboot+0x48xxx)
+    std::optional<BpeHeapGuard> heap_guard;
+    if (const u64 heap = EmulatorSettings.GetBpeHeapGuardAddress(); heap != 0) {
+        const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::HeapGuardBuilds,
+                                                        Common::PerfStats::Id::HeapGuardBuildNs};
+        heap_guard.emplace(memory, heap);
+        if (!heap_guard->IsValid()) {
+            heap_guard.reset();
+        }
+    }
     for (const auto& copy : copies) {
-        auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
-        memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
-                                copy.size);
+        const VAddr copy_addr = arena_base + copy.srcOffset;
+        const u8* src = download.mapped + (copy.dstOffset - download.offset);
+        // A page can become a stack while the GPU drains: subtract the stacks again
+        for (const auto& [lo, len] : memory->SubtractStackRanges(copy_addr, copy.size)) {
+            Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::BufferReadback,
+                                              lo, len, src + (lo - copy_addr), device_addr);
+            if (heap_guard) {
+                if (const u64 kept = heap_guard->Write(lo, src + (lo - copy_addr), len);
+                    kept != 0) {
+                    Common::GuestWriteJournal::Record(
+                        Common::GuestWriteJournal::Source::HeapGuardKept, lo, len, nullptr, kept);
+                    ReportHeapGuardHit(lo, kept);
+                }
+                continue;
+            }
+            memory->TryWriteBacking(std::bit_cast<u8*>(lo), src + (lo - copy_addr), len);
+        }
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
 }
@@ -186,7 +307,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         SynchronizeMemoryFromImage(arena, device_addr, size);
     }
     if (is_written) {
-        gpu_modified_ranges.Add(device_addr, size);
+        for (const auto& [lo, len] : memory->SubtractStackRanges(device_addr, size)) {
+            gpu_modified_ranges.Add(lo, len);
+        }
     }
     return {arena, arena->Offset(device_addr)};
 }
@@ -200,6 +323,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
     staging.Flush();
     return {staging.buffer, staging.offset};
+}
+
+bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
+    return memory_tracker->IsRegionCpuModified(addr, size);
 }
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
@@ -421,6 +548,9 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
 
     info.AddWait(signal_sema, signal_tick);
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceFault("SubmitPendingArenaBinds");
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     pending_binds.clear();
@@ -440,9 +570,14 @@ void BufferCache::FlushSyncBatch(bool from_scheduler) {
     if (copies.empty()) {
         return;
     }
+    Common::PerfStats::Add(Common::PerfStats::Id::SyncFlushes);
+    Common::PerfStats::Add(Common::PerfStats::Id::BufferUploadBytes, total_size_bytes);
     const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
     for (auto& copy : copies) {
         memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
+        Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Upload,
+                                          copy.dstOffset, copy.size,
+                                          staging.mapped + copy.srcOffset);
         copy.srcOffset += staging.offset;
     }
     staging.Flush();

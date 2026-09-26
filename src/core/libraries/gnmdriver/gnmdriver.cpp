@@ -5,9 +5,11 @@
 #include "gnmdriver.h"
 
 #include "common/assert.h"
+#include "common/cp_profiler.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
+#include "common/perf_stats.h"
 #include "common/slot_vector.h"
 #include "core/address_space.h"
 #include "core/debug_state.h"
@@ -86,6 +88,8 @@ static void ResetSubmissionLock(Platform::InterruptId irq) {
 
 static void WaitGpuIdle() {
     HLE_TRACE;
+    const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::GnmIdleWait,
+                                                    Common::PerfStats::Id::GnmIdleWaitNs};
     std::unique_lock lock{m_wait_idle};
     cv_lock.wait(lock, [] { return submission_lock == 0; });
 }
@@ -2355,6 +2359,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
 s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
+    Common::PerfStats::Add(Common::PerfStats::Id::GnmSubmitDone);
+    Common::CpProfiler::RegisterGameRenderThread();
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
     if (!liverpool->IsGpuIdle()) {

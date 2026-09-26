@@ -14,7 +14,12 @@ struct Archive;
 namespace Shader {
 
 using PFN_SrtWalker = void PS4_SYSV_ABI (*)(const u32* /*user_data*/, u32* /*flat_dst*/);
+/// Copies a walker into the executable buffer, sharing identical code. Returns nullptr when the buffer is
+/// full
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size);
+/// Bytes used in the walker code buffer and bytes saved by sharing identical walkers
+size_t GetSrtCodeUsage();
+size_t GetSrtCodeShared();
 
 struct PersistentSrtInfo {
     // Special case when fetch shader uses step rates.

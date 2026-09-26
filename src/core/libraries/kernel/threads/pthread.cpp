@@ -322,6 +322,11 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
         return POSIX_EAGAIN;
     }
 
+    // Both emulator-allocated and user-provided stacks must stay writable for the host to dispatch exceptions
+    // raised while running on them (cpu_authoritative_stacks)
+    Core::Memory::Instance()->RegisterStackRange(
+        std::bit_cast<VAddr>(new_thread->attr.stackaddr_attr), new_thread->attr.stacksize_attr);
+
     /*
      * Write a magic value to the thread structure
      * to help identify valid ones:

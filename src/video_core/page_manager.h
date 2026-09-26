@@ -46,6 +46,9 @@ public:
                                      const RegionBits& write_mask, const RegionBits& read_mask,
                                      PageOp write_op, PageOp read_op) const;
 
+    /// Diagnostic: (read watchers, write watchers) of the page holding addr
+    std::pair<u32, u32> GetWatchers(VAddr addr) const;
+
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
         return Common::AlignDown(addr, PM_PAGE_SIZE);

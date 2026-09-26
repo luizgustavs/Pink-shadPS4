@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 #include <pugixml.hpp>
 #include "common/elf_info.h"
+#include "common/harness.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "core/emulator_state.h"
@@ -410,6 +411,11 @@ void PatchMemory(const patchInfo& patch) {
 
     LOG_INFO(Loader, "Applied patch: {}, Offset: {:#x}, Value: {}", patch.modNameStr,
              (uintptr_t)cheatAddress, patch.valueStr);
+    // The harness log filter hides Info; runs must show which game patches were active
+    if (Common::HarnessEnabled()) {
+        LOG_WARNING(Loader, "Harness patch applied: {} at {:#x}", patch.modNameStr,
+                    (uintptr_t)cheatAddress);
+    }
 }
 
 static std::vector<int32_t> PatternToByte(const std::string& pattern) {

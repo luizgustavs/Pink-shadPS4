@@ -120,6 +120,12 @@ int ThreadState::CreateStack(PthreadAttr* attr) {
 }
 
 void ThreadState::FreeStack(PthreadAttr* attr) {
+    if (attr && attr->stackaddr_attr) {
+        // Balances the registration in posix_pthread_create_name_np. A cached stack is registered again when
+        // a new thread reuses it
+        Core::Memory::Instance()->UnregisterStackRange(
+            reinterpret_cast<VAddr>(attr->stackaddr_attr), attr->stacksize_attr);
+    }
     if (!attr || True(attr->flags & PthreadAttrFlags::StackUser) || !attr->stackaddr_attr) {
         return;
     }

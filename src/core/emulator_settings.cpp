@@ -20,6 +20,8 @@ using json = nlohmann::json;
 // ── Singleton storage ─────────────────────────────────────────────────
 std::shared_ptr<EmulatorSettingsImpl> EmulatorSettingsImpl::s_instance = nullptr;
 std::mutex EmulatorSettingsImpl::s_mutex;
+std::atomic<EmulatorSettingsImpl*> EmulatorSettingsImpl::s_current{nullptr};
+std::vector<std::shared_ptr<EmulatorSettingsImpl>> EmulatorSettingsImpl::s_retired;
 
 // ── nlohmann helpers for std::filesystem::path ───────────────────────
 namespace nlohmann {
@@ -106,14 +108,27 @@ EmulatorSettingsImpl::~EmulatorSettingsImpl() {
 
 std::shared_ptr<EmulatorSettingsImpl> EmulatorSettingsImpl::GetInstance() {
     std::lock_guard lock(s_mutex);
-    if (!s_instance)
+    if (!s_instance) {
         s_instance = std::make_shared<EmulatorSettingsImpl>();
+        s_current.store(s_instance.get(), std::memory_order_release);
+    }
     return s_instance;
+}
+
+EmulatorSettingsImpl& EmulatorSettingsImpl::Current() {
+    if (auto* current = s_current.load(std::memory_order_acquire)) {
+        return *current;
+    }
+    return *GetInstance();
 }
 
 void EmulatorSettingsImpl::SetInstance(std::shared_ptr<EmulatorSettingsImpl> instance) {
     std::lock_guard lock(s_mutex);
+    if (s_instance) {
+        s_retired.push_back(s_instance);
+    }
     s_instance = std::move(instance);
+    s_current.store(s_instance.get(), std::memory_order_release);
 }
 
 // --------------------
@@ -442,45 +457,36 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
             // Never reloads global settings. Only applies
             // game_specific_value overrides on top of the already-loaded
             // base configuration.
-            const auto gamePath =
-                Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (serial + ".json");
-
-            if (!std::filesystem::exists(gamePath)) {
-                return false;
-            }
-
-            std::ifstream in(gamePath);
-            if (!in) {
-                return false;
-            }
-
-            json gj;
-            in >> gj;
+            const auto customDir = Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs);
+            const auto gamePath = customDir / (serial + ".json");
+            // Apply this overlay after <serial>.json so frontends can rewrite that file without losing local
+            // workaround keys they do not recognize
+            const auto overlayPath = customDir / (serial + ".workarounds.json");
 
             std::vector<std::string> changed;
+            const auto apply_file = [&](const std::filesystem::path& path) {
+                if (!std::filesystem::exists(path)) {
+                    return false;
+                }
+                std::ifstream in(path);
+                if (!in) {
+                    return false;
+                }
+                json gj;
+                in >> gj;
+                ApplyGameOverrides(gj, changed);
+                return true;
+            };
 
-            // ApplyGroupOverrides now correctly stores values as
-            // game_specific_value (see make_override in the header).
-            // ConfigMode::Default will then resolve them at getter call
-            // time without ever touching the base values.
-            if (gj.contains("General"))
-                ApplyGroupOverrides(m_general, gj.at("General"), changed);
-            if (gj.contains("Log"))
-                ApplyGroupOverrides(m_log, gj.at("Log"), changed);
-            if (gj.contains("Debug"))
-                ApplyGroupOverrides(m_debug, gj.at("Debug"), changed);
-            if (gj.contains("Input"))
-                ApplyGroupOverrides(m_input, gj.at("Input"), changed);
-            if (gj.contains("Audio"))
-                ApplyGroupOverrides(m_audio, gj.at("Audio"), changed);
-            // Windows static guest red-zone protection
-            if (gj.contains("WindowsGuestRedZoneProtection"))
-                ApplyGroupOverrides(m_windows_guest_red_zone_protection,
-                                    gj.at("WindowsGuestRedZoneProtection"), changed);
-            if (gj.contains("GPU"))
-                ApplyGroupOverrides(m_gpu, gj.at("GPU"), changed);
-            if (gj.contains("Vulkan"))
-                ApplyGroupOverrides(m_vulkan, gj.at("Vulkan"), changed);
+            const bool has_game_config = apply_file(gamePath);
+            const bool has_overlay = apply_file(overlayPath);
+            if (!has_game_config && !has_overlay) {
+                return false;
+            }
+            if (has_overlay) {
+                LOG_WARNING(Config, "Per-game workaround overlay applied: {}",
+                            overlayPath.string());
+            }
 
             PrintChangedSummary(changed);
             EmulatorState::GetInstance()->SetGameSpecifigConfigUsed(true);
@@ -490,6 +496,28 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
         LOG_ERROR(Config, "Error loading settings: {}", e.what());
         return false;
     }
+}
+
+void EmulatorSettingsImpl::ApplyGameOverrides(const json& gj, std::vector<std::string>& changed) {
+    // ApplyGroupOverrides stores game-specific values; ConfigMode::Default reads them without changing the base
+    if (gj.contains("General"))
+        ApplyGroupOverrides(m_general, gj.at("General"), changed);
+    if (gj.contains("Log"))
+        ApplyGroupOverrides(m_log, gj.at("Log"), changed);
+    if (gj.contains("Debug"))
+        ApplyGroupOverrides(m_debug, gj.at("Debug"), changed);
+    if (gj.contains("Input"))
+        ApplyGroupOverrides(m_input, gj.at("Input"), changed);
+    if (gj.contains("Audio"))
+        ApplyGroupOverrides(m_audio, gj.at("Audio"), changed);
+    // Windows static guest red-zone protection
+    if (gj.contains("WindowsGuestRedZoneProtection"))
+        ApplyGroupOverrides(m_windows_guest_red_zone_protection,
+                            gj.at("WindowsGuestRedZoneProtection"), changed);
+    if (gj.contains("GPU"))
+        ApplyGroupOverrides(m_gpu, gj.at("GPU"), changed);
+    if (gj.contains("Vulkan"))
+        ApplyGroupOverrides(m_vulkan, gj.at("Vulkan"), changed);
 }
 
 void EmulatorSettingsImpl::SetDefaultValues() {

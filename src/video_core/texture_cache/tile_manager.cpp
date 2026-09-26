@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -268,6 +269,14 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
+    if (Vulkan::GpuCheckpoints::Enabled()) {
+        const auto* record = Vulkan::GpuCheckpoints::Push(
+            Vulkan::GpuCheckpoints::Kind::Internal,
+            u64(Vulkan::GpuCheckpoints::InternalTag::Detile), 0, dim_x, 1, 1);
+        if (Vulkan::GpuCheckpoints::g_nv_markers) {
+            cmdbuf.setCheckpointNV(record);
+        }
+    }
     cmdbuf.dispatch(dim_x, 1, 1);
 
     runtime.AccessBuffer(staging.buffer, staging.offset, info.guest_size,
@@ -360,6 +369,14 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
+    if (Vulkan::GpuCheckpoints::Enabled()) {
+        const auto* record = Vulkan::GpuCheckpoints::Push(
+            Vulkan::GpuCheckpoints::Kind::Internal,
+            u64(Vulkan::GpuCheckpoints::InternalTag::Tile), 0, dim_x, 1, 1);
+        if (Vulkan::GpuCheckpoints::g_nv_markers) {
+            cmdbuf.setCheckpointNV(record);
+        }
+    }
     cmdbuf.dispatch(dim_x, 1, 1);
 
     runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,

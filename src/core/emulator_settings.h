@@ -17,7 +17,9 @@
 #include "common/types.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 
-#define EmulatorSettings (*EmulatorSettingsImpl::GetInstance())
+// D5: a plain pointer read; GetInstance() locks a mutex and copies a shared_ptr on every access, which cost
+// ~3 ms per SotC frame on the command processor thread alone
+#define EmulatorSettings (EmulatorSettingsImpl::Current())
 
 enum HideCursorState : int {
     Never,
@@ -435,6 +437,28 @@ struct GPUSettings {
     Setting<bool> rcas_enabled{true};
     Setting<int> rcas_attenuation{250};
     Setting<bool> userfaultfd{false};
+    // Per-game loop limit (0 = off): stop runaway compute shaders after this many back edges
+    // Shadow of the Colossus uses 1048576 to avoid a GPU timeout
+    Setting<u32> compute_loop_cap{0};
+    // On Windows, restore guest and GPU tracking protections after splitting a mapped placeholder
+    Setting<bool> preserve_split_protection{false};
+    // Keep guest thread and fiber stacks writable and CPU-owned; a protected stack page can crash the host
+    Setting<bool> cpu_authoritative_stacks{false};
+    // SotC 01.01 BPE heap address (0 = off); protect its allocator metadata from GPU readbacks
+    Setting<u64> bpe_heap_guard_address{0};
+    // Treat constant-lane ReadLane as uniform so guarded LDS barriers stay in place
+    Setting<bool> lds_barrier_uniform_readlane{false};
+    // Add EarlyFragmentTests to storage-writing pixel shaders when the guest runs depth/stencil first
+    Setting<bool> early_fragment_tests_from_z_order{false};
+    // Report bound T# counter banks as sampled at LOD 0 so games can request finer mips
+    Setting<bool> lod_stats_from_bindings{false};
+    // Turn dynamically indexed compute T# reads into descriptor arrays of this size (0 = off, max 64)
+    Setting<u32> dynamic_tsharp_array_size{0};
+    // Treat branches on LDS-exchanged values as uniform when lowering ReadLane and Ballot
+    Setting<bool> wave64_uniform_branches{false};
+    // Record GPU commands and submits to identify the first unfinished submit after device loss
+    // Add NVIDIA checkpoints when available; recording adds a small cost per command
+    Setting<bool> gpu_checkpoints{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -457,6 +481,24 @@ struct GPUSettings {
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
+            make_override<GPUSettings>("compute_loop_cap", &GPUSettings::compute_loop_cap),
+            make_override<GPUSettings>("preserve_split_protection",
+                                       &GPUSettings::preserve_split_protection),
+            make_override<GPUSettings>("cpu_authoritative_stacks",
+                                       &GPUSettings::cpu_authoritative_stacks),
+            make_override<GPUSettings>("bpe_heap_guard_address",
+                                       &GPUSettings::bpe_heap_guard_address),
+            make_override<GPUSettings>("lds_barrier_uniform_readlane",
+                                       &GPUSettings::lds_barrier_uniform_readlane),
+            make_override<GPUSettings>("early_fragment_tests_from_z_order",
+                                       &GPUSettings::early_fragment_tests_from_z_order),
+            make_override<GPUSettings>("lod_stats_from_bindings",
+                                       &GPUSettings::lod_stats_from_bindings),
+            make_override<GPUSettings>("dynamic_tsharp_array_size",
+                                       &GPUSettings::dynamic_tsharp_array_size),
+            make_override<GPUSettings>("wave64_uniform_branches",
+                                       &GPUSettings::wave64_uniform_branches),
+            make_override<GPUSettings>("gpu_checkpoints", &GPUSettings::gpu_checkpoints),
         };
     }
 };
@@ -465,7 +507,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    readbacks_mode, readback_linear_images_enabled,
                                    direct_memory_access_enabled, dump_shaders, patch_shaders,
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
-                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation)
+                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
+                                   compute_loop_cap, preserve_split_protection,
+                                   cpu_authoritative_stacks, bpe_heap_guard_address,
+                                   lds_barrier_uniform_readlane, early_fragment_tests_from_z_order,
+                                   lod_stats_from_bindings, dynamic_tsharp_array_size,
+                                   wave64_uniform_branches, gpu_checkpoints)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -520,6 +567,9 @@ public:
 
     static std::shared_ptr<EmulatorSettingsImpl> GetInstance();
     static void SetInstance(std::shared_ptr<EmulatorSettingsImpl> instance);
+    /// The current instance without locking or reference counting. Instances replaced by SetInstance are kept
+    /// alive, so a reference taken before the swap stays valid
+    static EmulatorSettingsImpl& Current();
 
     bool Save(const std::string& serial = "");
     bool Load(const std::string& serial = "");
@@ -582,6 +632,8 @@ private:
 
     static std::shared_ptr<EmulatorSettingsImpl> s_instance;
     static std::mutex s_mutex;
+    static std::atomic<EmulatorSettingsImpl*> s_current;
+    static std::vector<std::shared_ptr<EmulatorSettingsImpl>> s_retired;
 
     /// Apply overrideable fields from groupJson into group.game_specific_value.
     template <typename Group>
@@ -609,6 +661,7 @@ private:
     }
 
     static void PrintChangedSummary(const std::vector<std::string>& changed);
+    void ApplyGameOverrides(const nlohmann::json& gj, std::vector<std::string>& changed);
 
 public:
     // Add these getters to access overrideable fields
@@ -745,6 +798,16 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
     SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)
+    SETTING_FORWARD(m_gpu, ComputeLoopCap, compute_loop_cap)
+    SETTING_FORWARD_BOOL(m_gpu, PreserveSplitProtection, preserve_split_protection)
+    SETTING_FORWARD_BOOL(m_gpu, CpuAuthoritativeStacks, cpu_authoritative_stacks)
+    SETTING_FORWARD(m_gpu, BpeHeapGuardAddress, bpe_heap_guard_address)
+    SETTING_FORWARD_BOOL(m_gpu, LdsBarrierUniformReadlane, lds_barrier_uniform_readlane)
+    SETTING_FORWARD_BOOL(m_gpu, EarlyFragmentTestsFromZOrder, early_fragment_tests_from_z_order)
+    SETTING_FORWARD_BOOL(m_gpu, LodStatsFromBindings, lod_stats_from_bindings)
+    SETTING_FORWARD(m_gpu, DynamicTsharpArraySize, dynamic_tsharp_array_size)
+    SETTING_FORWARD_BOOL(m_gpu, Wave64UniformBranches, wave64_uniform_branches)
+    SETTING_FORWARD_BOOL(m_gpu, GpuCheckpoints, gpu_checkpoints)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {

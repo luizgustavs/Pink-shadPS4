@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/elf_info.h"
+#include "common/harness.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "core/emulator_settings.h"
@@ -441,7 +442,17 @@ int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
     auto& controller = *it->second;
     std::array<Input::State, ORBIS_PAD_MAX_DATA_NUM> states;
     const int ret_num = controller.ReadStates(states.data(), num);
-    return ProcessStates(pData, states.data(), ret_num);
+    const int result = ProcessStates(pData, states.data(), ret_num);
+    if (Common::HarnessEnabled() && result > 0) {
+        LOG_HARNESS_MARKER_ONCE(Lib_Pad, "first scePadRead handle={}", handle);
+        if (std::any_of(pData, pData + result, [](const OrbisPadData& data) {
+                return data.buttons != OrbisPadButtonDataOffset::None &&
+                       data.buttons != OrbisPadButtonDataOffset::Intercepted;
+            })) {
+            LOG_HARNESS_MARKER_ONCE(Lib_Pad, "first scePadRead with buttons handle={}", handle);
+        }
+    }
+    return result;
 }
 
 int PS4_SYSV_ABI scePadReadBlasterForTracker() {

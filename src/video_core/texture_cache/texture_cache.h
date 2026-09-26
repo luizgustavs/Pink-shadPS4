@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -268,7 +269,15 @@ public:
         }
     }
 
+    /// Diagnostic (SHADPS4_HARNESS_PROGRESS): registered images and the largest one registered
+    [[nodiscard]] std::pair<u64, u64> GetImageStats() const noexcept {
+        return {stat_images.load(std::memory_order_relaxed),
+                stat_largest_image.load(std::memory_order_relaxed)};
+    }
+
 private:
+    std::atomic<u64> stat_images{0};
+    std::atomic<u64> stat_largest_image{0};
     /// Iterate over all page indices in a range
     template <typename Func>
     static void ForEachPage(PAddr addr, size_t size, Func&& func) {

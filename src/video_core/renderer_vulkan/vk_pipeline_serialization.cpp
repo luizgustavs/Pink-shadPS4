@@ -5,6 +5,7 @@
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/ir/passes/srt.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -12,12 +13,30 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 5u;
-static constexpr u32 ShaderMetaVersion = 5u;
+// ShaderBinaryVersion 6: SRT walkers recover per invocation, 10_11_11 and add_tid tolerate garbage
+// descriptors, DMA fault bitmap uses bounds checks and atomics. ShaderMetaVersion 6: meta records the codegen
+// settings key; Info gains uses_loop_cap. ShaderMetaVersion 7: HwFragmentRuntimeInfo gains
+// early_fragment_tests, InfoPersistent gains sharp_tables and ImageResource the descriptor array fields (all
+// stored raw)
+static constexpr u32 ShaderBinaryVersion = 6u;
+static constexpr u32 ShaderMetaVersion = 7u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 
 namespace Vulkan {
+
+namespace {
+/// Emulator settings that change the generated SPIR-V. The disk cache is keyed only by the guest shader hash,
+/// so a shader compiled with other values must be recompiled, not loaded
+u64 CodegenSettingsKey() {
+    return u64{EmulatorSettings.GetComputeLoopCap()} |
+           (u64{EmulatorSettings.IsDirectMemoryAccessEnabled()} << 32) |
+           (u64{EmulatorSettings.IsLdsBarrierUniformReadlane()} << 33) |
+           (u64{EmulatorSettings.IsEarlyFragmentTestsFromZOrder()} << 34) |
+           (u64{Shader::DynamicTsharpArraySize()} << 35) | // 7 bits, at most 64
+           (u64{EmulatorSettings.IsWave64UniformBranches()} << 42);
+}
+} // namespace
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
@@ -64,12 +83,20 @@ void RegisterShaderMeta(const Shader::Info& info,
     if (!Storage::DataBase::Instance().IsOpened()) {
         return;
     }
+    // A program whose walker did not fit the code buffer reads zeros from its SRT; caching it would keep it
+    // broken in the next runs
+    if (!info.srt_info.walker_func &&
+        info.srt_info.flattened_bufsize_dw - info.SharpTableDwords() >
+            Shader::NUM_USER_DATA_REGS) {
+        return;
+    }
 
     Serialization::Archive ar;
     Serialization::Writer meta{ar};
 
     meta.Write(Serialization::ShaderMetaVersion);
     meta.Write(Serialization::ShaderBinaryVersion);
+    meta.Write(CodegenSettingsKey());
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -108,12 +135,20 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
         return false;
     }
 
+    u64 codegen_key{};
+    meta.Read(codegen_key);
+    if (codegen_key != CodegenSettingsKey()) {
+        return false;
+    }
+
     u64 perm_hash_ar{};
     meta.Read(perm_hash_ar);
     meta.Read(perm_idx);
 
     spec.Deserialize(ar);
-    info.Deserialize(ar);
+    if (!info.Deserialize(ar)) {
+        return false;
+    }
 
     fetch_shader_data = spec.fetch_shader_data;
     return true;
@@ -369,6 +404,8 @@ void PipelineCache::WarmUp() {
         });
 
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    LOG_INFO(Render, "SRT walker code after preload: {} KiB, {} KiB shared with identical walkers",
+             Shader::GetSrtCodeUsage() >> 10, Shader::GetSrtCodeShared() >> 10);
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);
@@ -440,6 +477,11 @@ bool PersistentSrtInfo::Deserialize(Serialization::Archive& ar) {
     if (walker_func_size) {
         walker_func = RegisterWalkerCode(ar.CurrPtr(), walker_func_size);
         ar.Advance(walker_func_size);
+        if (!walker_func) {
+            // No space left in the walker buffer: fail the load, the pipeline is compiled at runtime instead
+            walker_func_size = 0;
+            return false;
+        }
     }
 
     return true;

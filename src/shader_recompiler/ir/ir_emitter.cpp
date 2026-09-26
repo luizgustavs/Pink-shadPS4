@@ -5,6 +5,7 @@
 #include <source_location>
 #include <boost/container/small_vector.hpp>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "shader_recompiler/ir/debug_print.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/opcodes.h"
@@ -994,7 +995,11 @@ U32 IREmitter::Pack10_11_11(const AmdGpu::NumberFormat number_format, const Valu
     case AmdGpu::NumberFormat::Float:
         return Inst<U32>(Opcode::PackUfloat10_11_11, vector);
     default:
-        UNREACHABLE_MSG("Unsupported 10_11_11 number format: {}", number_format);
+        // Garbage descriptors pair 10_11_11 with other number formats; the format only exists as unsigned
+        // float, so use that instead of aborting the shader compile
+        LOG_WARNING(Render_Recompiler, "Unsupported 10_11_11 number format {}, using float",
+                    u32(number_format));
+        return Inst<U32>(Opcode::PackUfloat10_11_11, vector);
     }
 }
 
@@ -1033,7 +1038,9 @@ Value IREmitter::Unpack10_11_11(const AmdGpu::NumberFormat number_format, const 
     case AmdGpu::NumberFormat::Float:
         return Inst(Opcode::UnpackUfloat10_11_11, value);
     default:
-        UNREACHABLE_MSG("Unsupported 10_11_11 number format: {}", number_format);
+        LOG_WARNING(Render_Recompiler, "Unsupported 10_11_11 number format {}, using float",
+                    u32(number_format));
+        return Inst(Opcode::UnpackUfloat10_11_11, value);
     }
 }
 
@@ -2110,6 +2117,10 @@ Value IREmitter::ImageAtomicCmpSwap(const Value& handle, const Value& coords, co
 
 Value IREmitter::ImageHandle(const Value& tsharp_low, const Value& tsharp_high) {
     return Inst(Opcode::ImageHandle, tsharp_low, tsharp_high);
+}
+
+Value IREmitter::ImageArrayHandle(const U32& handle, const U32& element) {
+    return Inst(Opcode::ImageArrayHandle, handle, element);
 }
 
 Value IREmitter::ImageSampleRaw(const Value& image_handle, const Value& sampler_handle,

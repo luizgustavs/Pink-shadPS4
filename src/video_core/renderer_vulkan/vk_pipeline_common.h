@@ -53,6 +53,11 @@ public:
         return *stages[u32(stage)];
     }
 
+    /// Null when the pipeline has no such stage
+    const Shader::Info* TryGetStage(Shader::SwStage stage) const noexcept {
+        return stages[u32(stage)];
+    }
+
     bool IsCompute() const {
         return is_compute;
     }

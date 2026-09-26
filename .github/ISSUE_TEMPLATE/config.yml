@@ -1,10 +1,7 @@
-# SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+# SPDX-FileCopyrightText: 2024 shadPS4 Emulator Project
+# SPDX-FileCopyrightText: 2026 Pink-shadPS4 contributors
 # SPDX-License-Identifier: GPL-2.0-or-later
-blank_issues_enabled: false
-contact_links:
-  - name: Discord
-    url: https://discord.gg/bFJxfftGW6
-    about: Get direct support and hang out with us
-  - name: Wiki
-    url: https://github.com/shadps4-emu/shadPS4/wiki
-    about: Information, guides, etc.
+# Modified by Pink-shadPS4 contributors on 2026-09-26
+
+blank_issues_enabled: true
+contact_links: []

@@ -22,11 +22,13 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type) {
     case AmdGpu::ImageType::Color2DMsaa:
         return vk::ImageViewType::e2D;
     case AmdGpu::ImageType::Color2DArray:
+    case AmdGpu::ImageType::Color2DMsaaArray:
         return vk::ImageViewType::e2DArray;
     case AmdGpu::ImageType::Color3D:
         return vk::ImageViewType::e3D;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("ConvertImageViewType", u32(type), "2D");
+        return vk::ImageViewType::e2D;
     }
 }
 
@@ -43,7 +45,8 @@ bool IsViewTypeCompatible(AmdGpu::ImageType view_type, AmdGpu::ImageType image_t
     case AmdGpu::ImageType::Color3D:
         return image_type == AmdGpu::ImageType::Color3D;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("IsViewTypeCompatible", u32(view_type), "incompatible");
+        return false;
     }
 }
 

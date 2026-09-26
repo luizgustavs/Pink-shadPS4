@@ -316,6 +316,11 @@ public:
         return properties.pipelineCacheUUID;
     }
 
+    /// Returns the physical device limits
+    const vk::PhysicalDeviceLimits& GetLimits() const {
+        return properties.limits;
+    }
+
     /// Returns the minimum required alignment for uniforms
     vk::DeviceSize UniformMinAlignment() const {
         return properties.limits.minUniformBufferOffsetAlignment;
@@ -461,9 +466,21 @@ public:
     /// Determines if a format is supported for a set of feature flags.
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
 
+    /// Returns true when VK_NV_device_diagnostic_checkpoints is enabled (gpu_checkpoints)
+    bool IsNvDiagnosticCheckpointsSupported() const {
+        return nv_diagnostic_checkpoints;
+    }
+
+    /// Logs the gpu_checkpoints report (recent commands, submit ledger, NV queue checkpoints) and the
+    /// VK_EXT_device_fault report after a device loss. Call it before aborting
+    void ReportDeviceFault(const char* where) const;
+
 private:
     /// Creates the logical device opportunistically enabling extensions
     bool CreateDevice();
+
+    /// Part of ReportDeviceFault: only with the gpu_checkpoints setting on
+    void ReportGpuCheckpoints(const char* where) const;
 
     /// Creates the VMA allocator handle
     void CreateAllocator();
@@ -535,6 +552,9 @@ private:
     bool shader_clock{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
+    bool device_fault{};
+    bool nv_diagnostic_checkpoints{};
+    bool nv_diagnostics_config{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;
 };

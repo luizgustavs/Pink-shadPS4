@@ -1,0 +1,195 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include <fmt/format.h>
+
+#include "common/perf_stats.h"
+
+namespace Common::PerfStats {
+
+namespace {
+
+enum class Unit { Count, Ms, Kb };
+
+struct Field {
+    Id id;
+    const char* name;
+    Unit unit;
+};
+
+// Report order and names; the harness parses "name=value" pairs, so names must stay stable
+constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
+    {Id::FaultRead, "fault_r", Unit::Count},
+    {Id::FaultWrite, "fault_w", Unit::Count},
+    {Id::FaultNs, "fault_ms", Unit::Ms},
+    {Id::FaultGpuThread, "fault_gpu", Unit::Count},
+    {Id::FaultGpuThreadNs, "fault_gpu_ms", Unit::Ms},
+    {Id::FaultWriteReadback, "fault_w_readback", Unit::Count},
+    {Id::Readbacks, "readbacks", Unit::Count},
+    {Id::ReadbackNs, "readback_ms", Unit::Ms},
+    {Id::ReadbackBytes, "readback_kb", Unit::Kb},
+    {Id::ImageDownloads, "image_downloads", Unit::Count},
+    {Id::VkFinish, "vk_finish", Unit::Count},
+    {Id::VkFinishNs, "vk_finish_ms", Unit::Ms},
+    {Id::VkWait, "vk_wait", Unit::Count},
+    {Id::VkWaitNs, "vk_wait_ms", Unit::Ms},
+    {Id::VkSubmits, "vk_submits", Unit::Count},
+    {Id::GpuNs, "gpu_ms", Unit::Ms},
+    {Id::GnmSubmitDone, "gnm_submit_done", Unit::Count},
+    {Id::GnmIdleWait, "gnm_idle_wait", Unit::Count},
+    {Id::GnmIdleWaitNs, "gnm_idle_wait_ms", Unit::Ms},
+    {Id::CpBusyNs, "cp_busy_ms", Unit::Ms},
+    {Id::CpVoWaitNs, "cp_vo_wait_ms", Unit::Ms},
+    {Id::CpWaitYields, "cp_wait_yields", Unit::Count},
+    {Id::Draws, "draws", Unit::Count},
+    {Id::DrawNs, "draw_ms", Unit::Ms},
+    {Id::Dispatches, "dispatches", Unit::Count},
+    {Id::DispatchNs, "dispatch_ms", Unit::Ms},
+    {Id::SrtWalks, "srt_walks", Unit::Count},
+    {Id::SrtWalkNs, "srt_walk_ms", Unit::Ms},
+    {Id::ShaderCompiles, "shader_compiles", Unit::Count},
+    {Id::ShaderCompileNs, "shader_compile_ms", Unit::Ms},
+    {Id::PipelineCreates, "pipeline_creates", Unit::Count},
+    {Id::PipelineCreateNs, "pipeline_create_ms", Unit::Ms},
+    {Id::TextureUploads, "tex_uploads", Unit::Count},
+    {Id::TextureUploadNs, "tex_upload_ms", Unit::Ms},
+    {Id::TextureUploadBytes, "tex_upload_kb", Unit::Kb},
+    {Id::BufferUploadBytes, "buf_upload_kb", Unit::Kb},
+    {Id::SyncFlushes, "sync_flushes", Unit::Count},
+    {Id::Protects, "protects", Unit::Count},
+    {Id::Splits, "splits", Unit::Count},
+    {Id::ProtectNs, "protect_ms", Unit::Ms},
+    {Id::ProtectGpuThread, "protect_gpu", Unit::Count},
+    {Id::ProtectGpuThreadNs, "protect_gpu_ms", Unit::Ms},
+    {Id::FaultWriteGuestNs, "fault_w_ms", Unit::Ms},
+    {Id::Invalidates, "invalidates", Unit::Count},
+    {Id::InvalidateBufferNs, "inval_buf_ms", Unit::Ms},
+    {Id::InvalidateTextureNs, "inval_tex_ms", Unit::Ms},
+    {Id::FaultRepairCalls, "fault_repairs", Unit::Count},
+    {Id::FaultRepairNs, "fault_repair_ms", Unit::Ms},
+    {Id::FaultWritePages, "fault_w_pages", Unit::Count},
+    {Id::HeapGuardBuilds, "guard_builds", Unit::Count},
+    {Id::HeapGuardBuildNs, "guard_ms", Unit::Ms},
+    {Id::LabelWrites, "labels", Unit::Count},
+    {Id::LabelLagNs, "label_lag_ms", Unit::Ms},
+    {Id::LabelLagMaxNs, "label_lag_max_ms", Unit::Ms},
+    {Id::GfxQueueMax, "gfx_queue_max", Unit::Count},
+}};
+
+constexpr bool FieldsMatchIds() {
+    for (size_t i = 0; i < Fields.size(); ++i) {
+        if (Fields[i].id != static_cast<Id>(i)) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(FieldsMatchIds(), "Fields must list every Id in enum order");
+
+std::array<std::atomic<u64>, static_cast<size_t>(Id::Count)> slots{};
+thread_local bool is_gpu_thread = false;
+
+// Fault regions: only touched on handled faults, which already cost microseconds or more
+constexpr u32 RegionBits = 20;
+constexpr size_t TopRegions = 6;
+enum RegionKind : size_t { GpuThread, GuestRead, GuestWrite, NumRegionKinds };
+std::mutex region_mutex;
+std::array<std::unordered_map<u64, u64>, NumRegionKinds> region_counts;
+constexpr u32 PageBits = 12;
+std::unordered_set<u64> guest_write_pages;
+
+} // Anonymous namespace
+
+bool Enabled() {
+    static const bool enabled = std::getenv("SHADPS4_PERF_STATS") != nullptr;
+    return enabled;
+}
+
+std::atomic<u64>& Detail::Slot(Id id) {
+    return slots[static_cast<size_t>(id)];
+}
+
+void MarkGpuThread() {
+    is_gpu_thread = true;
+}
+
+bool IsGpuThread() {
+    return is_gpu_thread;
+}
+
+void RecordFaultRegion(u64 address, bool is_write) {
+    if (!Enabled()) {
+        return;
+    }
+    const RegionKind kind = is_gpu_thread ? GpuThread : is_write ? GuestWrite : GuestRead;
+    std::scoped_lock lk{region_mutex};
+    ++region_counts[kind][address >> RegionBits];
+    if (kind == GuestWrite && guest_write_pages.insert(address >> PageBits).second) {
+        Detail::Slot(Id::FaultWritePages).fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+std::string TakeFaultRegionReport() {
+    static constexpr std::array<const char*, NumRegionKinds> names{"gpu", "guest_r", "guest_w"};
+    std::array<std::unordered_map<u64, u64>, NumRegionKinds> counts;
+    {
+        std::scoped_lock lk{region_mutex};
+        counts.swap(region_counts);
+    }
+    std::string report;
+    for (size_t kind = 0; kind < NumRegionKinds; ++kind) {
+        std::vector<std::pair<u64, u64>> top(counts[kind].begin(), counts[kind].end());
+        const size_t shown = std::min(top.size(), TopRegions);
+        std::partial_sort(top.begin(), top.begin() + shown, top.end(),
+                          [](const auto& a, const auto& b) { return a.second > b.second; });
+        if (!report.empty()) {
+            report += ' ';
+        }
+        report += fmt::format("{}=", names[kind]);
+        for (size_t i = 0; i < shown; ++i) {
+            report += fmt::format("{}{:#x}:{}", i ? "," : "", top[i].first << RegionBits,
+                                  top[i].second);
+        }
+        if (shown == 0) {
+            report += '-';
+        }
+    }
+    return report;
+}
+
+std::string TakeReport() {
+    {
+        std::scoped_lock lk{region_mutex};
+        guest_write_pages.clear();
+    }
+    std::string report;
+    for (const auto& field : Fields) {
+        const u64 value =
+            slots[static_cast<size_t>(field.id)].exchange(0, std::memory_order_relaxed);
+        if (!report.empty()) {
+            report += ' ';
+        }
+        switch (field.unit) {
+        case Unit::Count:
+            report += fmt::format("{}={}", field.name, value);
+            break;
+        case Unit::Ms:
+            report += fmt::format("{}={:.1f}", field.name, static_cast<double>(value) / 1e6);
+            break;
+        case Unit::Kb:
+            report += fmt::format("{}={}", field.name, value >> 10);
+            break;
+        }
+    }
+    return report;
+}
+
+} // namespace Common::PerfStats
