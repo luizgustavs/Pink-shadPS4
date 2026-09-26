@@ -23,6 +23,12 @@ enum class Id : u32 {
     FaultGpuThreadNs,
     // Write faults on GPU-modified memory: the write waits for a readback on the GPU thread
     FaultWriteReadback,
+    // SRT walker read faults completed from guest memory without a readback
+    // (srt_walker_clean_reads). They are not counted in FaultRead/FaultGpuThread
+    SrtCleanReads,
+    SrtCleanReadNs,
+    // Walker loads served the same way by the generated code, without a fault
+    SrtCleanLoads,
     // Tracker readbacks on the GPU thread, each draining Vulkan before copying data to guest memory
     Readbacks,
     ReadbackNs,

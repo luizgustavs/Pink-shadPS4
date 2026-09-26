@@ -18,9 +18,10 @@ namespace Serialization {
 // settings key; Info gains uses_loop_cap. ShaderMetaVersion 7: HwFragmentRuntimeInfo gains
 // early_fragment_tests, InfoPersistent gains sharp_tables and ImageResource the descriptor array fields (all
 // stored raw). ShaderMetaVersion 8: SharpFetch gains summary and FetchShaderData changes layout (#5112,
-// plus one_vgprs)
+// plus one_vgprs). ShaderMetaVersion 9: SRT walker guest loads test the clean-page bitmap first
+// (srt_walker_clean_reads)
 static constexpr u32 ShaderBinaryVersion = 6u;
-static constexpr u32 ShaderMetaVersion = 8u;
+static constexpr u32 ShaderMetaVersion = 9u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 

@@ -83,6 +83,11 @@ public:
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     void ReleaseCpuAuthoritativeRange(VAddr addr, u64 size);
     bool IsMapped(VAddr addr, u64 size);
+    /// Clean reads (srt_walker_clean_reads, shader_code_clean_reads): copies GPU-mapped bytes the GPU never
+    /// wrote from the physical backing without touching their page, which may be protected because it shares
+    /// a GPU-written buffer. A readback would leave the same value there. Returns false for GPU-written or
+    /// unbacked bytes. Command processor thread only
+    bool ReadCleanMemory(VAddr addr, void* out, u64 size);
 
     /// Returns false for a T# that describes an image Vulkan cannot create (garbage descriptor)
     bool IsPlausibleImage(const VideoCore::ImageInfo& info);
@@ -134,6 +139,8 @@ private:
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     /// dynamic_tsharp_array_size: logs the first descriptor array bound, then a per-minute count
     void ReportTsharpArray(u64 pgm_hash, u32 num_elements, u32 null_elements);
+    /// SHADPS4_CLEAN_READ_VERIFY: reads back the bytes a clean read served and reports any difference
+    void VerifyCleanRead(VAddr addr, const void* served, u64 size);
     bool BindResources(const Pipeline* pipeline);
 
     /// gpu_checkpoints: attaches SHADPS4_GPU_DIAG details to the command just recorded and runs the

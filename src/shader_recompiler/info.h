@@ -208,7 +208,8 @@ struct Info : InfoPersistent {
         if (srt_info.walker_func) {
             const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::SrtWalks,
                                                             Common::PerfStats::Id::SrtWalkNs};
-            srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+            srt_info.walker_func(user_data.data(), flattened_ud_buf.data(), 0, 0,
+                                 GetSrtWalkerContext());
         }
         if (!sharp_tables.empty()) {
             RefreshSharpTables();

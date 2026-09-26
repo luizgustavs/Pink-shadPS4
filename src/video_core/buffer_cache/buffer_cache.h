@@ -109,6 +109,13 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// Byte-precise: true when a written binding covered any byte of the range since its last readback.
+    /// Readbacks copy only these bytes, so the backing already holds the value of every other byte.
+    /// Command processor thread only
+    [[nodiscard]] bool IsRangeGpuWritten(VAddr addr, size_t size) const {
+        return gpu_modified_ranges.Intersects(addr, size);
+    }
+
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 

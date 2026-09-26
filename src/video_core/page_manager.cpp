@@ -18,6 +18,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/signals.h"
+#include "shader_recompiler/ir/passes/srt.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -418,6 +419,7 @@ struct SignalImpl : public PageManager::Impl {
     SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
         rasterizer = rasterizer_;
         instance = this;
+        Shader::SetSrtCleanLoad(&SrtWalkerCleanLoad);
 
         // Should be called first.
         constexpr auto priority = std::numeric_limits<u32>::min();
@@ -522,6 +524,17 @@ struct SignalImpl : public PageManager::Impl {
         const bool perf = Common::PerfStats::Enabled();
         const auto start =
             perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (!is_write && is_gpu_thread && EmulatorSettings.IsSrtWalkerCleanReads() &&
+            TryCleanWalkerRead(context, addr)) {
+            if (perf) {
+                using namespace Common::PerfStats;
+                Add(Id::SrtCleanReads);
+                Add(Id::SrtCleanReadNs, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - start)
+                                            .count());
+            }
+            return true;
+        }
         bool handled = is_write ? rasterizer->InvalidateMemory(addr, 8, is_gpu_thread)
                                 : rasterizer->ReadMemory(addr, 8, is_gpu_thread);
         if (handled && EmulatorSettings.IsPreserveSplitProtection()) {
@@ -545,6 +558,68 @@ struct SignalImpl : public PageManager::Impl {
             }
         }
         return handled;
+    }
+
+    /// Per-game srt_walker_clean_reads: an SRT walker load on the command processor thread faulted on a
+    /// page the tracker protects because it shares a GPU-written buffer. When the loaded bytes themselves
+    /// were never written by the GPU, the load is completed from the physical backing and the page stays
+    /// protected, instead of reading the page back and draining the GPU. SotC's walkers hit this on every
+    /// draw and dispatch
+    static bool TryCleanWalkerRead(void* context, VAddr addr) {
+        const auto load = Shader::DecodeSrtLoad(context);
+        if (!load || addr < load->address || addr >= load->address + load->size) {
+            return false;
+        }
+        u64 value = 0;
+        if (!rasterizer->ReadCleanMemory(load->address, &value, load->size)) {
+            return false;
+        }
+        Shader::CompleteSrtLoad(context, *load, value);
+        // Later walker loads from these pages call SrtWalkerCleanLoad instead of faulting
+        Shader::MarkSrtCleanPages(load->address, load->size);
+        ReportCleanRead(load->address);
+        return true;
+    }
+
+    /// The exception-free TryCleanWalkerRead, called by generated walker code for loads from pages that
+    /// served a clean read before. On false the walker runs the plain load, which faults into the handlers
+    /// above when it must
+    static bool PS4_SYSV_ABI SrtWalkerCleanLoad(u64 address, u32 size, u64* out) {
+        if (!EmulatorSettings.IsSrtWalkerCleanReads() || !Common::PerfStats::IsGpuThread()) {
+            return false;
+        }
+        u64 value = 0;
+        if (!rasterizer->ReadCleanMemory(address, &value, size)) {
+            return false;
+        }
+        *out = value;
+        Common::PerfStats::Add(Common::PerfStats::Id::SrtCleanLoads);
+        return true;
+    }
+
+    static void ReportCleanRead(VAddr addr) {
+        // Command processor thread only
+        static u64 total = 0;
+        static u64 last_minute = 0;
+        static auto last_report = std::chrono::steady_clock::now();
+        ++total;
+        ++last_minute;
+        const auto now = std::chrono::steady_clock::now();
+        if (total == 1) {
+            LOG_WARNING(Render,
+                        "Workaround srt_walker_clean_reads: SRT walker read at {:#x} served from "
+                        "guest memory without a readback",
+                        addr);
+            last_report = now;
+            last_minute = 0;
+        } else if (now - last_report >= std::chrono::minutes{1}) {
+            LOG_WARNING(Render,
+                        "Workaround srt_walker_clean_reads: {} walker read faults served without a "
+                        "readback in the last minute (total {}, last at {:#x})",
+                        last_minute, total, addr);
+            last_report = now;
+            last_minute = 0;
+        }
     }
 
     /// Per-game preserve_split_protection safety net: a fault the tracker handled must leave the page

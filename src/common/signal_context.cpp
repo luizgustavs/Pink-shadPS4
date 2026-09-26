@@ -48,6 +48,26 @@ void IncrementRip(void* ctx, u64 length) {
 }
 
 #ifdef ARCH_X86_64
+u64 GetX64Gpr(void* ctx, X64Gpr reg) {
+#if defined(_WIN32)
+    const auto* const context = ((EXCEPTION_POINTERS*)ctx)->ContextRecord;
+    return reg == X64Gpr::Rdi ? context->Rdi : reg == X64Gpr::R10 ? context->R10 : context->R11;
+#elif defined(__APPLE__)
+    const auto& state = ((ucontext_t*)ctx)->uc_mcontext->__ss;
+    return reg == X64Gpr::Rdi ? state.__rdi : reg == X64Gpr::R10 ? state.__r10 : state.__r11;
+#elif defined(__FreeBSD__)
+    const auto& context = ((ucontext_t*)ctx)->uc_mcontext;
+    return reg == X64Gpr::Rdi   ? context.mc_rdi
+           : reg == X64Gpr::R10 ? context.mc_r10
+                                : context.mc_r11;
+#else
+    const auto& gregs = ((ucontext_t*)ctx)->uc_mcontext.gregs;
+    return static_cast<u64>(reg == X64Gpr::Rdi   ? gregs[REG_RDI]
+                            : reg == X64Gpr::R10 ? gregs[REG_R10]
+                                                 : gregs[REG_R11]);
+#endif
+}
+
 void SetX64Gpr(void* ctx, X64Gpr reg, u64 value) {
 #if defined(_WIN32)
     auto* const context = ((EXCEPTION_POINTERS*)ctx)->ContextRecord;
@@ -57,6 +77,8 @@ void SetX64Gpr(void* ctx, X64Gpr reg, u64 value) {
         break;
     case X64Gpr::R10:
         context->R10 = value;
+        break;
+    default: // R11 is read only
         break;
     }
 #elif defined(__APPLE__)
@@ -68,6 +90,8 @@ void SetX64Gpr(void* ctx, X64Gpr reg, u64 value) {
     case X64Gpr::R10:
         state.__r10 = value;
         break;
+    default: // R11 is read only
+        break;
     }
 #elif defined(__FreeBSD__)
     auto& context = ((ucontext_t*)ctx)->uc_mcontext;
@@ -78,6 +102,8 @@ void SetX64Gpr(void* ctx, X64Gpr reg, u64 value) {
     case X64Gpr::R10:
         context.mc_r10 = value;
         break;
+    default: // R11 is read only
+        break;
     }
 #else
     auto& gregs = ((ucontext_t*)ctx)->uc_mcontext.gregs;
@@ -87,6 +113,8 @@ void SetX64Gpr(void* ctx, X64Gpr reg, u64 value) {
         break;
     case X64Gpr::R10:
         gregs[REG_R10] = value;
+        break;
+    default: // R11 is read only
         break;
     }
 #endif

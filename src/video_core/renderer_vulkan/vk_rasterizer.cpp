@@ -2115,6 +2115,53 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     return true;
 }
 
+bool Rasterizer::ReadCleanMemory(VAddr addr, void* out, u64 size) {
+    if (!IsMapped(addr, size) || buffer_cache.IsRangeGpuWritten(addr, size) ||
+        !memory->TryReadBacking(addr, out, size)) {
+        return false;
+    }
+    static const bool verify = std::getenv("SHADPS4_CLEAN_READ_VERIFY") != nullptr;
+    if (verify) {
+        VerifyCleanRead(addr, out, size);
+    }
+    return true;
+}
+
+void Rasterizer::VerifyCleanRead(VAddr addr, const void* served, u64 size) {
+    // Gate only: every clean read pays the readback it was meant to avoid. The readback runs as a fault on
+    // this thread would, and afterwards the backing must still hold the bytes the clean read served
+    static std::vector<u8> read_back;
+    static u64 checks = 0;
+    static u64 mismatches = 0;
+    static auto last_report = std::chrono::steady_clock::now();
+    buffer_cache.ReadMemory(addr, size, false, true);
+    read_back.resize(size);
+    if (!memory->TryReadBacking(addr, read_back.data(), size)) {
+        return;
+    }
+    ++checks;
+    const auto* served_bytes = static_cast<const u8*>(served);
+    u64 offset = 0;
+    while (offset < size && served_bytes[offset] == read_back[offset]) {
+        ++offset;
+    }
+    if (offset != size) {
+        ++mismatches;
+        if (mismatches <= 32) {
+            LOG_ERROR(Render_Vulkan,
+                      "Clean read verify: byte {:#x} of {} at {:#x} was served as {:#04x}, the "
+                      "readback left {:#04x}",
+                      offset, size, addr, served_bytes[offset], read_back[offset]);
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (checks == 1 || now - last_report >= std::chrono::minutes{1}) {
+        LOG_WARNING(Render_Vulkan, "Clean read verify: {} clean reads checked, {} mismatches",
+                    checks, mismatches);
+        last_report = now;
+    }
+}
+
 bool Rasterizer::IsPlausibleImage(const VideoCore::ImageInfo& info) {
     // A garbage T# (e.g. read from a constant buffer the guest has not written yet) can pass the address and
     // format checks and still describe an image that Vulkan cannot create. Creating it exhausts device memory

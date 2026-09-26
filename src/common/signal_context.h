@@ -18,8 +18,10 @@ void IncrementRip(void* ctx, u64 length);
 enum class X64Gpr : u8 {
     Rdi,
     R10,
+    R11, // Read only (GetX64Gpr)
 };
 
+u64 GetX64Gpr(void* ctx, X64Gpr reg);
 void SetX64Gpr(void* ctx, X64Gpr reg, u64 value);
 #endif
 
