@@ -622,6 +622,22 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
     mnt->Mount(mount_download_dir, "/download0");
 
+    if (EmulatorSettings.IsRedirectApp0Logs()) {
+        // Only /app0/logs becomes writable; the rest of /app0 stays read-only.
+        const auto mount_game_logs_dir =
+            Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "game_logs" / id;
+        std::error_code ec;
+        std::filesystem::create_directories(mount_game_logs_dir, ec);
+        if (ec) {
+            LOG_ERROR(Loader, "Could not create {} for /app0/logs: {}",
+                      mount_game_logs_dir.string(), ec.message());
+        } else {
+            LOG_WARNING(Loader, "Workaround redirect_app0_logs: /app0/logs -> {}",
+                        mount_game_logs_dir.string());
+            mnt->Mount(mount_game_logs_dir, "/app0/logs");
+        }
+    }
+
     // SHADPS4_RDOC_CAPTURE_DIR moves RenderDoc captures off the user dir (they can be GBs)
     const char* capture_dir_env = std::getenv("SHADPS4_RDOC_CAPTURE_DIR");
     const std::filesystem::path mount_captures_dir =

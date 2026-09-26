@@ -106,15 +106,18 @@ public:
 
     const MntPair* GetMount(const std::string& guest_path) {
         std::scoped_lock lock{m_mutex};
-        const auto it = std::ranges::find_if(m_mnt_pairs, [&](const auto& mount) {
+        // Pick the longest matching mount so nested mounts (e.g. a writable /app0/logs
+        // inside the read-only /app0) take precedence over their parent.
+        const MntPair* best = nullptr;
+        for (const auto& mount : m_mnt_pairs) {
             // When doing starts-with check, add a trailing slash to make sure we don't match
             // against only part of the mount path.
-            return guest_path == mount.mount || guest_path.starts_with(mount.mount + "/");
-        });
-        if (it == m_mnt_pairs.end()) {
-            return nullptr;
+            if ((guest_path == mount.mount || guest_path.starts_with(mount.mount + "/")) &&
+                (!best || mount.mount.size() > best->mount.size())) {
+                best = &mount;
+            }
         }
-        return &*it;
+        return best;
     }
 
 private:
