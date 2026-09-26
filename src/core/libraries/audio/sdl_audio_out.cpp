@@ -84,7 +84,9 @@ public:
         UpdateVolumeIfChanged();
         const u64 current_time = Kernel::sceKernelGetProcessTime();
         convert(ptr, internal_buffer, buffer_frames, nullptr);
-        HandleTiming(current_time);
+        const float speed = GetGameSpeed();
+        UpdateSpeedIfChanged(speed);
+        HandleTiming(current_time, speed);
 
         if ((output_count++ & 0xF) == 0) { // Check every 16 outputs
             ManageAudioQueue();
@@ -216,10 +218,24 @@ private:
         }
     }
 
-    void HandleTiming(u64 current_time) {
+    void UpdateSpeedIfChanged(float speed) {
+        if (speed == applied_speed) [[likely]] {
+            return;
+        }
+        // Below 1.0 SDL consumes the queued data slower, which lowers the pitch.
+        if (SDL_SetAudioStreamFrequencyRatio(stream, speed)) {
+            applied_speed = speed;
+        } else {
+            LOG_ERROR(Lib_AudioOut, "Failed to set audio stream speed: {}", SDL_GetError());
+        }
+    }
+
+    void HandleTiming(u64 current_time, float speed) {
+        const u64 period =
+            speed == 1.0f ? period_us : static_cast<u64>(static_cast<double>(period_us) / speed);
         if (next_output_time == 0) [[unlikely]] {
             // First output - set initial timing
-            next_output_time = current_time + period_us;
+            next_output_time = current_time + period;
             return;
         }
 
@@ -227,11 +243,11 @@ private:
 
         if (time_diff > static_cast<s64>(TIMING_RESYNC_THRESHOLD_US)) [[unlikely]] {
             // We're far behind - resync
-            next_output_time = current_time + period_us;
+            next_output_time = current_time + period;
         } else if (time_diff < 0) {
             // We're ahead of schedule - wait
             const u64 time_to_wait = static_cast<u64>(-time_diff);
-            next_output_time += period_us;
+            next_output_time += period;
 
             if (time_to_wait > MIN_SLEEP_THRESHOLD_US) {
                 // Sleep for most of the wait period
@@ -240,7 +256,7 @@ private:
             }
         } else {
             // Slightly behind or on time - just advance
-            next_output_time += period_us;
+            next_output_time += period;
         }
     }
 
@@ -639,6 +655,7 @@ private:
     u64 next_output_time{0};
     u64 last_volume_check_time{0};
     u32 output_count{0};
+    float applied_speed{1.0f};
 
     // Buffers
     u32 internal_buffer_size{0};

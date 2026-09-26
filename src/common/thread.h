@@ -42,6 +42,10 @@ public:
 
     void End();
 
+    void SetTargetInterval(std::chrono::nanoseconds interval) {
+        target_interval = interval;
+    }
+
     std::chrono::nanoseconds GetTotalWait() const {
         return total_wait;
     }

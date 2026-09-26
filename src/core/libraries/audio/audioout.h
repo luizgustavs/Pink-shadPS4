@@ -218,5 +218,9 @@ s32 PS4_SYSV_ABI sceAudioOutSparkControlSetEqCoef();
 s32 PS4_SYSV_ABI sceAudioOutSetSystemDebugState();
 
 void AdjustVol();
+// Audio.audio_follow_game_speed: VideoOut reports each guest flip; backends and output threads
+// read the resulting playback speed (1.0 when the setting is off).
+void NotifyGuestFlip(s32 flip_rate);
+float GetGameSpeed();
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 } // namespace Libraries::AudioOut

@@ -379,6 +379,13 @@ struct AudioSettings {
     Setting<std::string> openal_padSpk_output_device{"Default Device"};
     Setting<u32> openal_hrtf{OpenALHrtfMode::HrtfAuto};
     Setting<u32> openal_output_mode{OpenALOutputMode::OutputAuto};
+    // Plays audio at the game's speed: measured guest flips/s over the target frame rate, so a
+    // 30 fps game running at 7.5 fps plays audio at 0.25x (lower pitch). Off by default.
+    Setting<bool> audio_follow_game_speed{false};
+    // Lowest playback speed in percent (clamped to 5-100).
+    Setting<u32> audio_min_game_speed{10};
+    // Target frame rate; 0 = derive it from sceVideoOutSetFlipRate (60 / (rate + 1)).
+    Setting<u32> audio_game_target_fps{0};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -394,14 +401,22 @@ struct AudioSettings {
             make_override<AudioSettings>("openal_padSpk_output_device",
                                          &AudioSettings::openal_padSpk_output_device),
             make_override<AudioSettings>("openal_hrtf", &AudioSettings::openal_hrtf),
-            make_override<AudioSettings>("openal_output_mode", &AudioSettings::openal_output_mode)};
+            make_override<AudioSettings>("openal_output_mode", &AudioSettings::openal_output_mode),
+            make_override<AudioSettings>("audio_follow_game_speed",
+                                         &AudioSettings::audio_follow_game_speed),
+            make_override<AudioSettings>("audio_min_game_speed",
+                                         &AudioSettings::audio_min_game_speed),
+            make_override<AudioSettings>("audio_game_target_fps",
+                                         &AudioSettings::audio_game_target_fps)};
     }
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
                                    sdl_main_output_device, sdl_padSpk_output_device,
                                    openal_mic_device, openal_main_output_device,
-                                   openal_padSpk_output_device, openal_hrtf, openal_output_mode)
+                                   openal_padSpk_output_device, openal_hrtf, openal_output_mode,
+                                   audio_follow_game_speed, audio_min_game_speed,
+                                   audio_game_target_fps)
 
 // Windows static guest red-zone protection
 struct WindowsGuestRedZoneProtectionSettings {
@@ -798,6 +813,9 @@ public:
     SETTING_FORWARD(m_audio, OpenALPadSpkOutputDevice, openal_padSpk_output_device)
     SETTING_FORWARD(m_audio, OpenALHrtf, openal_hrtf)
     SETTING_FORWARD(m_audio, OpenALOutputMode, openal_output_mode)
+    SETTING_FORWARD_BOOL(m_audio, AudioFollowGameSpeed, audio_follow_game_speed)
+    SETTING_FORWARD(m_audio, AudioMinGameSpeed, audio_min_game_speed)
+    SETTING_FORWARD(m_audio, AudioGameTargetFps, audio_game_target_fps)
 
     // Windows static guest red-zone protection
     SETTING_FORWARD(m_windows_guest_red_zone_protection, WindowsGuestRedZoneProtectionMode,

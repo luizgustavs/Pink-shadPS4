@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -28,6 +30,14 @@ std::mutex port_allocation_mutex;
 
 static std::unique_ptr<AudioOutBackend> audio;
 static std::atomic<int> lazy_init{0};
+
+// Audio follows game speed: flips/s measured over a window, divided by the target frame rate.
+static constexpr u64 GAME_SPEED_WINDOW_US = 500'000;
+static std::atomic<float> game_speed{1.0f};
+static std::mutex game_speed_mutex;
+static u64 game_speed_window_start = 0;
+static u32 game_speed_window_flips = 0;
+static u32 game_speed_logged_target = 0;
 
 // Port allocation ranges
 constexpr struct PortRange {
@@ -146,6 +156,54 @@ static int AllocatePort(OrbisAudioOutPort type) {
     return -1;
 }
 
+void NotifyGuestFlip(s32 flip_rate) {
+    if (!EmulatorSettings.IsAudioFollowGameSpeed()) {
+        return;
+    }
+    const u64 now = Kernel::sceKernelGetProcessTime();
+    std::scoped_lock lock{game_speed_mutex};
+    if (game_speed_window_start == 0) {
+        game_speed_window_start = now;
+        return;
+    }
+    ++game_speed_window_flips;
+    const u64 elapsed = now - game_speed_window_start;
+    if (elapsed < GAME_SPEED_WINDOW_US) {
+        return;
+    }
+
+    u32 target_fps = EmulatorSettings.GetAudioGameTargetFps();
+    if (target_fps == 0) {
+        target_fps = 60 / (static_cast<u32>(std::max(flip_rate, 0)) + 1);
+    }
+    if (target_fps != game_speed_logged_target) {
+        LOG_WARNING(Lib_AudioOut, "Audio follows game speed: target {} fps (flip rate {})",
+                    target_fps, flip_rate);
+        game_speed_logged_target = target_fps;
+    }
+
+    const float min_speed =
+        std::clamp(static_cast<float>(EmulatorSettings.GetAudioMinGameSpeed()) * 0.01f, 0.05f,
+                   1.0f);
+    const double fps = game_speed_window_flips * 1'000'000.0 / static_cast<double>(elapsed);
+    const float measured = std::clamp(static_cast<float>(fps / target_fps), min_speed, 1.0f);
+    // Halfway per window: follows real changes within ~1 s without wobbling the pitch every frame.
+    const float previous = game_speed.load(std::memory_order_relaxed);
+    const float speed = previous + (measured - previous) * 0.5f;
+    game_speed.store(speed, std::memory_order_relaxed);
+    LOG_DEBUG(Lib_AudioOut, "Game speed {:.3f} ({:.2f} fps)", speed, fps);
+
+    game_speed_window_start = now;
+    game_speed_window_flips = 0;
+}
+
+float GetGameSpeed() {
+    if (!EmulatorSettings.IsAudioFollowGameSpeed()) {
+        return 1.0f;
+    }
+    return game_speed.load(std::memory_order_relaxed);
+}
+
 void AdjustVol() {
     if (lazy_init.load(std::memory_order_relaxed) == 0 && audio == nullptr) {
         return;
@@ -168,8 +226,9 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
         Common::SetCurrentThreadName(thread_name.c_str());
     }
 
-    Common::AccurateTimer timer(
-        std::chrono::nanoseconds(1000000000ULL * port->buffer_frames / port->sample_rate));
+    const std::chrono::nanoseconds period(1000000000ULL * port->buffer_frames /
+                                          port->sample_rate);
+    Common::AccurateTimer timer(period);
 
     while (true) {
         timer.Start();
@@ -194,6 +253,11 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
             break;
         }
 
+        // At game speed s the guest gets a free buffer every period / s.
+        const float speed = GetGameSpeed();
+        timer.SetTargetInterval(
+            speed == 1.0f ? period
+                          : std::chrono::nanoseconds(static_cast<s64>(period.count() / speed)));
         timer.End();
     }
 

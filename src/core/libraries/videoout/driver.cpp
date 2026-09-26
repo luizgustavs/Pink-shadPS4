@@ -6,6 +6,7 @@
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/audio/audioout.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
@@ -255,6 +256,7 @@ void VideoOutDriver::Flip(const Request& req) {
         }
         --flip_status.flip_pending_num;
     }
+    AudioOut::NotifyGuestFlip(port->flip_rate);
 
     // Trigger flip events for the port.
     for (auto event : port->flip_events) {

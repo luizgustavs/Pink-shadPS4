@@ -106,6 +106,12 @@ public:
 
         UpdateVolumeIfChanged();
         const u64 current_time = Kernel::sceKernelGetProcessTime();
+        const float speed = GetGameSpeed();
+        if (speed != applied_speed) {
+            // Below 1.0 the source plays slower, which lowers the pitch.
+            alSourcef(source, AL_PITCH, speed);
+            applied_speed = speed;
+        }
 
         // Convert audio data ONCE per call
         if (use_native_float) {
@@ -161,10 +167,12 @@ public:
         }
 
         // Only sleep if we have healthy buffer queue
+        const u64 period =
+            speed == 1.0f ? period_us : static_cast<u64>(static_cast<double>(period_us) / speed);
         if (queued >= 2) {
-            HandleTiming(current_time);
+            HandleTiming(current_time, period);
         } else {
-            next_output_time = current_time + period_us;
+            next_output_time = current_time + period;
         }
 
         last_output_time.store(current_time, std::memory_order_release);
@@ -405,26 +413,26 @@ private:
         }
     }
 
-    void HandleTiming(u64 current_time) {
+    void HandleTiming(u64 current_time, u64 period) {
         if (next_output_time == 0) [[unlikely]] {
-            next_output_time = current_time + period_us;
+            next_output_time = current_time + period;
             return;
         }
 
         const s64 time_diff = static_cast<s64>(current_time - next_output_time);
 
         if (time_diff > static_cast<s64>(TIMING_RESYNC_THRESHOLD_US)) [[unlikely]] {
-            next_output_time = current_time + period_us;
+            next_output_time = current_time + period;
         } else if (time_diff < 0) {
             const u64 time_to_wait = static_cast<u64>(-time_diff);
-            next_output_time += period_us;
+            next_output_time += period;
 
             if (time_to_wait > MIN_SLEEP_THRESHOLD_US) {
                 const u64 sleep_duration = time_to_wait - MIN_SLEEP_THRESHOLD_US;
                 std::this_thread::sleep_for(std::chrono::microseconds(sleep_duration));
             }
         } else {
-            next_output_time += period_us;
+            next_output_time += period;
         }
     }
 
@@ -1044,6 +1052,7 @@ private:
     u64 next_output_time{0};
     u64 last_volume_check_time{0};
     u32 output_count{0};
+    float applied_speed{1.0f};
 
     // OpenAL objects
     OpenALDevice* device_context{nullptr};
