@@ -13,9 +13,11 @@
 #include "common/perf_stats.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/process.h"
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/amdgpu/tiling.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -29,6 +31,7 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/texture_cache/tile.h"
 
 namespace Vulkan {
 
@@ -312,6 +315,41 @@ void DiagProbeTable(const Shader::Info& cs, const AmdGpu::ComputeProgram& cs_pro
                     u32(image.last_level), u32(image.tiling_index), words[4], words[5], words[6],
                     words[7]);
     }
+}
+
+/// ImageInfo sizes a T# with asserts and table lookups that only hold for layouts real images use. A
+/// garbage T# (SotC: a block-compressed format on a macro-tiled mode, image_info.cpp:184) must be rejected
+/// before ImageInfo is built, or the check itself aborts the process. Returns why, or nullptr if it can be
+/// built
+const char* UnsupportedImageLayout(const AmdGpu::Image& tsharp) {
+    const auto tile_mode = tsharp.GetTileMode();
+    if (!magic_enum::enum_contains(tile_mode)) {
+        return "reserved tile mode"; // GetArrayMode: UNREACHABLE
+    }
+    const auto array_mode = AmdGpu::GetArrayMode(tile_mode);
+    if (array_mode == AmdGpu::ArrayMode::ArrayLinearGeneral) {
+        return "linear general"; // UpdateSize: UNREACHABLE
+    }
+    if (!AmdGpu::IsMacroTiled(array_mode)) {
+        return nullptr;
+    }
+    const auto data_fmt = tsharp.GetDataFmt();
+    if (AmdGpu::IsBlockCoded(data_fmt)) {
+        return "block-compressed format on a macro-tiled mode"; // UpdateSize: ASSERT
+    }
+    // GetMacroTileExtents: asserts above 8 samples and indexes its table by log2(bpp) - 3
+    const u32 samples = tsharp.NumSamples();
+    const u32 bpp = AmdGpu::NumBitsPerBlock(data_fmt);
+    if (samples > 8 || bpp < 8 || bpp > 128) {
+        return "macro-tiled mode with an unsupported sample count or bpp";
+    }
+    const bool alt = Libraries::Kernel::sceKernelIsNeoMode() && tsharp.alt_tile_mode;
+    const auto [pitch_align, height_align] =
+        VideoCore::GetMacroTileExtents(tile_mode, bpp, samples, alt);
+    if (pitch_align == 0 || height_align == 0) {
+        return "macro-tiled mode without tile extents"; // ImageSizeMacroTiled: ASSERT
+    }
+    return nullptr;
 }
 
 } // Anonymous namespace
@@ -1355,6 +1393,15 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         "data_format={}, num_format={}, depth={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt), image_desc.is_depth);
+            return false;
+        }
+
+        if (const char* reason = UnsupportedImageLayout(tsharp)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Rejecting T# with an unsupported layout ({}) address={:#x}, width={}, "
+                        "tiling_index={}, data_format={}, samples={}",
+                        reason, tsharp.Address(), tsharp.width, u32(tsharp.tiling_index),
+                        static_cast<u32>(data_fmt), tsharp.NumSamples());
             return false;
         }
 
