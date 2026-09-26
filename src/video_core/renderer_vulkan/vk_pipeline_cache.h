@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <functional>
+#include <utility>
 #include <variant>
+#include <boost/container/small_vector.hpp>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -100,7 +103,24 @@ public:
         return profile;
     }
 
+    /// shader_code_clean_reads: Rasterizer::ReadCleanMemory, set by the rasterizer
+    std::function<bool(VAddr, void*, u64)> read_clean_memory;
+
 private:
+    /// AmdGpu::SearchBinaryInfo result for one code address, with the guest bytes the search depended on.
+    /// While they are unchanged the search would find the same block, even if the guest replaced the shader
+    struct CachedBinaryInfo {
+        // (offset from the code address, size) of each range the search read, and their bytes in order
+        boost::container::small_vector<std::pair<u64, u32>, 2> ranges;
+        std::vector<u8> bytes;
+        AmdGpu::BinaryInfo info;
+    };
+
+    /// AmdGpu::GetParams without scanning the shader code on every draw and dispatch
+    template <typename Program>
+    Shader::ShaderParams GetParamsCached(const Program& pgm);
+    bool CachedBytesMatch(const u32* code, const CachedBinaryInfo& cached);
+
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
@@ -138,6 +158,8 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    tsl::robin_map<const u32*, CachedBinaryInfo> binary_info_cache;
+    std::vector<u8> code_scratch;
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

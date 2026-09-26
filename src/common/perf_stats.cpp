@@ -36,6 +36,7 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::SrtCleanReads, "srt_clean", Unit::Count},
     {Id::SrtCleanReadNs, "srt_clean_ms", Unit::Ms},
     {Id::SrtCleanLoads, "srt_clean_nofault", Unit::Count},
+    {Id::ShaderCodeCleanReads, "code_clean", Unit::Count},
     {Id::Readbacks, "readbacks", Unit::Count},
     {Id::ReadbackNs, "readback_ms", Unit::Ms},
     {Id::ReadbackBytes, "readback_kb", Unit::Kb},

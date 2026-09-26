@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstddef>
+#include <cstring>
 #include <ranges>
 
 #include "common/hash.h"
@@ -500,6 +502,74 @@ bool PipelineCache::RefreshGraphicsKey() {
     return true;
 }
 
+bool PipelineCache::CachedBytesMatch(const u32* code, const CachedBinaryInfo& cached) {
+    // SotC keeps shader code on pages it shares with GPU-written buffers: reading it through the protected
+    // page faults, reads the page back and drains the GPU. Bytes the GPU never wrote already hold their
+    // value in the backing (shader_code_clean_reads)
+    const bool clean = EmulatorSettings.IsShaderCodeCleanReads() && read_clean_memory;
+    const auto* base = reinterpret_cast<const u8*>(code);
+    const u8* expected = cached.bytes.data();
+    for (const auto& [offset, size] : cached.ranges) {
+        const u8* current = base + offset;
+        if (clean) {
+            code_scratch.resize(size);
+            if (read_clean_memory(reinterpret_cast<VAddr>(current), code_scratch.data(), size)) {
+                current = code_scratch.data();
+                Common::PerfStats::Add(Common::PerfStats::Id::ShaderCodeCleanReads);
+            }
+        }
+        if (std::memcmp(current, expected, size) != 0) {
+            return false;
+        }
+        expected += size;
+    }
+    return true;
+}
+
+template <typename Program>
+Shader::ShaderParams PipelineCache::GetParamsCached(const Program& pgm) {
+    const auto* code = pgm.template Address<u32*>();
+    const auto make_params = [&](const AmdGpu::BinaryInfo& info) {
+        return Shader::ShaderParams{
+            .user_data = pgm.user_data,
+            .code = std::span{code, info.length / sizeof(u32)},
+            .hash = info.shader_hash,
+        };
+    };
+    if (const auto it = binary_info_cache.find(code);
+        it != binary_info_cache.end() && CachedBytesMatch(code, it->second)) {
+        return make_params(it->second.info);
+    }
+    const auto& info = AmdGpu::SearchBinaryInfo(code);
+    auto& cached = binary_info_cache[code];
+    cached.ranges.clear();
+    cached.bytes.clear();
+    std::memcpy(&cached.info, &info, sizeof(info));
+    const auto* base = reinterpret_cast<const u8*>(code);
+    const auto add_range = [&](const u8* begin, u32 size) {
+        cached.ranges.emplace_back(static_cast<u64>(begin - base), size);
+        cached.bytes.insert(cached.bytes.end(), begin, begin + size);
+    };
+    // The bytes SearchBinaryInfo read: the header of code starting with s_mov_b32 vcc_hi points at the block,
+    // otherwise the code is scanned up to the block
+    constexpr u32 token_mov_vcchi = 0xBEEB03FF;
+    constexpr u32 info_extent = offsetof(AmdGpu::BinaryInfo, crc32) + sizeof(u32);
+    const auto* found = reinterpret_cast<const u8*>(&info);
+    const auto* header_target =
+        code[0] == token_mov_vcchi ? reinterpret_cast<const u8*>(code + (code[1] + 1) * 2) : nullptr;
+    if (found == header_target) {
+        add_range(base, 2 * sizeof(u32));
+        add_range(found, info_extent);
+    } else {
+        add_range(base, static_cast<u32>(found - base) + info_extent);
+        if (header_target) {
+            // The header pointed at an invalid block; it must stay invalid
+            add_range(header_target, sizeof(AmdGpu::BinaryInfo::signature_ref));
+        }
+    }
+    return make_params(cached.info);
+}
+
 bool PipelineCache::RefreshGraphicsStages() {
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
@@ -522,7 +592,7 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
 
-        const auto params = AmdGpu::GetParams(*pgm);
+        const auto params = GetParamsCached(*pgm);
         std::tie(infos[stage_out_idx], modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
             GetProgram(stage_in, stage_out, params, binding);
         return true;
@@ -622,7 +692,7 @@ bool PipelineCache::RefreshGraphicsStages() {
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    const auto cs_params = GetParamsCached(cs_pgm);
     std::tie(infos[0], modules[0], compute_key.value) =
         GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
     return true;

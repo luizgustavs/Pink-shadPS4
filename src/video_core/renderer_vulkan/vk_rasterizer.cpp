@@ -493,6 +493,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     memory->SetRasterizer(this);
 
     scheduler.SetSessionCallback([this] { buffer_cache.FlushSyncBatch(true); });
+    pipeline_cache.read_clean_memory = [this](VAddr addr, void* out, u64 size) {
+        return ReadCleanMemory(addr, out, size);
+    };
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();

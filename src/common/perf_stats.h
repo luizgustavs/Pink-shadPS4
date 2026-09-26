@@ -29,6 +29,8 @@ enum class Id : u32 {
     SrtCleanReadNs,
     // Walker loads served the same way by the generated code, without a fault
     SrtCleanLoads,
+    // Cached shader code ranges compared through the backing (shader_code_clean_reads)
+    ShaderCodeCleanReads,
     // Tracker readbacks on the GPU thread, each draining Vulkan before copying data to guest memory
     Readbacks,
     ReadbackNs,
