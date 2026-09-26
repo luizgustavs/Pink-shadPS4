@@ -56,6 +56,85 @@ static void LogSync(std::string_view queue, fmt::format_string<Args...> format, 
                 fmt::format(format, std::forward<Args>(args)...));
 }
 
+namespace CpHistory {
+
+namespace {
+struct Entry {
+    u64 ns;
+    const void* header; // packet header, or the first dword of a submit
+    std::array<u32, 4> words;
+    u32 size_dw; // submits only
+    s16 queue;
+    u16 opcode; // SubmitOpcode for a submit
+};
+constexpr u16 SubmitOpcode = 0xFFFF;
+constexpr u32 NumEntries = 1024;
+std::array<Entry, NumEntries> entries{};
+std::atomic<u64> next_entry{0};
+
+u64 NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+std::string QueueName(s16 queue) {
+    return queue == Queue::Ce ? "CE" : queue == Queue::De ? "DE" : fmt::format("ASC{}", queue);
+}
+} // Anonymous namespace
+
+bool Enabled() {
+    static const bool enabled = std::getenv("SHADPS4_CBUF_PROBE") != nullptr;
+    return enabled;
+}
+
+void RecordPacket(s16 queue, const void* header) {
+    // Packets come from the command processor thread only; submits race with it, which is fine for
+    // a diagnostic (a torn entry shows up as garbage in the dump)
+    auto& entry = entries[next_entry.fetch_add(1, std::memory_order_relaxed) % NumEntries];
+    const auto* pm4 = static_cast<const PM4Header*>(header);
+    const auto* body = static_cast<const u32*>(header) + 1;
+    const u32 count = std::min<u32>(pm4->type3.NumWords(), 4);
+    entry.ns = NowNs();
+    entry.header = header;
+    entry.words = {};
+    std::memcpy(entry.words.data(), body, count * sizeof(u32));
+    entry.size_dw = 0;
+    entry.queue = queue;
+    entry.opcode = static_cast<u16>(pm4->type3.opcode.Value());
+}
+
+void RecordSubmit(s16 queue, std::span<const u32> commands) {
+    auto& entry = entries[next_entry.fetch_add(1, std::memory_order_relaxed) % NumEntries];
+    entry.ns = NowNs();
+    entry.header = commands.data();
+    entry.words = {};
+    entry.size_dw = static_cast<u32>(commands.size());
+    entry.queue = queue;
+    entry.opcode = SubmitOpcode;
+}
+
+void Dump(u32 count) {
+    const u64 end = next_entry.load(std::memory_order_relaxed);
+    const u64 begin = end - std::min<u64>({end, count, NumEntries});
+    const u64 now = NowNs();
+    for (u64 i = begin; i < end; ++i) {
+        const Entry entry = entries[i % NumEntries];
+        const double ago_ms = static_cast<double>(now - entry.ns) / 1e6;
+        if (entry.opcode == SubmitOpcode) {
+            LOG_WARNING(Render, "CbufProbe hist -{:.3f}ms {} SUBMIT {} dwords at {}", ago_ms,
+                        QueueName(entry.queue), entry.size_dw, entry.header);
+            continue;
+        }
+        const auto opcode = static_cast<PM4ItOpcode>(entry.opcode);
+        LOG_WARNING(Render, "CbufProbe hist -{:.3f}ms {} {} at {} [{:08x} {:08x} {:08x} {:08x}]",
+                    ago_ms, QueueName(entry.queue), magic_enum::enum_name(opcode), entry.header,
+                    entry.words[0], entry.words[1], entry.words[2], entry.words[3]);
+    }
+}
+
+} // namespace CpHistory
+
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
 
@@ -217,6 +296,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 
         const PM4ItOpcode opcode = header->type3.opcode;
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
+        if (CpHistory::Enabled()) {
+            CpHistory::RecordPacket(CpHistory::Queue::Ce, header);
+        }
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             // const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -328,6 +410,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            if (CpHistory::Enabled()) {
+                CpHistory::RecordPacket(CpHistory::Queue::De, header);
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -1061,6 +1146,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        if (CpHistory::Enabled()) {
+            CpHistory::RecordPacket(static_cast<s16>(vqid), header);
+        }
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -1407,6 +1495,9 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     if (EmulatorSettings.IsCopyGpuBuffers()) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
     }
+    if (CpHistory::Enabled()) {
+        CpHistory::RecordSubmit(CpHistory::Queue::De, dcb);
+    }
 
     auto task = ProcessGraphics(dcb, ccb);
     {
@@ -1428,6 +1519,9 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
+    if (CpHistory::Enabled()) {
+        CpHistory::RecordSubmit(static_cast<s16>(vqid), acb);
+    }
     const auto& task = ProcessCompute(acb, vqid);
     {
         std::scoped_lock lock{queue.m_access};

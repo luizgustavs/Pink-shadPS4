@@ -1,12 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <tuple>
+#include <fmt/ranges.h>
 
 #include "common/debug.h"
 #include "common/guest_write_journal.h"
@@ -314,6 +318,113 @@ void DiagProbeTable(const Shader::Info& cs, const AmdGpu::ComputeProgram& cs_pro
                     u32(image.num_format), u32(image.type), u32(image.base_level),
                     u32(image.last_level), u32(image.tiling_index), words[4], words[5], words[6],
                     words[7]);
+    }
+}
+
+/// SHADPS4_CBUF_PROBE=<cs hash>:<buffer>:<dword>[,...] (hash in hex): the SotC TDR root cause (§7.5 of the
+/// port guide). Some compute shaders loop up to a constant buffer dword; the device losses showed that dword
+/// holding old ring contents (~10^9 iterations) when the dispatch was recorded. For each listed shader the
+/// dword is read through the backing when the dispatch is recorded (the value the stream buffer copies);
+/// above SHADPS4_CBUF_PROBE_MAX (default 0x100000) the probe logs the words, the tracker state, the last PM4
+/// packets of every queue, and starts a watcher thread that logs when the game changes the dword afterwards
+void ProbeStaleCbuf(const Shader::Info& cs, Core::MemoryManager* memory,
+                    VideoCore::BufferCache& buffer_cache) {
+    struct Target {
+        u64 hash;
+        u32 buffer;
+        u32 dword;
+        u64 seen;
+        u64 stale;
+    };
+    static std::vector<Target> targets = [] {
+        std::vector<Target> parsed;
+        const char* value = std::getenv("SHADPS4_CBUF_PROBE");
+        for (std::string_view rest = value ? value : ""; !rest.empty();) {
+            const size_t comma = rest.find(',');
+            const std::string item{rest.substr(0, comma)};
+            rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+            Target target{};
+            if (std::sscanf(item.c_str(), "%llx:%u:%u", &target.hash, &target.buffer,
+                            &target.dword) == 3) {
+                parsed.push_back(target);
+                LOG_WARNING(Render_Vulkan, "CbufProbe: watching cs {:#x} buffer {} dword {}",
+                            target.hash, target.buffer, target.dword);
+            }
+        }
+        return parsed;
+    }();
+    static const u32 max_value = [] {
+        const char* value = std::getenv("SHADPS4_CBUF_PROBE_MAX");
+        return value ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0x100000u;
+    }();
+    static std::atomic<bool> watcher_running{false};
+    static u32 reports = 0;
+
+    for (auto& target : targets) {
+        if (target.hash != cs.pgm_hash || target.buffer >= cs.buffers.size() ||
+            cs.buffers[target.buffer].IsSpecial()) {
+            continue;
+        }
+        const auto vsharp = cs.buffers[target.buffer].GetSharp(cs);
+        const VAddr addr = vsharp.base_address + u64{target.dword} * sizeof(u32);
+        std::array<u32, 8> words{};
+        const VAddr head = Common::AlignDown(addr, sizeof(words));
+        if (vsharp.base_address <= 1 || !memory->TryReadBacking(head, words.data(), sizeof(words))) {
+            continue;
+        }
+        const u32 value = words[(addr - head) / sizeof(u32)];
+        ++target.seen;
+        const bool stale = value > max_value;
+        target.stale += stale;
+        if (!stale) {
+            if (target.seen <= 3 || target.seen % 10000 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "CbufProbe ok cs {:#x}: [{:#x}]={:#x} (seen {}, stale {}) words {:08x}",
+                            cs.pgm_hash, addr, value, target.seen, target.stale,
+                            fmt::join(words, " "));
+            }
+            continue;
+        }
+        if (++reports > 16) {
+            if (reports % 100 == 0) {
+                LOG_WARNING(Render_Vulkan, "CbufProbe: {} stale dispatches so far", reports);
+            }
+            continue;
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "CbufProbe STALE cs {:#x}: [{:#x}]={:#x} > {:#x} (seen {}, stale {}) V# base "
+                    "{:#x} size {:#x} words@{:#x} {:08x} cpu_modified={} gpu_modified={}",
+                    cs.pgm_hash, addr, value, max_value, target.seen, target.stale,
+                    vsharp.base_address, vsharp.GetSize(), head, fmt::join(words, " "),
+                    buffer_cache.IsRegionCpuModified(head, sizeof(words)),
+                    buffer_cache.IsRegionGpuModified(head, sizeof(words)));
+        AmdGpu::CpHistory::Dump(96);
+        if (!watcher_running.exchange(true)) {
+            std::thread([memory, addr, value, hash = cs.pgm_hash] {
+                const auto start = std::chrono::steady_clock::now();
+                u32 last = value;
+                u32 changes = 0;
+                while (std::chrono::steady_clock::now() - start < std::chrono::seconds{2} &&
+                       changes < 8) {
+                    u32 now_value = last;
+                    if (memory->TryReadBacking(addr, &now_value, sizeof(now_value)) &&
+                        now_value != last) {
+                        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() - start)
+                                            .count();
+                        LOG_WARNING(Render_Vulkan,
+                                    "CbufProbe watch cs {:#x}: [{:#x}] {:#x} -> {:#x} after {} us",
+                                    hash, addr, last, now_value, us);
+                        last = now_value;
+                        ++changes;
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds{100});
+                }
+                LOG_WARNING(Render_Vulkan, "CbufProbe watch cs {:#x}: done, {} changes", hash,
+                            changes);
+                watcher_running = false;
+            }).detach();
+        }
     }
 }
 
@@ -733,6 +844,9 @@ void Rasterizer::DispatchDirect() {
         TraceCompute(cs, cs_program, "Dispatch", memory, buffer_cache, page_manager);
     }
     DiagProbeTable(cs, cs_program, memory);
+    if (AmdGpu::CpHistory::Enabled()) {
+        ProbeStaleCbuf(cs, memory, buffer_cache);
+    }
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
         return;
     }
@@ -783,6 +897,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     if (DrawTrace::Instance().Active()) {
         TraceCompute(pipeline->GetStage(Shader::SwStage::Compute), cs_program, "DispatchIndirect",
                      memory, buffer_cache, page_manager);
+    }
+    if (AmdGpu::CpHistory::Enabled()) {
+        ProbeStaleCbuf(pipeline->GetStage(Shader::SwStage::Compute), memory, buffer_cache);
     }
 
     if (!BindResources(pipeline)) {

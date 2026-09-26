@@ -249,4 +249,15 @@ private:
     s32 curr_qid{-1};
 };
 
+/// SHADPS4_CBUF_PROBE: the last PM4 packets the command processor ran on every queue, plus the
+/// guest submits, so a dispatch caught with a stale constant buffer shows what came before it
+namespace CpHistory {
+enum Queue : s16 { Ce = -2, De = -1 }; // >= 0: ASC vqid
+[[nodiscard]] bool Enabled();
+void RecordPacket(s16 queue, const void* header);
+void RecordSubmit(s16 queue, std::span<const u32> commands);
+/// Logs the last `count` entries, oldest first
+void Dump(u32 count);
+} // namespace CpHistory
+
 } // namespace AmdGpu
