@@ -1,12 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <optional>
+// XXH3_state_t for the streaming hash of HashGuestMemory
+#define XXH_STATIC_LINKING_ONLY
 #include <xxhash.h>
 
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/guest_write_journal.h"
 #include "common/hash.h"
+#include "common/perf_stats.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -23,6 +28,31 @@ namespace VideoCore {
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
+
+/// Hashes guest memory through its physical backing, like XXH3_64bits over the guest range. A direct read can
+/// fault, and inside the fault handler a nested fault on memory the tracker does not handle (not GPU mapped,
+/// or with no backing) was a host access violation (SotC, §17 of the port guide). Returns nullopt when part
+/// of the range has no physical backing, or when the memory manager lock is held for writing (possibly by the
+/// faulting thread itself)
+static std::optional<u64> HashGuestMemory(VAddr addr, u64 size) {
+    auto* memory = Core::Memory::Instance();
+    XXH3_state_t state;
+    XXH3_64bits_reset(&state);
+    while (size != 0) {
+        VAddr run_start{};
+        u64 run_size{};
+        const u8* run = memory->GetBackingRun(addr, &run_start, &run_size, true);
+        if (!run) {
+            return std::nullopt;
+        }
+        const u64 offset = addr - run_start;
+        const u64 chunk = std::min(size, run_size - offset);
+        XXH3_64bits_update(&state, run + offset, chunk);
+        addr += chunk;
+        size -= chunk;
+    }
+    return XXH3_64bits_digest(&state);
+}
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
@@ -78,6 +108,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
+    Common::PerfStats::Add(Common::PerfStats::Id::ImageDownloads);
     const auto download =
         runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, !sync);
     const vk::BufferImageCopy image_download = {
@@ -99,12 +130,17 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (sync) {
         scheduler.Finish();
         download.Invalidate();
+        Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::ImageDownload,
+                                          image.info.guest_address, download_size,
+                                          download.mapped, 1);
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download.mapped, download_size);
     } else {
         scheduler.DeferPriorityOperation(
             [this, device_addr = image.info.guest_address, download, download_size] {
                 download.Invalidate();
+                Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::ImageDownload,
+                                                  device_addr, download_size, download.mapped, 0);
                 Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
                                                           download.mapped, download_size);
                 runtime.GetStagingPool().FreeDeferred(download);
@@ -114,9 +150,16 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     if (image.hash == 0) {
-        // Initialize hash
-        const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
-        image.hash = XXH3_64bits(addr, image.info.guest_size);
+        // Initialize hash. This runs inside the guest's write fault handler, after the buffer cache brought
+        // the page up to date, so the backing holds the current contents
+        const auto hash = HashGuestMemory(image.info.guest_address, image.info.guest_size);
+        if (!hash) {
+            // No backing to compare against later: treat the image as modified
+            image.flags |= ImageFlagBits::CpuDirty;
+            UntrackImage(image_id);
+            return;
+        }
+        image.hash = *hash;
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
     UntrackImage(image_id);
@@ -224,7 +267,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
 
     if (recreate) {
         auto new_info = requested_info;
-        new_info.resources = std::max(requested_info.resources, cache_image.info.resources);
+        // Each extent separately: std::max over SubresourceExtent is lexicographic, it would keep the cached
+        // layer count when the request has fewer levels but more layers
+        new_info.resources.levels =
+            std::max(requested_info.resources.levels, cache_image.info.resources.levels);
+        new_info.resources.layers =
+            std::max(requested_info.resources.layers, cache_image.info.resources.layers);
         new_info.UpdateSize();
         const auto new_image_id = slot_images.insert(instance, runtime, slot_image_views, new_info);
         RegisterImage(new_image_id);
@@ -696,6 +744,8 @@ void TextureCache::RefreshImage(Image& image) {
 
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
+    const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::TextureUploads,
+                                                    Common::PerfStats::Id::TextureUploadNs};
 
     if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
         False(image.flags & ImageFlagBits::CpuDirty)) {
@@ -763,6 +813,7 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     scheduler.EndRendering();
+    Common::PerfStats::Add(Common::PerfStats::Id::TextureUploadBytes, image.info.guest_size);
 
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
@@ -798,6 +849,10 @@ void TextureCache::RegisterImage(ImageId image_id) {
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
+    stat_images.fetch_add(1, std::memory_order_relaxed);
+    if (image.info.guest_size > stat_largest_image.load(std::memory_order_relaxed)) {
+        stat_largest_image.store(image.info.guest_size, std::memory_order_relaxed);
+    }
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) { page_table[page].push_back(image_id); });
@@ -810,6 +865,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     image.flags &= ~ImageFlagBits::Registered;
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
+    stat_images.fetch_sub(1, std::memory_order_relaxed);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         const auto page_it = page_table.find(page);
         if (page_it == nullptr) {

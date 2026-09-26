@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include "core/emulator_settings.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
@@ -193,6 +194,23 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
             .is_written = true,
         });
         LOG_ERROR(Render, "Enabling DMA for shader {:#x}", info.pgm_hash);
+    }
+
+    // Per-game compute_loop_cap. Read from the settings rather than the Profile: the Profile is stored in the
+    // pipeline cache and a change would disable the cache on every boot. The setting is part of the cache's
+    // codegen key instead
+    const u32 loop_cap = EmulatorSettings.GetComputeLoopCap();
+    const bool has_loop = std::ranges::any_of(program.syntax_list, [](const auto& node) {
+        return node.type == IR::AbstractSyntaxNode::Type::Repeat;
+    });
+    if (loop_cap != 0 && info.hw_stage == HwStage::Compute && has_loop) {
+        info.uses_loop_cap = true;
+        info.loop_cap = loop_cap;
+        info.buffers.push_back({
+            .used_types = IR::Type::U32,
+            .buffer_type = BufferType::LoopCapBuffer,
+            .is_written = true,
+        });
     }
 }
 

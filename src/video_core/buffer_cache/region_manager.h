@@ -37,6 +37,10 @@ public:
         cpu_addr = new_cpu_addr;
     }
 
+    VAddr GetCpuAddress() const noexcept {
+        return cpu_addr;
+    }
+
     static constexpr Bounds GetBounds(u64 offset, u64 size) {
         const u64 end_address = offset + size - 1;
         return Bounds{

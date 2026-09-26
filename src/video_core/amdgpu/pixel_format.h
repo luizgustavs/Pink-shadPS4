@@ -4,11 +4,18 @@
 #pragma once
 
 #include <string_view>
+#include <type_traits>
 #include <fmt/format.h>
 #include "common/assert.h"
 #include "common/types.h"
 
 namespace AmdGpu {
+
+// Guest-controlled enums may contain reserved values (garbage descriptors of draws the game predicates away,
+// constants read before they are written). Diagnose each value once, including when translation is called
+// concurrently by shader compiler workers, and let the caller use the closest valid fallback instead of
+// aborting
+void WarnInvalidDescriptorOnce(std::string_view operation, u64 value, std::string_view fallback);
 
 // Table 8.13 Data and Image Formats [Sea Islands Series Instruction Set Architecture]
 enum class DataFormat : u32 {
@@ -171,7 +178,8 @@ private:
         case CompSwizzle::Alpha:
             return data[3];
         default:
-            UNREACHABLE();
+            WarnInvalidDescriptorOnce("CompMapping::ApplySingle", u32(swizzle), "zero");
+            return T(0);
         }
     }
 
@@ -356,7 +364,11 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
         default:
-            UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
+            if (!std::is_constant_evaluated()) {
+                WarnInvalidDescriptorOnce("MapNumberConversion(SnormNz)", u32(data_fmt),
+                                          "no conversion");
+            }
+            return NumberConversion::None;
         }
     }
     default:

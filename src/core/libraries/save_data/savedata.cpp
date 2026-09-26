@@ -11,6 +11,7 @@
 #include "common/assert.h"
 #include "common/cstring.h"
 #include "common/elf_info.h"
+#include "common/harness.h"
 #include "common/enum.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
@@ -376,6 +377,8 @@ static Error saveDataMount(const OrbisSaveDataMount2* mount_info,
         LOG_INFO(Lib_SaveData, "called without dirName");
         return Error::PARAMETER;
     }
+    LOG_HARNESS_MARKER_ONCE(Lib_SaveData, "first sceSaveDataMount dirName={} mode={:#x}",
+                            mount_info->dirName->data.to_view(), (int)mount_info->mountMode);
 
     // check backup status
     {
@@ -788,6 +791,7 @@ Error PS4_SYSV_ABI sceSaveDataDirNameSearch(const OrbisSaveDataDirNameSearchCond
         return Error::PARAMETER;
     }
     LOG_DEBUG(Lib_SaveData, "called");
+    LOG_HARNESS_MARKER_ONCE(Lib_SaveData, "first sceSaveDataDirNameSearch");
     const std::string_view title_id{cond->titleId == nullptr
                                         ? std::string_view{g_game_serial}
                                         : std::string_view{cond->titleId->data}};

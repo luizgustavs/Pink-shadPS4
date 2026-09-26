@@ -3,10 +3,14 @@
 
 #pragma once
 
+#include <array>
+#include <chrono>
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -72,9 +76,16 @@ public:
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
+    /// Per-game lod_stats_from_bindings: answers IT_GET_LOD_STATS from the counter banks of the T#s bound
+    /// since the previous packet. Returns false when the workaround is off
+    bool WriteLodStats(VAddr address, u32 num_bytes);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+    void ReleaseCpuAuthoritativeRange(VAddr addr, u64 size);
     bool IsMapped(VAddr addr, u64 size);
+
+    /// Returns false for a T# that describes an image Vulkan cannot create (garbage descriptor)
+    bool IsPlausibleImage(const VideoCore::ImageInfo& info);
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
@@ -121,7 +132,17 @@ private:
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    /// dynamic_tsharp_array_size: logs the first descriptor array bound, then a per-minute count
+    void ReportTsharpArray(u64 pgm_hash, u32 num_elements, u32 null_elements);
     bool BindResources(const Pipeline* pipeline);
+
+    /// gpu_checkpoints: attaches SHADPS4_GPU_DIAG details to the command just recorded and runs the
+    /// SHADPS4_GPU_SYNC_EVERY bisection
+    void OnGpuCommandRecorded();
+    /// SHADPS4_GPU_DIAG: copies words of a buffer into host memory on the GPU, right before the command that
+    /// reads them. Returns null when no capture buffer exists
+    const u32* CaptureWords(vk::Buffer buffer, u64 offset, u32 num_words);
+    void CaptureBufferHeads();
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);
@@ -152,9 +173,13 @@ private:
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
-    boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
+    // Room for dynamic_tsharp_array_size descriptor arrays (array_size + 1 bindings each; the recompiler
+    // keeps a shader's arrays within NUM_IMAGE_ARRAY_DESCRIPTORS)
+    static constexpr u32 MaxImageDescriptors =
+        Shader::NUM_IMAGES + Shader::NUM_IMAGE_ARRAY_DESCRIPTORS;
+    boost::container::static_vector<vk::DescriptorImageInfo, MaxImageDescriptors> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
-    boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
+    boost::container::static_vector<VideoCore::ImageId, MaxImageDescriptors> bound_images;
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;
         u64 offset;
@@ -168,9 +193,28 @@ private:
     Shader::PushData push_data;
 
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
-    boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
+    boost::container::static_vector<ImageBindingInfo, MaxImageDescriptors> image_bindings;
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+    // gpu_checkpoints diagnostics (SHADPS4_GPU_DIAG, SHADPS4_GPU_SYNC_EVERY)
+    GpuCheckpoints::Detail diag_detail{};
+    std::array<vk::DescriptorBufferInfo, GpuCheckpoints::Detail::MaxBuffers> diag_sources{};
+    static constexpr u64 DiagCaptureBufferSize = 8_MB;
+    std::unique_ptr<VideoCore::Buffer> diag_capture_buffer;
+    u64 diag_capture_offset{};
+    u32 diag_commands_since_sync{};
+    std::chrono::steady_clock::time_point diag_start{std::chrono::steady_clock::now()};
+    // lod_stats_from_bindings: bindings per T# counter_bank_id since the last IT_GET_LOD_STATS. Only the GPU
+    // command processor thread binds textures and processes the packet
+    const bool lod_stats_enabled;
+    std::array<u32, 256> lod_stats_uses{};
+    u64 lod_stats_packets_minute{};
+    u64 lod_stats_banks_minute{};
+    std::chrono::steady_clock::time_point lod_stats_last_report{};
+    // dynamic_tsharp_array_size: descriptor arrays bound and their null elements
+    u64 tsharp_array_binds_minute{};
+    u64 tsharp_array_null_minute{};
+    std::chrono::steady_clock::time_point tsharp_array_last_report{};
 };
 
 } // namespace Vulkan

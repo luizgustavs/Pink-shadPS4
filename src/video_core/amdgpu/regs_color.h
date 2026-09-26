@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/amdgpu/tiling.h"
 
@@ -293,7 +294,8 @@ struct ColorBuffer {
         }};
         // clang-format on
         const auto swap_idx = static_cast<u32>(info.comp_swap);
-        const auto components_idx = NumComponents(DataFormat(info.format)) - 1;
+        // Reserved formats have no components; clamp so a garbage one cannot index before the table
+        const auto components_idx = std::max(NumComponents(DataFormat(info.format)), 1u) - 1;
         const auto mrt_swizzle = mrt_swizzles[swap_idx][components_idx];
         return RemapSwizzle(DataFormat(info.format), mrt_swizzle);
     }

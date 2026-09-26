@@ -2,10 +2,26 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <mutex>
+#include <set>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "video_core/amdgpu/pixel_format.h"
 
 namespace AmdGpu {
+
+void WarnInvalidDescriptorOnce(std::string_view operation, u64 value, std::string_view fallback) {
+    static std::mutex mutex;
+    static std::set<std::pair<std::string_view, u64>> reported;
+    {
+        std::scoped_lock lock{mutex};
+        if (!reported.emplace(operation, value).second) {
+            return;
+        }
+    }
+    LOG_WARNING(Render, "Unsupported descriptor/register value: {}={:#x}, using {}", operation,
+                value, fallback);
+}
 
 std::string_view NameOf(DataFormat fmt) {
     switch (fmt) {
@@ -74,7 +90,8 @@ std::string_view NameOf(DataFormat fmt) {
     case DataFormat::FormatBc7:
         return "FormatBc7";
     default:
-        UNREACHABLE();
+        // Garbage descriptors reach this through log formatting; naming them must not abort
+        return "FormatUnknown";
     }
 }
 
@@ -107,7 +124,7 @@ std::string_view NameOf(NumberFormat fmt) {
     case NumberFormat::Ubscaled:
         return "Unscaled";
     default:
-        UNREACHABLE();
+        return "Unknown";
     }
 }
 
@@ -154,11 +171,38 @@ static constexpr std::array NUM_COMPONENTS = {
     2, // 39 FormatBc5
     3, // 40 FormatBc6
     4, // 41 FormatBc7
+    0, // 42
+    0, // 43
+    1, // 44 FormatFmask8_S2_F1
+    1, // 45 FormatFmask8_S4_F1
+    1, // 46 FormatFmask8_S8_F1
+    1, // 47 FormatFmask8_S2_F2
+    1, // 48 FormatFmask8_S4_F2
+    1, // 49 FormatFmask8_S4_F4
+    1, // 50 FormatFmask16_S16_F1
+    1, // 51 FormatFmask16_S8_F2
+    1, // 52 FormatFmask32_S16_F2
+    1, // 53 FormatFmask32_S8_F4
+    1, // 54 FormatFmask32_S8_F8
+    1, // 55 FormatFmask64_S16_F4
+    1, // 56 FormatFmask64_S16_F8
+    2, // 57 Format4_4
+    3, // 58 Format6_5_5
+    1, // 59 Format1
+    1, // 60 Format1_Reversed
+    1, // 61 Format32_As_8
+    2, // 62 Format32_As_8_8
+    4, // 63 Format32_As_32_32_32_32
 };
+static_assert(NUM_COMPONENTS.size() == 64, "one entry per 6-bit data format");
 
 u32 NumComponents(DataFormat format) {
     const u32 index = static_cast<u32>(format);
-    ASSERT_MSG(index < NUM_COMPONENTS.size(), "Invalid data format = {}", format);
+    if (index >= NUM_COMPONENTS.size()) {
+        // Every 6-bit hardware field value has an entry; a larger one comes from a bad cast
+        WarnInvalidDescriptorOnce("NumComponents", index, "1");
+        return 1;
+    }
     return NUM_COMPONENTS[index];
 }
 
@@ -205,11 +249,37 @@ static constexpr std::array BITS_PER_BLOCK = {
     128, // 39 FormatBc5
     128, // 40 FormatBc6
     128, // 41 FormatBc7
+    -1,  // 42
+    -1,  // 43
+    8,   // 44 FormatFmask8_S2_F1
+    8,   // 45 FormatFmask8_S4_F1
+    8,   // 46 FormatFmask8_S8_F1
+    8,   // 47 FormatFmask8_S2_F2
+    8,   // 48 FormatFmask8_S4_F2
+    8,   // 49 FormatFmask8_S4_F4
+    16,  // 50 FormatFmask16_S16_F1
+    16,  // 51 FormatFmask16_S8_F2
+    32,  // 52 FormatFmask32_S16_F2
+    32,  // 53 FormatFmask32_S8_F4
+    32,  // 54 FormatFmask32_S8_F8
+    64,  // 55 FormatFmask64_S16_F4
+    64,  // 56 FormatFmask64_S16_F8
+    8,   // 57 Format4_4
+    16,  // 58 Format6_5_5
+    1,   // 59 Format1
+    1,   // 60 Format1_Reversed
+    32,  // 61 Format32_As_8
+    32,  // 62 Format32_As_8_8
+    32,  // 63 Format32_As_32_32_32_32
 };
+static_assert(BITS_PER_BLOCK.size() == 64, "one entry per 6-bit data format");
 
 u32 NumBitsPerBlock(DataFormat format) {
     const u32 index = static_cast<u32>(format);
-    ASSERT_MSG(index < BITS_PER_BLOCK.size(), "Invalid data format = {}", format);
+    if (index >= BITS_PER_BLOCK.size()) {
+        WarnInvalidDescriptorOnce("NumBitsPerBlock", index, "32");
+        return 32;
+    }
     return BITS_PER_BLOCK[index];
 }
 
@@ -256,11 +326,37 @@ static constexpr std::array BITS_PER_ELEMENT = {
     8,   // 39 FormatBc5
     8,   // 40 FormatBc6
     8,   // 41 FormatBc7
+    -1,  // 42
+    -1,  // 43
+    8,   // 44 FormatFmask8_S2_F1
+    8,   // 45 FormatFmask8_S4_F1
+    8,   // 46 FormatFmask8_S8_F1
+    8,   // 47 FormatFmask8_S2_F2
+    8,   // 48 FormatFmask8_S4_F2
+    8,   // 49 FormatFmask8_S4_F4
+    16,  // 50 FormatFmask16_S16_F1
+    16,  // 51 FormatFmask16_S8_F2
+    32,  // 52 FormatFmask32_S16_F2
+    32,  // 53 FormatFmask32_S8_F4
+    32,  // 54 FormatFmask32_S8_F8
+    64,  // 55 FormatFmask64_S16_F4
+    64,  // 56 FormatFmask64_S16_F8
+    8,   // 57 Format4_4
+    16,  // 58 Format6_5_5
+    1,   // 59 Format1
+    1,   // 60 Format1_Reversed
+    32,  // 61 Format32_As_8
+    32,  // 62 Format32_As_8_8
+    32,  // 63 Format32_As_32_32_32_32
 };
+static_assert(BITS_PER_ELEMENT.size() == 64, "one entry per 6-bit data format");
 
 u32 NumBitsPerElement(DataFormat format) {
     const u32 index = static_cast<u32>(format);
-    ASSERT_MSG(index < BITS_PER_ELEMENT.size(), "Invalid data format = {}", format);
+    if (index >= BITS_PER_ELEMENT.size()) {
+        WarnInvalidDescriptorOnce("NumBitsPerElement", index, "32");
+        return 32;
+    }
     return BITS_PER_ELEMENT[index];
 }
 

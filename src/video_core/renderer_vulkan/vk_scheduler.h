@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <array>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -445,14 +447,30 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
+    /// gpu_checkpoints: attributes GPU checkpoint records to this scheduler's submits (see
+    /// vk_gpu_checkpoints.h). Called once, for the rasterizer's scheduler
+    void TrackGpuCommands() noexcept {
+        tracks_gpu_commands = true;
+    }
+
+    /// SHADPS4_PERF_STATS: measures the GPU execution time of every submit with a pair of timestamps and
+    /// reports it as gpu_ms. Called once, for the rasterizer's scheduler
+    void EnableGpuTiming();
+
     static std::mutex submit_mutex;
 
 private:
-    void EndSession();
+    /// Ends the current session. submit_tick is the timeline value of the submit that carries it, or 0 when a
+    /// new session starts inside the same submit
+    void EndSession(u64 submit_tick = 0);
 
     void SubmitExecution(SubmitInfo& info);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
+
+    void BeginGpuTiming();
+    void EndGpuTiming(u64 submit_tick);
+    void CollectGpuTiming();
 
 private:
     const Instance& instance;
@@ -480,6 +498,21 @@ private:
     RenderState render_state;
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};
+
+    bool tracks_gpu_commands{};
+    u64 submitted_seq{};
+
+    static constexpr u32 GpuTimingSlots = 256;
+    struct GpuTimingPending {
+        u32 slot;
+        u64 tick;
+    };
+    vk::UniqueQueryPool gpu_timing_pool;
+    std::deque<GpuTimingPending> gpu_timing_pending;
+    std::array<bool, GpuTimingSlots> gpu_timing_busy{};
+    u32 gpu_timing_next{};
+    s32 gpu_timing_open{-1};
+    double gpu_timestamp_period_ns{};
 };
 
 } // namespace Vulkan

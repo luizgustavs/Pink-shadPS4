@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/div_ceil.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -38,7 +39,7 @@ static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_in
     u32 src_layers = src_info.resources.layers;
     u32 dst_layers = dst_info.resources.layers;
 
-    // 3D images can only use 1 layer.
+    // 3D images use exactly one layer
     if (vk_src_type == vk::ImageType::e3D && src_layers != 1) {
         LOG_WARNING(Render_Vulkan, "Coercing copy 3D source layers {} to 1.", src_layers);
         src_layers = 1;
@@ -48,7 +49,7 @@ static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_in
         dst_layers = 1;
     }
 
-    // If the image type is equal, layer count must match. Take the minimum of both.
+    // Images of the same type need matching layer counts, so use the smaller count
     if (vk_src_type == vk_dst_type) {
         if (src_layers != dst_layers) {
             LOG_WARNING(Render_Vulkan,
@@ -57,7 +58,7 @@ static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_in
             src_layers = dst_layers = std::min(src_layers, dst_layers);
         }
     } else {
-        // For 2D <-> 3D copies, 2D layer count must equal 3D depth.
+        // For 2D and 3D copies, the 2D layer count must match the 3D depth
         if (vk_src_type == vk::ImageType::e2D && vk_dst_type == vk::ImageType::e3D &&
             src_layers != depth) {
             LOG_WARNING(Render_Vulkan,
@@ -75,6 +76,14 @@ static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_in
     }
 
     return std::make_pair(src_layers, dst_layers);
+}
+
+/// Keep the copy inside both images, even when overlapping images at the same address have different sizes
+/// Compare block counts for compressed formats, then return the extent in source texels
+static u32 ClampCopyExtent(u32 src_extent, u32 src_block, u32 dst_extent, u32 dst_block) {
+    const u32 src_blocks = Common::DivCeil(src_extent, src_block);
+    const u32 dst_blocks = Common::DivCeil(dst_extent, dst_block);
+    return std::min(std::min(src_blocks, dst_blocks) * src_block, src_extent);
 }
 
 static u32 BufferImageCopySize(const vk::BufferImageCopy& copy, const vk::Format pixel_format) {
@@ -226,7 +235,7 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
 
-    // Format mismatch warning (safe but useful)
+    // Flag format mismatches to help diagnose copies with undefined results
     if (src->info.pixel_format != dst->info.pixel_format) {
         LOG_DEBUG(Render_Vulkan,
                   "Copy between different formats: src={}, dst={}. "
@@ -234,10 +243,10 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
                   vk::to_string(src->info.pixel_format), vk::to_string(dst->info.pixel_format));
     }
 
-    const u32 base_width = src->info.size.width;
-    const u32 base_height = src->info.size.height;
     const u32 base_depth =
         dst->info.type == AmdGpu::ImageType::Color3D ? dst->info.size.depth : src->info.size.depth;
+    const auto src_block = vk::blockExtent(src->info.pixel_format);
+    const auto dst_block = vk::blockExtent(dst->info.pixel_format);
 
     // Match sample count before copying
     SetBackingSamples(dst, dst->info.num_samples, false);
@@ -259,11 +268,22 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     const bool is_same_type = !is_2d_to_3d && !is_3d_to_2d;
 
     for (u32 mip = 0; mip < num_mips; ++mip) {
-        const u32 mip_w = std::max(base_width >> mip, 1u);
-        const u32 mip_h = std::max(base_height >> mip, 1u);
+        const u32 mip_w = ClampCopyExtent(std::max(src->info.size.width >> mip, 1u), src_block[0],
+                                          std::max(dst->info.size.width >> mip, 1u), dst_block[0]);
+        const u32 mip_h =
+            ClampCopyExtent(std::max(src->info.size.height >> mip, 1u), src_block[1],
+                            std::max(dst->info.size.height >> mip, 1u), dst_block[1]);
         const u32 mip_d = std::max(base_depth >> mip, 1u);
+        const u32 src_mip_d = std::max(src->info.size.depth >> mip, 1u);
+        const u32 dst_mip_d = std::max(dst->info.size.depth >> mip, 1u);
 
-        const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, mip_d);
+        auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, mip_d);
+        // SanitizeCopyLayers matches 2D layers to 3D depth, so clamp the result to the 2D image
+        if (is_2d_to_3d) {
+            src_layers = std::min(src_layers, src->info.resources.layers);
+        } else if (is_3d_to_2d) {
+            dst_layers = std::min(dst_layers, dst->info.resources.layers);
+        }
 
         vk::ImageCopy region{};
         region.srcSubresource.aspectMask = src_aspect;
@@ -274,14 +294,14 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
         region.dstSubresource.baseArrayLayer = 0;
 
         if (is_same_type) {
-            // 2D->2D OR 3D->3D
+            // Both images have the same dimensionality
             if (src_is_3d) {
-                // 3D images must use layerCount=1
+                // Vulkan requires one layer for 3D images
                 region.srcSubresource.layerCount = 1;
                 region.dstSubresource.layerCount = 1;
-                region.extent = vk::Extent3D(mip_w, mip_h, mip_d);
+                region.extent = vk::Extent3D(mip_w, mip_h, std::min(src_mip_d, dst_mip_d));
             } else {
-                // Array images
+                // Copy only the layers shared by both arrays
                 const u32 copy_layers = std::min(src_layers, dst_layers);
                 region.srcSubresource.layerCount = copy_layers;
                 region.dstSubresource.layerCount = copy_layers;
@@ -321,17 +341,20 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
-void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
-                                  const VideoCore::Buffer* buffer, u64 offset) {
+void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
+    // ResolveDepthOverlap may grow the new image, so copy only the layers shared by both images
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
-    ASSERT(src->info.resources.layers == dst->info.resources.layers && num_mips == 1);
+    ASSERT(num_mips == 1);
 
     SetBackingSamples(dst, dst->info.num_samples, false);
     SetBackingSamples(src, src->info.num_samples);
 
+    // The buffer copy reads and writes the same region, which must fit both images
+    const auto src_block = vk::blockExtent(src->info.pixel_format);
+    const auto dst_block = vk::blockExtent(dst->info.pixel_format);
     vk::BufferImageCopy buffer_copy = {
-        .bufferOffset = offset,
+        .bufferOffset = 0,
         .bufferRowLength = 0,
         .bufferImageHeight = 0,
         .imageSubresource{
@@ -341,9 +364,21 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
             .layerCount = num_layers,
         },
         .imageOffset = {0, 0, 0},
-        .imageExtent = {src->info.size.width, src->info.size.height, src->info.size.depth},
+        .imageExtent = {ClampCopyExtent(src->info.size.width, src_block[0], dst->info.size.width,
+                                        dst_block[0]),
+                        ClampCopyExtent(src->info.size.height, src_block[1],
+                                        dst->info.size.height, dst_block[1]),
+                        std::min(src->info.size.depth, dst->info.size.depth)},
     };
-    const auto copy_size = BufferImageCopySize(buffer_copy, src->info.pixel_format);
+    // Size the staging buffer for either format, keeping the usual 128 MiB minimum for smaller copies
+    static constexpr u64 MIN_COPY_BUFFER_SIZE = 128_MB;
+    const u64 copy_size = std::max(BufferImageCopySize(buffer_copy, src->info.pixel_format),
+                                   BufferImageCopySize(buffer_copy, dst->info.pixel_format));
+    const auto copy_ref = staging_pool.Request(std::max(copy_size, MIN_COPY_BUFFER_SIZE),
+                                               VideoCore::MemoryType::DeviceLocal);
+    const VideoCore::Buffer* buffer = copy_ref.buffer;
+    const u64 offset = copy_ref.offset;
+    buffer_copy.bufferOffset = offset;
 
     scheduler.EndRendering();
 
@@ -433,21 +468,47 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
+/// Depth formats whose depth aspect has the same texel layout in a buffer copy
+static u32 DepthCopyClass(vk::Format format) {
+    switch (format) {
+    case vk::Format::eD16Unorm:
+    case vk::Format::eD16UnormS8Uint:
+        return 1;
+    case vk::Format::eD32Sfloat:
+    case vk::Format::eD32SfloatS8Uint:
+        return 2;
+    case vk::Format::eX8D24UnormPack32:
+    case vk::Format::eD24UnormS8Uint:
+        return 3;
+    default:
+        return 0;
+    }
+}
+
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
     if (src->info.num_samples == 1 && dst->info.num_samples == 1) {
-        if (instance.IsMaintenance8Supported() ||
-            src->info.props.is_depth == dst->info.props.is_depth) {
+        const bool depth_format_change = src->info.props.is_depth && dst->info.props.is_depth &&
+                                         src->info.pixel_format != dst->info.pixel_format;
+        const u32 src_depth_class = DepthCopyClass(src->info.pixel_format);
+        const bool buffer_depth_copy =
+            depth_format_change && !instance.IsMaintenance8Supported() && src_depth_class != 0 &&
+            src_depth_class == DepthCopyClass(dst->info.pixel_format) &&
+            src->info.size == dst->info.size &&
+            std::min(src->info.resources.levels, dst->info.resources.levels) == 1;
+        if (buffer_depth_copy) {
+            // Vulkan cannot copy directly between depth/stencil formats such as D16 and D16S8
+            // When the guest adds stencil to a depth image, copy the depth aspect through a buffer
+            CopyImageWithBuffer(src, dst);
+        } else if (instance.IsMaintenance8Supported() ||
+                   src->info.props.is_depth == dst->info.props.is_depth) {
             CopyImage(src, dst);
         } else {
-            // Perform depth from/to color copy using the intermediate copy buffer.
-            static constexpr size_t COPY_BUFFER_SIZE = 128_MB;
-            const auto copy_ref =
-                staging_pool.Request(COPY_BUFFER_SIZE, VideoCore::MemoryType::DeviceLocal);
-            CopyImageWithBuffer(src, dst, copy_ref.buffer, copy_ref.offset);
+            // Copy between depth and color through an intermediate buffer
+            CopyImageWithBuffer(src, dst);
         }
     } else if (src->info.num_samples == 1 && dst->info.num_samples > 1 &&
                dst->info.props.is_depth) {
-        // Perform a rendering pass to transfer the channels of source as samples in dest.
+        // Use a rendering pass to transfer the source channels as destination samples
         bool needs_flush =
             Transit(src, vk::ImageLayout::eShaderReadOnlyOptimal,
                     vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
@@ -638,7 +699,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         Transit(image, vk::ImageLayout::eShaderReadOnlyOptimal,
                 vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
 
-        // Transition dest backing to color attachment layout, not caring of previous contents
+        // Transition the destination backing to the color attachment layout without preserving its contents
         constexpr auto dst_stage = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
         constexpr auto dst_access =
             vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
@@ -663,12 +724,12 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         });
         FlushBarriers();
 
-        // Copy between ms and non ms backing images
+        // Copy between multisampled and single sample backing images
         blit_helper->CopyBetweenMsImages(
             info.size.width, info.size.height, new_backing->num_samples, info.pixel_format,
             backing->num_samples > 1, backing->image, new_backing->image);
 
-        // Update current layout in tracker to new backings layout
+        // Track the layout of the new backing image
         new_backing->state.layout = dst_layout;
         new_backing->state.access_mask = dst_access;
         new_backing->state.pl_stage = dst_stage;

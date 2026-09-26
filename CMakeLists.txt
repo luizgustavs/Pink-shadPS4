@@ -787,7 +787,14 @@ set(COMMON src/common/logging/classes.cpp
            src/common/debug.h
            src/common/decoder.cpp
            src/common/decoder.h
+           src/common/cp_profiler.cpp
+           src/common/cp_profiler.h
            src/common/elf_info.h
+           src/common/guest_write_journal.cpp
+           src/common/guest_write_journal.h
+           src/common/harness.h
+           src/common/perf_stats.cpp
+           src/common/perf_stats.h
            src/common/endian.h
            src/common/enum.h
            src/common/incremental_id.h
@@ -972,6 +979,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/recompiler.cpp
                       src/shader_recompiler/recompiler.h
                       src/shader_recompiler/resource.h
+                      src/shader_recompiler/info.cpp
                       src/shader_recompiler/info.h
                       src/shader_recompiler/params.h
                       src/shader_recompiler/runtime_info.h
@@ -1104,6 +1112,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/amdgpu/resource.h
                src/video_core/amdgpu/tiling.cpp
                src/video_core/amdgpu/tiling.h
+               src/video_core/buffer_cache/bpe_heap_guard.cpp
+               src/video_core/buffer_cache/bpe_heap_guard.h
                src/video_core/buffer_cache/buffer.cpp
                src/video_core/buffer_cache/buffer.h
                src/video_core/buffer_cache/buffer_cache.cpp
@@ -1124,6 +1134,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_compute_pipeline.h
                src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
                src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+               src/video_core/renderer_vulkan/vk_draw_trace.h
+               src/video_core/renderer_vulkan/vk_gpu_checkpoints.h
                src/video_core/renderer_vulkan/vk_instance.cpp
                src/video_core/renderer_vulkan/vk_instance.h
                src/video_core/renderer_vulkan/vk_pipeline_cache.cpp

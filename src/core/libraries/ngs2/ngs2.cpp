@@ -51,7 +51,7 @@ s32 PS4_SYSV_ABI sceNgs2RackCreate(OrbisNgs2Handle systemHandle, u32 rackId,
                                    const OrbisNgs2RackOption* option,
                                    const OrbisNgs2ContextBufferInfo* bufferInfo,
                                    OrbisNgs2Handle* outHandle) {
-    LOG_ERROR(Lib_Ngs2, "rackId = {}", rackId);
+    LOG_DEBUG(Lib_Ngs2, "rackId = {}", rackId);
     if (!systemHandle) {
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
@@ -63,7 +63,7 @@ s32 PS4_SYSV_ABI sceNgs2RackCreateWithAllocator(OrbisNgs2Handle systemHandle, u3
                                                 const OrbisNgs2RackOption* option,
                                                 const OrbisNgs2BufferAllocator* allocator,
                                                 OrbisNgs2Handle* outHandle) {
-    LOG_ERROR(Lib_Ngs2, "rackId = {}", rackId);
+    LOG_DEBUG(Lib_Ngs2, "rackId = {}", rackId);
     if (!systemHandle) {
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
@@ -101,7 +101,7 @@ s32 PS4_SYSV_ABI sceNgs2RackLock(OrbisNgs2Handle rackHandle) {
 
 s32 PS4_SYSV_ABI sceNgs2RackQueryBufferSize(u32 rackId, const OrbisNgs2RackOption* option,
                                             OrbisNgs2ContextBufferInfo* outBufferInfo) {
-    LOG_ERROR(Lib_Ngs2, "rackId = {}", rackId);
+    LOG_DEBUG(Lib_Ngs2, "rackId = {}", rackId);
     return RackQueryBufferSize(option, outBufferInfo);
 }
 
@@ -303,42 +303,54 @@ s32 PS4_SYSV_ABI sceNgs2SystemUnlock(OrbisNgs2Handle systemHandle) {
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
     }
-    LOG_ERROR(Lib_Ngs2, "called");
+    LOG_DEBUG(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2VoiceControl(OrbisNgs2Handle voiceHandle,
                                      const OrbisNgs2VoiceParamHeader* paramList) {
-    LOG_ERROR(Lib_Ngs2, "called");
+    // Hot path: called once per audio grain. Kept at DEBUG to avoid log spam
+    LOG_DEBUG(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2VoiceGetMatrixInfo(OrbisNgs2Handle voiceHandle, u32 matrixId,
                                            OrbisNgs2VoiceMatrixInfo* outInfo, size_t outInfoSize) {
-    LOG_ERROR(Lib_Ngs2, "matrixId = {}, outInfoSize = {}", matrixId, outInfoSize);
+    LOG_DEBUG(Lib_Ngs2, "matrixId = {}, outInfoSize = {}", matrixId, outInfoSize);
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2VoiceGetOwner(OrbisNgs2Handle voiceHandle, OrbisNgs2Handle* outRackHandle,
                                       u32* outVoiceId) {
-    LOG_ERROR(Lib_Ngs2, "called");
+    LOG_DEBUG(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2VoiceGetPortInfo(OrbisNgs2Handle voiceHandle, u32 port,
                                          OrbisNgs2VoicePortInfo* outInfo, size_t outInfoSize) {
-    LOG_ERROR(Lib_Ngs2, "port = {}, outInfoSize = {}", port, outInfoSize);
+    LOG_DEBUG(Lib_Ngs2, "port = {}, outInfoSize = {}", port, outInfoSize);
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2VoiceGetState(OrbisNgs2Handle voiceHandle, OrbisNgs2VoiceState* outState,
                                       size_t stateSize) {
-    LOG_ERROR(Lib_Ngs2, "stateSize = {}", stateSize);
+    // SotC polls this every audio grain, so log at DEBUG to leave real errors visible
+    // The rack's voice type determines the state layout, which this HLE layer does not track
+    // Return ORBIS_OK without clearing outState: a partial clear leaves unknown fields, while a full clear
+    // may overwrite values the game already set
+    LOG_DEBUG(Lib_Ngs2, "stateSize = {}", stateSize);
+    (void)voiceHandle;
+    (void)outState;
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2VoiceGetStateFlags(OrbisNgs2Handle voiceHandle, u32* outStateFlags) {
-    LOG_ERROR(Lib_Ngs2, "called");
+    // A null output pointer would crash the host in this handler; report silence when one is provided
+    if (outStateFlags) {
+        *outStateFlags = 0;
+    }
+    LOG_DEBUG(Lib_Ngs2, "called");
+    (void)voiceHandle;
     return ORBIS_OK;
 }
 

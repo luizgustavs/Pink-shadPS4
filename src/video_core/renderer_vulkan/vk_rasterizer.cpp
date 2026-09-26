@@ -1,7 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <set>
+#include <tuple>
+
 #include "common/debug.h"
+#include "common/guest_write_journal.h"
+#include "common/perf_stats.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -10,6 +19,8 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_draw_trace.h"
+#include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -20,6 +31,290 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Vulkan {
+
+namespace {
+
+/// Diagnostic: SHADPS4_WRITE_WATCH=<addr> (hex) logs the first 64 distinct stage/range pairs that mark it
+/// GPU-modified, i.e. the writers of a corrupted address
+VAddr WriteWatchAddress() {
+    static const VAddr watch = [] {
+        const char* env = std::getenv("SHADPS4_WRITE_WATCH");
+        return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : VAddr{0};
+    }();
+    return watch;
+}
+
+void WatchGpuWrite(std::string_view source, u64 pgm_hash, VAddr addr, u64 size) {
+    const VAddr watch = WriteWatchAddress();
+    if (watch == 0 || watch < addr || watch >= addr + size) {
+        return;
+    }
+    static std::mutex watch_mutex;
+    static std::set<std::tuple<u64, VAddr, u64>> seen;
+    std::scoped_lock lk{watch_mutex};
+    if (seen.size() < 64 && seen.emplace(pgm_hash, addr, size).second) {
+        LOG_WARNING(Render, "Write watch {:#x}: {} (stage {:#x}) marks {:#x}+{:#x} GPU-modified",
+                    watch, source, pgm_hash, addr, size);
+    }
+}
+
+// SHADPS4_DRAW_TRACE: one line per draw or dispatch in the selected frames, then its targets, buffers and
+// textures. Null T#s also dump the raw fetch and the SRT pointer chain
+
+void TraceMemory(s32 frame, u32 index, std::string_view label, VAddr addr,
+                 Core::MemoryManager* memory, VideoCore::BufferCache& buffer_cache,
+                 const VideoCore::PageManager& page_manager) {
+    constexpr u32 NumDwords = 16;
+    if (!memory->IsMappedLocked(addr, NumDwords * sizeof(u32))) {
+        LOG_WARNING(Render_Vulkan, "DrawTrace f={} #{}     {} {:#x} unmapped", frame, index, label,
+                    addr);
+        return;
+    }
+    const bool gpu_modified = buffer_cache.IsRegionGpuModified(addr, NumDwords * sizeof(u32));
+    const bool cpu_modified = buffer_cache.IsRegionCpuModified(addr, NumDwords * sizeof(u32));
+    u32 protection = 0;
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<const void*>(addr), &mbi, sizeof(mbi))) {
+        protection = mbi.Protect;
+    }
+#endif
+    const auto [read_watchers, write_watchers] = page_manager.GetWatchers(addr);
+    // Read through the backing: a protected page would fault (and read back) otherwise
+    std::array<u32, NumDwords> words{};
+    const bool read = memory->TryReadBacking(addr, words.data(), sizeof(words));
+    std::string text;
+    for (const u32 word : words) {
+        text += fmt::format(" {:08x}", word);
+    }
+    LOG_WARNING(Render_Vulkan,
+                "DrawTrace f={} #{}     {} {:#x} cpu_modified={} gpu_modified={} protect={:#x} "
+                "watchers r={} w={}{}",
+                frame, index, label, addr, cpu_modified, gpu_modified, protection, read_watchers,
+                write_watchers, read ? text : std::string{" (no backing)"});
+}
+
+/// Dumps the descriptor table behind user_data[0:1] and every pointer it holds, so a null T# can be traced
+/// back to the memory the SRT walker read. SHADPS4_DRAW_TRACE_CHAIN=<hash> limits this dump to one shader; it
+/// is slow
+void TracePointerChain(s32 frame, u32 index, const Shader::Info& stage,
+                       Core::MemoryManager* memory, VideoCore::BufferCache& buffer_cache,
+                       const VideoCore::PageManager& page_manager) {
+    static const u64 chain_hash = [] {
+        const char* value = std::getenv("SHADPS4_DRAW_TRACE_CHAIN");
+        return value ? std::strtoull(value, nullptr, 16) : 0ULL;
+    }();
+    if (stage.pgm_hash != chain_hash || stage.user_data.size() < 2) {
+        return;
+    }
+    constexpr VAddr AddressMask = 0xFFFFFFFFFFFFULL;
+    const VAddr root = (VAddr(stage.user_data[0]) | VAddr(stage.user_data[1]) << 32) & AddressMask;
+    TraceMemory(frame, index, "ud[0:1]", root, memory, buffer_cache, page_manager);
+    std::array<u64, 8> pointers{};
+    if (!memory->TryReadBacking(root, pointers.data(), sizeof(pointers))) {
+        return;
+    }
+    for (u32 i = 0; i < pointers.size(); ++i) {
+        const VAddr pointer = pointers[i] & AddressMask;
+        if (pointer < 0x100000000ULL || !memory->IsMappedLocked(pointer, 0x40)) {
+            continue;
+        }
+        const u32 offset = i * 8;
+        TraceMemory(frame, index, fmt::format("[ud+{:#x}]", offset), pointer, memory,
+                    buffer_cache, page_manager);
+        TraceMemory(frame, index, fmt::format("[ud+{:#x}]+0x40", offset), pointer + 0x40, memory,
+                    buffer_cache, page_manager);
+    }
+}
+
+void TraceStageBuffers(s32 frame, u32 index, const Shader::Info& stage) {
+    for (u32 i = 0; i < stage.buffers.size(); ++i) {
+        const auto& desc = stage.buffers[i];
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        const auto vsharp = desc.GetSharp(stage);
+        LOG_WARNING(Render_Vulkan,
+                    "DrawTrace f={} #{}   {:#x} buf{} {} addr={:#x} size={:#x} stride={} "
+                    "records={:#x} fmt={}/{}",
+                    frame, index, stage.pgm_hash, i, desc.is_written ? "rw" : "ro",
+                    vsharp.base_address, vsharp.GetSize(), u32(vsharp.stride),
+                    u32(vsharp.num_records), static_cast<u32>(vsharp.GetDataFmt()),
+                    static_cast<u32>(vsharp.GetNumberFmt()));
+    }
+}
+
+void TraceStageImages(s32 frame, u32 index, const Shader::Info& stage, Core::MemoryManager* memory,
+                      VideoCore::BufferCache& buffer_cache,
+                      const VideoCore::PageManager& page_manager) {
+    for (u32 i = 0; i < stage.images.size(); ++i) {
+        const auto& desc = stage.images[i];
+        const bool unknown = std::ranges::find(desc.sharp_fetch.offsets,
+                                               Shader::UNKNOWN_LOCATION) !=
+                             desc.sharp_fetch.offsets.end();
+        const auto tsharp = desc.GetSharp(stage);
+        LOG_WARNING(Render_Vulkan,
+                    "DrawTrace f={} #{}   {:#x} img{} {} addr={:#x} {}x{}x{} pitch={} fmt={}/{} "
+                    "tile={} type={} mips={}-{} array={}{}",
+                    frame, index, stage.pgm_hash, i, desc.is_written ? "rw" : "ro",
+                    tsharp.Address(), u32(tsharp.width) + 1, u32(tsharp.height) + 1,
+                    u32(tsharp.depth) + 1, u32(tsharp.pitch) + 1,
+                    static_cast<u32>(tsharp.GetDataFmt()), static_cast<u32>(tsharp.GetNumberFmt()),
+                    u32(tsharp.tiling_index), u32(tsharp.type), u32(tsharp.base_level),
+                    u32(tsharp.last_level), desc.array_size,
+                    unknown                 ? " NULL(sharp not flattened)"
+                    : tsharp.Address() == 0 ? " NULL"
+                                            : "");
+        if (tsharp.Address() == 0 && !unknown) {
+            // Raw fetch before validation, and where each dword comes from in the flat buffer
+            std::array<u32, 8> raw{};
+            const auto& fetch = desc.sharp_fetch;
+            std::string where;
+            for (u32 dw = 0; dw < raw.size(); ++dw) {
+                const bool loaded = (fetch.load_mask >> dw) & 1u;
+                raw[dw] = loaded && fetch.offsets[dw] < stage.flattened_ud_buf.size()
+                              ? stage.flattened_ud_buf[fetch.offsets[dw]]
+                              : fetch.immediates[dw];
+                where += loaded ? fmt::format(" f{}", fetch.offsets[dw]) : " imm";
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "DrawTrace f={} #{}   {:#x} img{} raw={:08x} {:08x} {:08x} {:08x} {:08x} "
+                        "{:08x} {:08x} {:08x} src={}",
+                        frame, index, stage.pgm_hash, i, raw[0], raw[1], raw[2], raw[3], raw[4],
+                        raw[5], raw[6], raw[7], where);
+            std::string ud;
+            for (const u32 value : stage.user_data) {
+                ud += fmt::format(" {:08x}", value);
+            }
+            LOG_WARNING(Render_Vulkan, "DrawTrace f={} #{}   {:#x} user_data={}", frame, index,
+                        stage.pgm_hash, ud);
+            TracePointerChain(frame, index, stage, memory, buffer_cache, page_manager);
+        }
+    }
+}
+
+const Shader::Info* TryGetStage(const Pipeline* pipeline, Shader::SwStage stage) {
+    return pipeline ? pipeline->TryGetStage(stage) : nullptr;
+}
+
+void TraceGraphics(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline,
+                   std::string_view kind, std::string_view outcome, Core::MemoryManager* memory,
+                   VideoCore::BufferCache& buffer_cache,
+                   const VideoCore::PageManager& page_manager) {
+    auto& tracer = DrawTrace::Instance();
+    const s32 frame = tracer.Frame();
+    const u32 index = tracer.NextIndex();
+    const auto* vs = TryGetStage(pipeline, Shader::SwStage::Vertex);
+    const auto* fs = TryGetStage(pipeline, Shader::SwStage::Fragment);
+    LOG_WARNING(Render_Vulkan,
+                "DrawTrace f={} #{} {} vs={:#x} ps={:#x} ps_addr={:#x} n={} inst={} {}", frame,
+                index, kind, vs ? vs->pgm_hash : 0, fs ? fs->pgm_hash : 0,
+                regs.ps_program.Address<uintptr_t>(), regs.num_indices,
+                regs.num_instances.NumInstances(), outcome);
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        const auto& col_buf = regs.color_buffers[cb];
+        const u32 target_mask = regs.color_target_mask.GetMask(cb);
+        if (!col_buf || !target_mask) {
+            continue;
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "DrawTrace f={} #{}   cb{} addr={:#x} fmt={}/{} pitch={} h={} mask={:#x}",
+                    frame, index, cb, col_buf.Address(), static_cast<u32>(col_buf.GetDataFmt()),
+                    static_cast<u32>(col_buf.GetNumberFmt()), col_buf.Pitch(), col_buf.Height(),
+                    target_mask);
+    }
+    if (regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid()) {
+        LOG_WARNING(Render_Vulkan,
+                    "DrawTrace f={} #{}   db addr={:#x} z_test={} z_write={} stencil={}", frame,
+                    index, regs.depth_buffer.DepthAddress(), u32(regs.depth_control.depth_enable),
+                    u32(regs.depth_control.depth_write_enable),
+                    u32(regs.depth_control.stencil_enable));
+    }
+    for (const auto* stage : {vs, fs}) {
+        if (stage) {
+            TraceStageBuffers(frame, index, *stage);
+            TraceStageImages(frame, index, *stage, memory, buffer_cache, page_manager);
+        }
+    }
+}
+
+void TraceCompute(const Shader::Info& cs, const AmdGpu::ComputeProgram& cs_program,
+                  std::string_view kind, Core::MemoryManager* memory,
+                  VideoCore::BufferCache& buffer_cache,
+                  const VideoCore::PageManager& page_manager) {
+    auto& tracer = DrawTrace::Instance();
+    const s32 frame = tracer.Frame();
+    const u32 index = tracer.NextIndex();
+    LOG_WARNING(Render_Vulkan, "DrawTrace f={} #{} {} cs={:#x} dims={}x{}x{}", frame, index, kind,
+                cs.pgm_hash, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    TraceStageBuffers(frame, index, cs);
+    TraceStageImages(frame, index, cs, memory, buffer_cache, page_manager);
+}
+
+/// SHADPS4_DIAG_PROBE_TABLE=<cs hash> (hex): every 10 s, dumps the reflection-probe table read by SotC's
+/// local IBL pass (the layout dynamic_tsharp_array_size was built from). P = *(u64*)(SGPR0:1 + 8); probe k
+/// keeps its cubemap slot at P + k*224 + 36 and slot s has its 128-bit T# at P + s*32 + 14480 (S# at +16).
+/// Reads go through the backing, so they never fault
+void DiagProbeTable(const Shader::Info& cs, const AmdGpu::ComputeProgram& cs_program,
+                    Core::MemoryManager* memory) {
+    static const u64 target = [] {
+        const char* value = std::getenv("SHADPS4_DIAG_PROBE_TABLE");
+        return value ? std::strtoull(value, nullptr, 16) : 0ULL;
+    }();
+    static std::chrono::steady_clock::time_point last{};
+    if (target == 0 || cs.pgm_hash != target) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (last != decltype(now){} && now - last < std::chrono::seconds{10}) {
+        return;
+    }
+    last = now;
+    const auto read = [memory](VAddr addr, void* out, u64 size) {
+        return addr != 0 && memory->TryReadBacking(addr, out, size);
+    };
+    const VAddr ud = VAddr{cs_program.user_data[0]} | (VAddr{cs_program.user_data[1]} << 32);
+    VAddr table = 0;
+    u32 header = 0;
+    if (!read(ud + 8, &table, sizeof(table)) || !read(table, &header, sizeof(header))) {
+        LOG_WARNING(Render_Vulkan, "DiagProbeTable: ud={:#x} unreadable", ud);
+        return;
+    }
+    std::map<u32, u32> slots;
+    std::string records;
+    for (u32 k = 0; k < 64; ++k) {
+        u32 slot = 0;
+        if (!read(table + k * 224 + 36, &slot, sizeof(slot))) {
+            break;
+        }
+        ++slots[slot];
+        records += fmt::format(" {}", slot);
+    }
+    LOG_WARNING(Render_Vulkan, "DiagProbeTable: ud={:#x} P={:#x} P[0]={} slots(k=0..63):{}", ud,
+                table, header, records);
+    u32 shown = 0;
+    for (const auto& [slot, count] : slots) {
+        if (shown++ == 16 || slot > 4096) {
+            break;
+        }
+        std::array<u32, 8> words{};
+        if (!read(table + u64{slot} * 32 + 14480, words.data(), sizeof(words))) {
+            continue;
+        }
+        AmdGpu::Image image{};
+        std::memcpy(&image, words.data(), 4 * sizeof(u32));
+        LOG_WARNING(Render_Vulkan,
+                    "DiagProbeTable: slot {} (x{}) T#={:08x} {:08x} {:08x} {:08x} addr={:#x} "
+                    "{}x{} fmt={}/{} type={} mips={}-{} tile={} S#={:08x} {:08x} {:08x} {:08x}",
+                    slot, count, words[0], words[1], words[2], words[3], image.Address(),
+                    u32(image.width) + 1, u32(image.height) + 1, u32(image.data_format),
+                    u32(image.num_format), u32(image.type), u32(image.base_level),
+                    u32(image.last_level), u32(image.tiling_index), words[4], words[5], words[6],
+                    words[7]);
+    }
+}
+
+} // Anonymous namespace
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -40,7 +335,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       liverpool{liverpool_}, memory{Core::Memory::Instance()},
       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
-      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
+      lod_stats_enabled{EmulatorSettings.IsLodStatsFromBindings()} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -52,6 +348,17 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
     });
+
+    if (GpuCheckpoints::Enabled()) {
+        scheduler.TrackGpuCommands();
+        if (GpuCheckpoints::DiagEnabled() && GpuCheckpoints::DiagGpuCopies() != 0) {
+            // Uncached host memory: the device loss report reads the words without an invalidate
+            diag_capture_buffer = std::make_unique<VideoCore::Buffer>(
+                instance, 0, DiagCaptureBufferSize, VideoCore::MemoryType::HostUncached,
+                "GPU diag capture");
+        }
+    }
+    scheduler.EnableGpuTiming();
 }
 
 Rasterizer::~Rasterizer() = default;
@@ -184,17 +491,32 @@ void Rasterizer::EliminateFastClear() {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
+    const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Draws,
+                                                    Common::PerfStats::Id::DrawNs};
 
     scheduler.PopPendingOperations();
 
+    const auto& regs = liverpool->regs;
+    const bool trace = DrawTrace::Instance().Active();
+    const std::string_view trace_kind = is_indexed ? "DrawIndexed" : "Draw";
     if (!FilterDraw()) {
+        if (trace) {
+            TraceGraphics(regs, nullptr, trace_kind, "skipped: filtered", memory, buffer_cache,
+                          page_manager);
+        }
         return;
     }
 
-    const auto& regs = liverpool->regs;
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
     if (!pipeline) {
+        if (trace) {
+            TraceGraphics(regs, nullptr, trace_kind, "skipped: no pipeline", memory, buffer_cache,
+                          page_manager);
+        }
         return;
+    }
+    if (trace) {
+        TraceGraphics(regs, pipeline, trace_kind, "", memory, buffer_cache, page_manager);
     }
 
     PrepareRenderState(pipeline);
@@ -223,6 +545,17 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
+    if (GpuCheckpoints::Enabled()) {
+        const auto* fs_info = TryGetStage(pipeline, Shader::SwStage::Fragment);
+        const auto* record = GpuCheckpoints::Push(
+            is_indexed ? GpuCheckpoints::Kind::DrawIndexed : GpuCheckpoints::Kind::Draw,
+            vs_info.pgm_hash, fs_info ? fs_info->pgm_hash : 0, regs.num_indices,
+            regs.num_instances.NumInstances(), 0);
+        if (instance.IsNvDiagnosticCheckpointsSupported()) {
+            cmdbuf.setCheckpointNV(record);
+        }
+    }
+
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
@@ -232,6 +565,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     DebugState.IncDrawCall();
 
+    OnGpuCommandRecorded();
     ResetBindings(false);
 }
 
@@ -239,10 +573,18 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
+    const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Draws,
+                                                    Common::PerfStats::Id::DrawNs};
 
     scheduler.PopPendingOperations();
 
+    const bool trace = DrawTrace::Instance().Active();
+    const std::string_view trace_kind = is_indexed ? "DrawIndexedIndirect" : "DrawIndirect";
     if (!FilterDraw()) {
+        if (trace) {
+            TraceGraphics(liverpool->regs, nullptr, trace_kind, "skipped: filtered", memory,
+                          buffer_cache, page_manager);
+        }
         return;
     }
 
@@ -252,7 +594,15 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     };
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
     if (!pipeline) {
+        if (trace) {
+            TraceGraphics(liverpool->regs, nullptr, trace_kind, "skipped: no pipeline", memory,
+                          buffer_cache, page_manager);
+        }
         return;
+    }
+    if (trace) {
+        TraceGraphics(liverpool->regs, pipeline, trace_kind, "", memory, buffer_cache,
+                      page_manager);
     }
 
     PrepareRenderState(pipeline);
@@ -288,6 +638,19 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
+    if (GpuCheckpoints::Enabled()) {
+        const auto* vs_info = TryGetStage(pipeline, Shader::SwStage::Vertex);
+        const auto* fs_info = TryGetStage(pipeline, Shader::SwStage::Fragment);
+        const auto* record = GpuCheckpoints::Push(
+            is_indexed ? GpuCheckpoints::Kind::DrawIndexedIndirect
+                       : GpuCheckpoints::Kind::DrawIndirect,
+            vs_info ? vs_info->pgm_hash : 0, fs_info ? fs_info->pgm_hash : 0, max_count,
+            count_address != 0, 0, arg_address + offset);
+        if (instance.IsNvDiagnosticCheckpointsSupported()) {
+            cmdbuf.setCheckpointNV(record);
+        }
+    }
+
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
 
@@ -310,11 +673,14 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         DebugState.IncDrawCall();
     }
 
+    OnGpuCommandRecorded();
     ResetBindings(false);
 }
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
+    const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Dispatches,
+                                                    Common::PerfStats::Id::DispatchNs};
 
     scheduler.PopPendingOperations();
 
@@ -325,6 +691,10 @@ void Rasterizer::DispatchDirect() {
     }
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+    if (DrawTrace::Instance().Active()) {
+        TraceCompute(cs, cs_program, "Dispatch", memory, buffer_cache, page_manager);
+    }
+    DiagProbeTable(cs, cs_program, memory);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
         return;
     }
@@ -339,17 +709,31 @@ void Rasterizer::DispatchDirect() {
 
     scheduler.EndRendering();
     pipeline->BindResources(set_writes, push_data);
+    if (GpuCheckpoints::DiagEnabled()) {
+        CaptureBufferHeads();
+    }
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    if (GpuCheckpoints::Enabled()) {
+        const auto* record =
+            GpuCheckpoints::Push(GpuCheckpoints::Kind::Dispatch, cs.pgm_hash, 0, cs_program.dim_x,
+                                 cs_program.dim_y, cs_program.dim_z);
+        if (instance.IsNvDiagnosticCheckpointsSupported()) {
+            cmdbuf.setCheckpointNV(record);
+        }
+    }
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
 
+    OnGpuCommandRecorded();
     ResetBindings(true);
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
+    const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Dispatches,
+                                                    Common::PerfStats::Id::DispatchNs};
 
     scheduler.PopPendingOperations();
 
@@ -357,6 +741,10 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
     if (!pipeline) {
         return;
+    }
+    if (DrawTrace::Instance().Active()) {
+        TraceCompute(pipeline->GetStage(Shader::SwStage::Compute), cs_program, "DispatchIndirect",
+                     memory, buffer_cache, page_manager);
     }
 
     if (!BindResources(pipeline)) {
@@ -372,13 +760,104 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
     scheduler.EndRendering();
     pipeline->BindResources(set_writes, push_data);
+    if (GpuCheckpoints::DiagEnabled()) {
+        CaptureBufferHeads();
+        if (GpuCheckpoints::DiagGpuCopies() > 1) {
+            if (const u32* args = CaptureWords(buffer->Handle(), base, 3)) {
+                diag_detail.args = args;
+                diag_detail.num_args = 3;
+            }
+        }
+    }
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    if (GpuCheckpoints::Enabled()) {
+        const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+        const auto* record = GpuCheckpoints::Push(GpuCheckpoints::Kind::DispatchIndirect,
+                                                  cs.pgm_hash, 0, 0, 0, 0, address + offset);
+        if (instance.IsNvDiagnosticCheckpointsSupported()) {
+            cmdbuf.setCheckpointNV(record);
+        }
+    }
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
 
+    OnGpuCommandRecorded();
     ResetBindings(true);
+}
+
+void Rasterizer::OnGpuCommandRecorded() {
+    if (!GpuCheckpoints::Enabled()) {
+        return;
+    }
+    if (GpuCheckpoints::DiagEnabled()) {
+        GpuCheckpoints::AttachDetail(diag_detail);
+    }
+    // For diagnosis, wait every N guest commands so the ledger can locate the submit that lost the device
+    static const u32 sync_every = [] {
+        const char* value = std::getenv("SHADPS4_GPU_SYNC_EVERY");
+        return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0u;
+    }();
+    static const u32 sync_after_sec = [] {
+        const char* value = std::getenv("SHADPS4_GPU_SYNC_AFTER_SEC");
+        return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0u;
+    }();
+    if (sync_every == 0 || ++diag_commands_since_sync < sync_every) {
+        return;
+    }
+    if (std::chrono::steady_clock::now() - diag_start < std::chrono::seconds{sync_after_sec}) {
+        return;
+    }
+    diag_commands_since_sync = 0;
+    scheduler.Finish();
+}
+
+const u32* Rasterizer::CaptureWords(vk::Buffer buffer, u64 offset, u32 num_words) {
+    // Capture the words the GPU is about to read so a device loss report shows their values
+    // A remaining sentinel shows where execution stopped; the ring overwrites old captures
+    if (!diag_capture_buffer) {
+        return nullptr;
+    }
+    const u64 size = u64(num_words) * sizeof(u32);
+    if (diag_capture_offset + size > DiagCaptureBufferSize) {
+        diag_capture_offset = 0;
+    }
+    const u64 capture_offset = diag_capture_offset;
+    diag_capture_offset += Common::AlignUp(size, 64);
+    auto* words = reinterpret_cast<u32*>(diag_capture_buffer->mapped_data.data() + capture_offset);
+    std::fill_n(words, num_words, GpuCheckpoints::CaptureSentinel);
+    diag_capture_buffer->Flush(capture_offset, size);
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const vk::MemoryBarrier2 before = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &before});
+    cmdbuf.copyBuffer(buffer, diag_capture_buffer->Handle(),
+                      vk::BufferCopy{offset, capture_offset, size});
+    const vk::MemoryBarrier2 after = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost | vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead | vk::AccessFlagBits2::eMemoryRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &after});
+    return words;
+}
+
+void Rasterizer::CaptureBufferHeads() {
+    // Must run outside of a render pass, after the bindings were resolved
+    const u32 count = std::min(diag_detail.num_buffers, GpuCheckpoints::DiagGpuCopies());
+    for (u32 i = 0; i < count; ++i) {
+        const auto& source = diag_sources[i];
+        if (source.buffer && source.range >= GpuCheckpoints::CaptureWords * sizeof(u32)) {
+            diag_detail.buffers[i].words =
+                CaptureWords(source.buffer, source.offset, GpuCheckpoints::CaptureWords);
+        }
+    }
 }
 
 u64 Rasterizer::Flush() {
@@ -414,6 +893,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     set_writes.clear();
     buffer_infos.clear();
     image_infos.clear();
+    if (GpuCheckpoints::DiagEnabled()) {
+        diag_detail.Reset();
+    }
 
     bool uses_dma = false;
 
@@ -435,6 +917,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     if (uses_dma) {
         buffer_cache.SynchronizeDmaBuffers();
     }
+    diag_detail.uses_dma = uses_dma;
 
     return true;
 }
@@ -761,6 +1244,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else if (desc.buffer_type == Shader::BufferType::FaultBuffer) {
                 const auto* fault_buffer = buffer_cache.GetFaultBuffer();
                 buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
+            } else if (desc.buffer_type == Shader::BufferType::LoopCapBuffer) {
+                const auto* loop_cap_buffer = buffer_cache.GetLoopCapBuffer();
+                buffer_infos.emplace_back(loop_cap_buffer->Handle(), 0,
+                                          loop_cap_buffer->SizeBytes());
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = liverpool->GetCsRegs();
@@ -774,12 +1261,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         } else {
             const auto vsharp = desc.GetSharp(stage);
-            if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+            // A V# whose base is not GPU-mapped cannot be a real resource (garbage sharps of draws the game
+            // predicates away). Bind a null descriptor instead of asserting in ClampRangeSize or creating a
+            // buffer over unmapped memory
+            if (vsharp.base_address <= 1 || vsharp.GetSize() == 0 ||
+                !IsMapped(vsharp.base_address, 1)) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
                 if (size != vsharp.GetSize()) {
-                    LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
+                    LOG_DEBUG(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
@@ -796,6 +1287,21 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+                    Common::GuestWriteJournal::Record(
+                        Common::GuestWriteJournal::Source::WrittenBinding, vsharp.base_address,
+                        size, nullptr, stage.pgm_hash);
+                    WatchGpuWrite("written binding", stage.pgm_hash, vsharp.base_address, size);
+                }
+                if (GpuCheckpoints::DiagEnabled() &&
+                    diag_detail.num_buffers < GpuCheckpoints::Detail::MaxBuffers) {
+                    diag_sources[diag_detail.num_buffers] = {buffer->Handle(), offset, size};
+                    diag_detail.AddBuffer(vsharp.base_address, size, desc.is_written);
+                    auto& ref = diag_detail.buffers[diag_detail.num_buffers - 1];
+                    ref.overlaps_stack = memory->OverlapsStackRange(vsharp.base_address, size);
+                    ref.has_cpu_words =
+                        size >= sizeof(ref.cpu_words) &&
+                        memory->TryReadBacking(vsharp.base_address, ref.cpu_words.data(),
+                                               sizeof(ref.cpu_words));
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
             }
@@ -818,18 +1324,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
-    for (const auto& image_desc : stage.images) {
-        const auto tsharp = image_desc.GetSharp(stage);
-        if (texture_cache.IsMeta(tsharp.Address())) {
-            LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
-        }
-
+    // Checks shared by single images and descriptor array elements
+    const auto is_bindable = [&](const AmdGpu::Image& tsharp,
+                                 const Shader::ImageResource& image_desc) {
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
-            image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
-            image_descriptor_array_sizes.push_back(1);
-            continue;
+            return false;
         }
 
         if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
@@ -839,13 +1340,113 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         "data_format={}, num_format={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt));
-            image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
-            image_descriptor_array_sizes.push_back(1);
-            continue;
+            return false;
         }
 
-        const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
+        // A garbage T# can also carry a valid format pair that has no Vulkan format (seen in SotC: 10_11_11
+        // Unorm, 40/11); ImageInfo would assert in SurfaceFormat or PromoteFormatToDepth. The hardware would
+        // read zeros, so it is bound as null
+        const auto vk_fmt = LiverpoolToVK::TrySurfaceFormat(data_fmt, num_fmt);
+        const bool depth_ok = !image_desc.is_depth || vk_fmt == vk::Format::eR32Sfloat ||
+                              vk_fmt == vk::Format::eR32Uint || vk_fmt == vk::Format::eR16Unorm;
+        if (vk_fmt == vk::Format::eUndefined || !depth_ok) {
+            LOG_WARNING(Render_Vulkan,
+                        "Rejecting T# with no host format address={:#x}, pitch={}, width={}, "
+                        "data_format={}, num_format={}, depth={}",
+                        tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
+                        static_cast<u32>(num_fmt), image_desc.is_depth);
+            return false;
+        }
+
+        return IsPlausibleImage(VideoCore::TextureCache::ImageDesc{tsharp, image_desc}.info);
+    };
+    const auto count_lod_stats = [&](const AmdGpu::Image& tsharp, bool is_written) {
+        if (tsharp.lod_hw_cnt_en && lod_stats_enabled) {
+            u32& uses = lod_stats_uses[tsharp.counter_bank_id];
+            uses += uses < 0xFFFFFFu;
+        }
+        if (GpuCheckpoints::DiagEnabled()) {
+            diag_detail.AddImage(tsharp.Address(),
+                                 static_cast<u32>(tsharp.GetDataFmt()) |
+                                     static_cast<u32>(tsharp.GetNumberFmt()) << 8,
+                                 is_written);
+        }
+    };
+    const auto find_bound_image = [&](VideoCore::ImageId& image_id,
+                                      VideoCore::TextureCache::ImageDesc& desc,
+                                      const Shader::ImageResource& image_desc) {
+        image_id = texture_cache.FindImage(desc);
+        auto* image = &texture_cache.GetImage(image_id);
+        if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
+            // If this image has an associated depth image, it's a stencil attachment. Redirect the access to
+            // the actual depth-stencil buffer
+            image_id = depth_image_id;
+            image = &texture_cache.GetImage(image_id);
+        }
+        if (image->binding.is_bound) {
+            // The image is already bound. In case if it is about to be used as storage we need to force
+            // general layout on it
+            image->binding.force_general |= image_desc.is_written;
+        }
+        image->binding.is_bound = 1u;
+    };
+    // A rejected T# still fills every descriptor the shader declares, with the declared type
+    const auto append_null_binding = [&](const Shader::ImageResource& image_desc) {
+        image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
+        image_bindings.back().second.type = image_desc.is_written
+                                                ? VideoCore::TextureCache::BindingType::Storage
+                                                : VideoCore::TextureCache::BindingType::Texture;
+    };
+
+    for (const auto& image_desc : stage.images) {
+        const auto tsharp = image_desc.GetSharp(stage);
         const u32 num_bindings = image_desc.NumBindings(stage);
+        if (image_desc.array_size != 0) {
+            // Per-game dynamic_tsharp_array_size: one binding per table element, then a null one for
+            // out-of-range indices. The shader was typed after `tsharp`, the first valid element, so elements
+            // of another view type or number class stay null
+            const auto view_type = tsharp.GetViewType(image_desc.is_array);
+            const bool is_integer = AmdGpu::IsInteger(tsharp.GetNumberFmt());
+            u32 null_elements = 0;
+            for (u32 i = 0; i < num_bindings; ++i) {
+                const auto element = i < image_desc.array_size
+                                         ? image_desc.GetElementSharp(stage, i)
+                                         : AmdGpu::Image::Null(image_desc.is_depth);
+                const bool compatible =
+                    element && element.GetViewType(image_desc.is_array) == view_type &&
+                    AmdGpu::IsInteger(element.GetNumberFmt()) == is_integer &&
+                    element.GetNumberConversion() == tsharp.GetNumberConversion();
+                if (!compatible || !is_bindable(element, image_desc)) {
+                    null_elements += i < image_desc.array_size;
+                    append_null_binding(image_desc);
+                    continue;
+                }
+                count_lod_stats(element, image_desc.is_written);
+                auto& [image_id, desc] = image_bindings.emplace_back(
+                    std::piecewise_construct, std::tuple{}, std::tuple{element, image_desc});
+                find_bound_image(image_id, desc, image_desc);
+            }
+            ReportTsharpArray(stage.pgm_hash, image_desc.array_size, null_elements);
+            image_descriptor_array_sizes.push_back(num_bindings);
+            continue;
+        }
+        const auto append_null_bindings = [&] {
+            for (u32 i = 0; i < num_bindings; ++i) {
+                append_null_binding(image_desc);
+            }
+            image_descriptor_array_sizes.push_back(num_bindings);
+        };
+        if (texture_cache.IsMeta(tsharp.Address())) {
+            LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
+        }
+
+        if (!is_bindable(tsharp, image_desc)) {
+            append_null_bindings();
+            continue;
+        }
+        count_lod_stats(tsharp, image_desc.is_written);
+
+        const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
 
         for (auto i = 0; i < num_bindings; i++) {
             auto& [image_id, desc] = image_bindings.emplace_back(
@@ -860,20 +1461,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 desc.view_info.range.extent.levels = 1;
             }
 
-            image_id = texture_cache.FindImage(desc);
-            auto* image = &texture_cache.GetImage(image_id);
-            if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
-                // If this image has an associated depth image, it's a stencil attachment.
-                // Redirect the access to the actual depth-stencil buffer.
-                image_id = depth_image_id;
-                image = &texture_cache.GetImage(image_id);
-            }
-            if (image->binding.is_bound) {
-                // The image is already bound. In case if it is about to be used as storage we
-                // need to force general layout on it.
-                image->binding.force_general |= image_desc.is_written;
-            }
-            image->binding.is_bound = 1u;
+            find_bound_image(image_id, desc, image_desc);
         }
 
         image_descriptor_array_sizes.push_back(num_bindings);
@@ -1150,11 +1738,18 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
         texture_cache.ClearMeta(address);
+        // The journal copies up to 16 bytes of data
+        const u32 pattern[4] = {value, value, value, value};
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
+            Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::FillCpu, address,
+                                              num_bytes, pattern, value);
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
             return;
         }
+        Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::FillGpu, address,
+                                          num_bytes, pattern, value);
+        WatchGpuWrite("FillBuffer", 0, address, num_bytes);
     }
     const auto [buffer, offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
         if (is_gds) {
@@ -1170,9 +1765,16 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
+            Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::CopyCpu, dst,
+                                              num_bytes, std::bit_cast<const void*>(src), src);
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             return;
         }
+    }
+    if (!dst_gds) {
+        Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::CopyGpu, dst,
+                                          num_bytes, nullptr, src_gds ? 0 : src);
+        WatchGpuWrite("CopyBuffer", 0, dst, num_bytes);
     }
     texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
     const auto* gds_buffer = buffer_cache.GetGdsBuffer();
@@ -1203,23 +1805,147 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     return value;
 }
 
+bool Rasterizer::WriteLodStats(VAddr address, u32 num_bytes) {
+    if (!lod_stats_enabled) {
+        return false;
+    }
+    // Hardware reports sample counts below min_lod_warn in bits 32..55 and the finest requested LOD in bits
+    // 56..59 (15 means not sampled). We cannot see those LODs, so report LOD 0 and the binding count for each
+    // bank used since the last packet; this lets SotC stream finer mips within its memory budget
+    // Leave the 64-byte header intact and map each entry to bank (index % 256)
+    constexpr u32 HeaderBytes = 0x40;
+    constexpr u32 MaxBytes = 16_MB;
+    constexpr u64 NotSampled = u64{0xF} << 56;
+    // Reject unmapped buffers and unreasonable sizes before staging entries on the host
+    if (num_bytes <= HeaderBytes || num_bytes > MaxBytes || !IsMapped(address, num_bytes)) {
+        LOG_WARNING(Render_Vulkan,
+                    "Workaround lod_stats_from_bindings: IT_GET_LOD_STATS with invalid buffer "
+                    "{:#x}+{:#x}, ignored",
+                    address, num_bytes);
+        return true;
+    }
+    const u32 num_entries = (num_bytes - HeaderBytes) / sizeof(u64);
+    std::vector<u64> entries(num_entries);
+    u32 banks_used = 0;
+    for (const u32 uses : lod_stats_uses) {
+        banks_used += uses != 0;
+    }
+    for (u32 i = 0; i < num_entries; ++i) {
+        const u32 uses = lod_stats_uses[i % lod_stats_uses.size()];
+        entries[i] = uses != 0 ? u64{uses} << 32 : NotSampled;
+    }
+    const VAddr dst = address + HeaderBytes;
+    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::WriteData, dst,
+                                      num_entries * sizeof(u64), entries.data(), 2);
+    std::memcpy(reinterpret_cast<void*>(dst), entries.data(), num_entries * sizeof(u64));
+    lod_stats_uses.fill(0);
+
+    const auto now = std::chrono::steady_clock::now();
+    if (lod_stats_packets_minute == 0 && lod_stats_last_report == decltype(now){}) {
+        LOG_WARNING(Render_Vulkan,
+                    "Workaround lod_stats_from_bindings: IT_GET_LOD_STATS at {:#x} ({} bytes) "
+                    "answered with {} bound counter banks",
+                    address, num_bytes, banks_used);
+        lod_stats_last_report = now;
+    }
+    ++lod_stats_packets_minute;
+    lod_stats_banks_minute += banks_used;
+    if (now - lod_stats_last_report >= std::chrono::minutes{1}) {
+        LOG_WARNING(Render_Vulkan,
+                    "Workaround lod_stats_from_bindings: {} IT_GET_LOD_STATS in the last minute, "
+                    "{} bound counter banks reported",
+                    lod_stats_packets_minute, lod_stats_banks_minute);
+        lod_stats_packets_minute = 0;
+        lod_stats_banks_minute = 0;
+        lod_stats_last_report = now;
+    }
+    return true;
+}
+
+void Rasterizer::ReportTsharpArray(u64 pgm_hash, u32 num_elements, u32 null_elements) {
+    const auto now = std::chrono::steady_clock::now();
+    if (tsharp_array_binds_minute == 0 && tsharp_array_last_report == decltype(now){}) {
+        LOG_WARNING(Render_Vulkan,
+                    "Workaround dynamic_tsharp_array_size: shader {:#x} binds {} T#s, {} null",
+                    pgm_hash, num_elements, null_elements);
+        tsharp_array_last_report = now;
+    }
+    ++tsharp_array_binds_minute;
+    tsharp_array_null_minute += null_elements;
+    if (now - tsharp_array_last_report >= std::chrono::minutes{1}) {
+        LOG_WARNING(Render_Vulkan,
+                    "Workaround dynamic_tsharp_array_size: {} T# arrays bound in the last minute, "
+                    "{} null elements",
+                    tsharp_array_binds_minute, tsharp_array_null_minute);
+        tsharp_array_binds_minute = 0;
+        tsharp_array_null_minute = 0;
+        tsharp_array_last_report = now;
+    }
+}
+
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
+        Common::GuestWriteJournal::Record(
+            Common::GuestWriteJournal::Source::FaultIgnoredNotGpuMapped, addr, size, nullptr, 1);
         return false;
     }
-    buffer_cache.InvalidateMemory(addr, size, assume_locks);
+    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::FaultWrite, addr, size);
+    {
+        const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Invalidates,
+                                                        Common::PerfStats::Id::InvalidateBufferNs};
+        buffer_cache.InvalidateMemory(addr, size, assume_locks);
+    }
+    const Common::PerfStats::ScopedNs perf_timer{Common::PerfStats::Id::InvalidateTextureNs};
     texture_cache.InvalidateMemory(addr, size);
     return true;
+}
+
+void Rasterizer::ReleaseCpuAuthoritativeRange(VAddr addr, u64 size) {
+    if (IsMapped(addr, size)) {
+        buffer_cache.ReleaseCpuAuthoritativeRange(addr, size);
+    }
 }
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
+        Common::GuestWriteJournal::Record(
+            Common::GuestWriteJournal::Source::FaultIgnoredNotGpuMapped, addr, size, nullptr, 0);
         return false;
     }
+    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::FaultRead, addr, size);
     buffer_cache.ReadMemory(addr, size, false, assume_locks);
     return true;
+}
+
+bool Rasterizer::IsPlausibleImage(const VideoCore::ImageInfo& info) {
+    // A garbage T# (e.g. read from a constant buffer the guest has not written yet) can pass the address and
+    // format checks and still describe an image that Vulkan cannot create. Creating it exhausts device memory
+    // (image.cpp allocation assert), so it is bound as null instead
+    const auto& limits = instance.GetLimits();
+    const bool is_3d = info.type == AmdGpu::ImageType::Color3D;
+    const u32 max_dim = is_3d ? limits.maxImageDimension3D : limits.maxImageDimension2D;
+    // For block-compressed formats num_bits is per 4x4 block
+    const u32 block_dim = info.props.is_block ? 4 : 1;
+    const u64 host_bytes = u64{(info.size.width + block_dim - 1) / block_dim} *
+                           ((info.size.height + block_dim - 1) / block_dim) * info.size.depth *
+                           info.resources.layers * std::max(info.num_samples, 1u) *
+                           std::max(info.num_bits / 8, 1u);
+    constexpr u64 MaxPlausibleImageBytes = 2ULL << 30;
+    const bool plausible = info.size.width <= max_dim && info.size.height <= max_dim &&
+                           (!is_3d || info.size.depth <= max_dim) &&
+                           info.resources.layers <= limits.maxImageArrayLayers &&
+                           host_bytes <= MaxPlausibleImageBytes;
+    if (!plausible) {
+        LOG_WARNING(Render_Vulkan,
+                    "Rejecting implausible T# address={:#x} {}x{}x{} layers={} levels={} "
+                    "bits={} (~{} MiB)",
+                    info.guest_address, info.size.width, info.size.height, info.size.depth,
+                    info.resources.layers, info.resources.levels, info.num_bits,
+                    host_bytes >> 20);
+    }
+    return plausible;
 }
 
 bool Rasterizer::IsMapped(VAddr addr, u64 size) {
@@ -1238,6 +1964,7 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
+    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::GpuMap, addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
@@ -1249,6 +1976,7 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::GpuUnmap, addr, size);
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);
     {

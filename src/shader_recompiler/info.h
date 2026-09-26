@@ -7,6 +7,7 @@
 #include <vector>
 #include <boost/container/static_vector.hpp>
 #include "common/assert.h"
+#include "common/perf_stats.h"
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/frontend/copy_shader.h"
@@ -43,6 +44,7 @@ struct InfoPersistent {
     ImageResourceList images;
     SamplerResourceList samplers;
     FMaskResourceList fmasks;
+    SharpTableList sharp_tables;
 
     struct UserDataMask {
         void Set(IR::ScalarReg reg) noexcept {
@@ -75,6 +77,9 @@ struct InfoPersistent {
     bool has_fetch_shader{};
     bool has_bitwise_xor{};
     bool uses_dma{};
+    /// compute_loop_cap: back-edge budget per invocation, 0 = unlimited
+    bool uses_loop_cap{};
+    u32 loop_cap{};
 
     InfoPersistent() = default;
     InfoPersistent(HwStage hw_stage_, SwStage sw_stage_, u64 pgm_hash_)
@@ -189,6 +194,10 @@ struct Info : InfoPersistent {
     void AddBindings(Backend::Bindings& bnd) const {
         bnd.buffer += buffers.size();
         bnd.unified += buffers.size() + images.size() + samplers.size();
+        for (const auto& image : images) {
+            // Descriptor arrays take array_size + 1 bindings
+            bnd.unified += image.array_size;
+        }
         bnd.user_data += ud_mask.NumRegs();
     }
 
@@ -197,8 +206,25 @@ struct Info : InfoPersistent {
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
         if (srt_info.walker_func) {
+            const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::SrtWalks,
+                                                            Common::PerfStats::Id::SrtWalkNs};
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
         }
+        if (!sharp_tables.empty()) {
+            RefreshSharpTables();
+        }
+    }
+
+    /// Copies every SharpTable from guest memory into the flat buffer (zeros if unmapped)
+    void RefreshSharpTables();
+
+    /// Flat buffer dwords that hold sharp tables rather than SRT walker output
+    u32 SharpTableDwords() const noexcept {
+        u32 dwords = 0;
+        for (const auto& table : sharp_tables) {
+            dwords += table.NumDwords();
+        }
+        return dwords;
     }
 
     void ReadTessConstantBuffer(TessellationDataConstantBuffer& tess_constants) const {
@@ -215,5 +241,8 @@ struct Info : InfoPersistent {
     bool Deserialize(Serialization::Archive& ar);
 };
 DECLARE_ENUM_FLAG_OPERATORS(Info::ReadConstType);
+
+/// Per-game dynamic_tsharp_array_size, clamped to 64 elements (0 = off)
+u32 DynamicTsharpArraySize();
 
 } // namespace Shader

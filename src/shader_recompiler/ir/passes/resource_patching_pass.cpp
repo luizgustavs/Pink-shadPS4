@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <limits>
+#include <optional>
+#include "common/logging/log.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/breadth_first_search.h"
@@ -117,7 +119,7 @@ public:
             return desc.sharp_fetch == existing.sharp_fetch && desc.is_array == existing.is_array &&
                    desc.mip_fallback_mode == existing.mip_fallback_mode &&
                    desc.constant_mip_index == existing.constant_mip_index &&
-                   desc.post_op == existing.post_op;
+                   desc.post_op == existing.post_op && desc.array_size == existing.array_size;
         })};
         auto& image = image_resources[index];
         image.is_atomic |= desc.is_atomic;
@@ -194,6 +196,190 @@ SharpFetch<T> ConstructSharpFetch(const SharpReference& sharp) {
     return sharp_fetch;
 }
 
+/// A ReadConst dword offset written as element * scale + offset, element being the only non-constant term
+/// (empty if the offset is constant)
+struct AffineOffset {
+    IR::Value element;
+    u32 scale;
+    u32 offset;
+};
+
+AffineOffset MatchAffineOffset(const IR::Value& value, u32 depth = 0) {
+    if (value.IsImmediate()) {
+        return {{}, 0, value.U32()};
+    }
+    const AffineOffset leaf{value, 1, 0};
+    const IR::Inst* inst = value.Inst();
+    if (depth == 8) {
+        return leaf;
+    }
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::IAdd32: {
+        const AffineOffset a = MatchAffineOffset(inst->Arg(0), depth + 1);
+        const AffineOffset b = MatchAffineOffset(inst->Arg(1), depth + 1);
+        if (!a.element.IsEmpty() && !b.element.IsEmpty() && a.element != b.element) {
+            return leaf;
+        }
+        return {a.element.IsEmpty() ? b.element : a.element, a.scale + b.scale,
+                a.offset + b.offset};
+    }
+    case IR::Opcode::IMul32: {
+        const bool imm0 = inst->Arg(0).IsImmediate();
+        if (imm0 == inst->Arg(1).IsImmediate()) {
+            return leaf;
+        }
+        const u32 factor = inst->Arg(imm0 ? 0 : 1).U32();
+        const AffineOffset a = MatchAffineOffset(inst->Arg(imm0 ? 1 : 0), depth + 1);
+        return {a.element, a.scale * factor, a.offset * factor};
+    }
+    case IR::Opcode::ShiftLeftLogical32: {
+        if (!inst->Arg(1).IsImmediate() || inst->Arg(1).U32() >= 32) {
+            return leaf;
+        }
+        const u32 shift = inst->Arg(1).U32();
+        const AffineOffset a = MatchAffineOffset(inst->Arg(0), depth + 1);
+        return {a.element, a.scale << shift, a.offset << shift};
+    }
+    case IR::Opcode::ShiftRightLogical32: {
+        // Exact only when both terms are multiples of the divisor (byte to dword offsets)
+        if (!inst->Arg(1).IsImmediate() || inst->Arg(1).U32() >= 32) {
+            return leaf;
+        }
+        const u32 shift = inst->Arg(1).U32();
+        const u32 mask = (1u << shift) - 1;
+        const AffineOffset a = MatchAffineOffset(inst->Arg(0), depth + 1);
+        if ((a.scale & mask) != 0 || (a.offset & mask) != 0) {
+            return leaf;
+        }
+        return {a.element, a.scale >> shift, a.offset >> shift};
+    }
+    default:
+        return leaf;
+    }
+}
+
+/// Flat buffer location of a flattened pointer dword, without the warning of SharpLocationFromSource
+std::optional<SharpLocation> FlatLocation(const IR::Value& value) {
+    const IR::Inst* inst = value.TryInst();
+    if (!inst) {
+        return std::nullopt;
+    }
+    if (inst->GetOpcode() == IR::Opcode::GetUserData) {
+        return static_cast<SharpLocation>(inst->Arg(0).ScalarReg());
+    }
+    if (inst->GetOpcode() == IR::Opcode::ReadConst && inst->Flags<SharpLocation>() != 0) {
+        return inst->Flags<SharpLocation>();
+    }
+    if (inst->GetOpcode() == IR::Opcode::ReadConstBuffer &&
+        inst->Flags<IR::BufferInstInfo>().flatbuf_off_dw != 0) {
+        return static_cast<SharpLocation>(inst->Flags<IR::BufferInstInfo>().flatbuf_off_dw);
+    }
+    return std::nullopt;
+}
+
+struct SharpTableMatch {
+    SharpLocation ptr_lo;
+    SharpLocation ptr_hi;
+    IR::Value element;
+    u32 stride_dw;
+    u32 first_dw;
+};
+
+/// Per-game dynamic_tsharp_array_size: recognizes a sharp whose dwords are all ReadConst(ptr, element *
+/// stride + first + k), ptr being flattened (SotC cs 0xfb974c0e reads the reflection probe cubemap at P +
+/// slot * 32 + 14480, slot coming from the probe record)
+std::optional<SharpTableMatch> MatchSharpTable(const SharpReference& sharp) {
+    std::optional<SharpTableMatch> match;
+    for (u32 i = 0; i < sharp.num_dwords; ++i) {
+        const IR::Inst* dword = sharp.dwords[i].TryInst();
+        if (!dword || dword->GetOpcode() != IR::Opcode::ReadConst ||
+            dword->Flags<SharpLocation>() != 0) {
+            return std::nullopt;
+        }
+        const IR::Inst* base = dword->Arg(0).TryInst();
+        if (!base || base->GetOpcode() != IR::Opcode::CompositeConstructU32x2) {
+            return std::nullopt;
+        }
+        const auto ptr_lo = FlatLocation(base->Arg(0));
+        const auto ptr_hi = FlatLocation(base->Arg(1));
+        const AffineOffset offset = MatchAffineOffset(dword->Arg(1));
+        if (!ptr_lo || !ptr_hi || offset.element.IsEmpty() || offset.scale < sharp.num_dwords ||
+            offset.scale > 256 || offset.offset < i) {
+            return std::nullopt;
+        }
+        if (!match) {
+            match = SharpTableMatch{*ptr_lo, *ptr_hi, offset.element, offset.scale,
+                                    offset.offset - i};
+        } else if (*ptr_lo != match->ptr_lo || *ptr_hi != match->ptr_hi ||
+                   offset.element != match->element || offset.scale != match->stride_dw ||
+                   offset.offset != match->first_dw + i) {
+            return std::nullopt;
+        }
+    }
+    return match;
+}
+
+/// Finds or appends the SharpTable holding the matched sharp and returns the fetch of its element 0 (see
+/// ImageResource::array_size)
+std::optional<SharpFetch<AmdGpu::Image>> AddSharpTable(Info& info, const SharpTableMatch& match,
+                                                       u32 num_dwords, u32 num_elements) {
+    auto it = std::ranges::find_if(info.sharp_tables, [&](const SharpTable& table) {
+        return table.ptr_lo == match.ptr_lo && table.ptr_hi == match.ptr_hi &&
+               table.stride_dw == match.stride_dw && table.num_elements == num_elements &&
+               match.first_dw >= table.offset_dw &&
+               match.first_dw + num_dwords <= table.offset_dw + table.stride_dw;
+    });
+    if (it == info.sharp_tables.end()) {
+        const u32 flatbuf_off = info.srt_info.flattened_bufsize_dw;
+        if (info.sharp_tables.size() == info.sharp_tables.capacity() ||
+            flatbuf_off + num_elements * match.stride_dw >= UNKNOWN_LOCATION) {
+            return std::nullopt;
+        }
+        info.sharp_tables.push_back({
+            .ptr_lo = match.ptr_lo,
+            .ptr_hi = match.ptr_hi,
+            .flatbuf_off = static_cast<SharpLocation>(flatbuf_off),
+            .num_elements = static_cast<u16>(num_elements),
+            .offset_dw = match.first_dw,
+            .stride_dw = match.stride_dw,
+        });
+        info.srt_info.flattened_bufsize_dw += num_elements * match.stride_dw;
+        // Make the elements visible to the rest of the compilation (image type, cube fixup)
+        info.RefreshFlatBuf();
+        it = std::prev(info.sharp_tables.end());
+    }
+    SharpFetch<AmdGpu::Image> fetch{};
+    for (u32 i = 0; i < num_dwords; ++i) {
+        fetch.offsets[i] =
+            static_cast<SharpLocation>(it->flatbuf_off + match.first_dw - it->offset_dw + i);
+        fetch.load_mask |= 1u << i;
+    }
+    LOG_WARNING(Render_Recompiler,
+                "Workaround dynamic_tsharp_array_size: shader {:#x} indexes {} T#s at "
+                "flat[{}:{}] + {:#x}, stride {} bytes",
+                info.pgm_hash, num_elements, match.ptr_lo, match.ptr_hi, match.first_dw * 4,
+                match.stride_dw * 4);
+    return fetch;
+}
+
+/// Descriptors the dynamic_tsharp_array_size arrays of the shader take so far
+u32 NumArrayDescriptors(const Info& info) {
+    u32 count = 0;
+    for (const ImageResource& image : info.images) {
+        count += image.array_size != 0 ? image.array_size + 1u : 0u;
+    }
+    return count;
+}
+
+/// Packed image | sampler << 16 bindings of an image instruction handle
+u32 ImageHandleBindings(const IR::Value& handle) {
+    if (const IR::Inst* array_handle = handle.TryInst()) {
+        ASSERT(array_handle->GetOpcode() == IR::Opcode::ImageArrayHandle);
+        return array_handle->Arg(0).U32();
+    }
+    return handle.U32();
+}
+
 void PatchBufferSharp(const ResourceDiscovery& resource, Info& info, Descriptors& descriptors,
                       const Profile& profile) {
     IR::Inst& inst = *resource.user;
@@ -226,14 +412,33 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
     // need fallback (TODO is this 100% true?)
     const bool needs_mip_storage_fallback =
         inst_info.has_lod && is_written && !profile.supports_image_load_store_lod;
+    // Per-game: a sampled T# read at a dynamic offset becomes a descriptor array. Compute only: SotC's vs
+    // 0x9d6f9bf4 matches too (shadow map tables) and hung the GPU with it
+    const u32 array_size = info.hw_stage == HwStage::Compute ? DynamicTsharpArraySize() : 0;
+    auto table =
+        array_size != 0 && !is_written ? MatchSharpTable(resource.sharps[0]) : std::nullopt;
+    if (table && NumArrayDescriptors(info) + array_size + 1 > NUM_IMAGE_ARRAY_DESCRIPTORS) {
+        // The binder has room for NUM_IMAGE_ARRAY_DESCRIPTORS; this sharp keeps the default path
+        LOG_WARNING(Render_Recompiler,
+                    "Workaround dynamic_tsharp_array_size: shader {:#x} has no room for another "
+                    "array of {} T#s",
+                    info.pgm_hash, array_size);
+        table.reset();
+    }
+    const auto table_fetch =
+        table ? AddSharpTable(info, *table, resource.sharps[0].num_dwords, array_size)
+              : std::nullopt;
     ImageResource image_res = {
-        .sharp_fetch = ConstructSharpFetch<AmdGpu::Image>(resource.sharps[0]),
+        .sharp_fetch = table_fetch ? *table_fetch
+                                   : ConstructSharpFetch<AmdGpu::Image>(resource.sharps[0]),
         .is_depth = bool(inst_info.is_depth),
         .is_atomic = is_atomic,
         .is_array = bool(inst_info.is_array),
         .is_written = is_written,
         .is_r128 = bool(inst_info.is_r128),
         .post_op = resource.sharps[0].post_op,
+        .array_size = static_cast<u16>(table_fetch ? array_size : 0),
+        .array_stride_dw = static_cast<u16>(table_fetch ? table->stride_dw : 0),
     };
 
     auto image = image_res.GetSharp(info);
@@ -308,6 +513,7 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
 
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
 
+    u32 bindings = image_binding;
     if (inst.GetOpcode() == IR::Opcode::ImageSampleRaw) {
         auto& lod_prod = resource.sharps[1].post_op_data.lod_prod;
         const u32 sampler_binding = descriptors.Add(SamplerResource{
@@ -317,9 +523,14 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
                 lod_prod.IsEmpty() ? UNKNOWN_LOCATION : SharpLocationFromSource(lod_prod.Inst()),
             .is_depth = bool(inst_info.is_depth), // true for the _C (compare) opcodes
         });
-        inst.SetArg(0, ir.Imm32(image_binding | sampler_binding << 16));
+        bindings |= sampler_binding << 16;
+    }
+    if (image_res.array_size != 0) {
+        // Elements past the table hit the extra null binding at index array_size
+        const IR::U32 element = ir.UMin(IR::U32{table->element}, ir.Imm32(u32{array_size}));
+        inst.SetArg(0, ir.ImageArrayHandle(ir.Imm32(bindings), element));
     } else {
-        inst.SetArg(0, ir.Imm32(image_binding));
+        inst.SetArg(0, ir.Imm32(bindings));
     }
 }
 
@@ -564,8 +775,13 @@ IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const In
         index = ir.IAdd(index, vgpr_index);
     }
     if (buffer.add_tid_enable) {
-        ASSERT_MSG(info.sw_stage == SwStage::Compute,
-                   "Thread ID buffer addressing is not supported outside of compute.");
+        // Garbage V#s (constants read before the game writes them) can set add_tid_enable in other stages.
+        // Keep the lane offset instead of aborting the compile
+        if (info.sw_stage != SwStage::Compute) {
+            LOG_WARNING(Render_Recompiler,
+                        "Thread ID buffer addressing outside of compute (shader {:#x}, stage {})",
+                        info.pgm_hash, u32(info.sw_stage));
+        }
         const IR::U32 thread_id{ir.LaneId()};
         index = ir.IAdd(index, thread_id);
     }
@@ -640,7 +856,7 @@ IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const IR:
 void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image_res,
                           const AmdGpu::Image& image) {
     const auto handle = inst.Arg(0);
-    const auto& sampler_res = info.samplers[(handle.U32() >> 16) & 0xFFFF];
+    const auto& sampler_res = info.samplers[(ImageHandleBindings(handle) >> 16) & 0xFFFF];
     const auto sampler = sampler_res.GetSharp(info);
 
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
@@ -837,7 +1053,7 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
     }
 
     const auto image_handle = inst.Arg(0);
-    const auto binding_index = image_handle.U32() & 0xFFFF;
+    const auto binding_index = ImageHandleBindings(image_handle) & 0xFFFF;
     const auto& image_res = info.images[binding_index];
     auto image = image_res.GetSharp(info);
 

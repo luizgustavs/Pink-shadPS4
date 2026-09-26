@@ -104,6 +104,9 @@ public:
 private:
     Frame* GetRenderFrame();
 
+    /// SHADPS4_PERF_STATS and SHADPS4_HARNESS_PROGRESS report lines, once per presentation
+    void ReportDiagnostics(bool is_reusing_frame, bool is_game_frame);
+
     void RecreateFrame(Frame* frame, u32 width, u32 height);
 
     void SetExpectedGameSize(s32 width, s32 height);

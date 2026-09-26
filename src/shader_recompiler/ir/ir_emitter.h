@@ -370,6 +370,8 @@ public:
                                            TextureInstInfo info);
 
     [[nodiscard]] Value ImageHandle(const Value& tsharp_low, const Value& tsharp_high);
+    /// Handle of a descriptor array image: the packed bindings (immediate) and the element
+    [[nodiscard]] Value ImageArrayHandle(const U32& handle, const U32& element);
 
     [[nodiscard]] Value ImageSampleRaw(const Value& handle, const Value& sampler_handle,
                                        const Value& address1, const Value& address2,

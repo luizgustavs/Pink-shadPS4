@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -620,9 +621,13 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
     mnt->Mount(mount_download_dir, "/download0");
 
-    const auto& mount_captures_dir = Common::FS::GetUserPath(Common::FS::PathType::CapturesDir);
+    // SHADPS4_RDOC_CAPTURE_DIR moves RenderDoc captures off the user dir (they can be GBs)
+    const char* capture_dir_env = std::getenv("SHADPS4_RDOC_CAPTURE_DIR");
+    const std::filesystem::path mount_captures_dir =
+        capture_dir_env ? std::filesystem::path{capture_dir_env}
+                        : Common::FS::GetUserPath(Common::FS::PathType::CapturesDir);
     if (!std::filesystem::exists(mount_captures_dir)) {
-        std::filesystem::create_directory(mount_captures_dir);
+        std::filesystem::create_directories(mount_captures_dir);
     }
     VideoCore::SetOutputDir(mount_captures_dir, id);
 

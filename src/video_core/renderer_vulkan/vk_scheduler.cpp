@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
+
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/perf_stats.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -115,14 +119,20 @@ void Scheduler::Flush() {
 }
 
 void Scheduler::Finish() {
+    const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::VkFinish,
+                                                    Common::PerfStats::Id::VkFinishNs};
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
-    Wait(presubmit_tick);
+    // The tick was just submitted, so Wait() would never flush; waiting on the semaphore directly keeps
+    // Finish out of the vk_wait counters
+    work_semaphore.Wait(presubmit_tick);
 }
 
 void Scheduler::Wait(u64 tick) {
+    const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::VkWait,
+                                                    Common::PerfStats::Id::VkWaitNs};
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
@@ -150,6 +160,10 @@ void Scheduler::BeginSession() {
     };
     session.primary = command_pool.Commit();
     Check(session.primary.begin(begin_info));
+    if (sessions.size() == 1) {
+        // First session of a submit
+        BeginGpuTiming();
+    }
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
@@ -164,7 +178,7 @@ void Scheduler::BeginSession() {
 #endif
 }
 
-void Scheduler::EndSession() {
+void Scheduler::EndSession(u64 submit_tick) {
     if (sessions.empty()) {
         return;
     }
@@ -179,6 +193,9 @@ void Scheduler::EndSession() {
     }
 
     EndRendering();
+    if (submit_tick != 0) {
+        EndGpuTiming(submit_tick);
+    }
     Check(session.primary.end());
 }
 
@@ -198,7 +215,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         on_submit(info);
     }
 
-    EndSession();
+    EndSession(signal_value);
 
     std::vector<vk::CommandBuffer> cmd_buffers;
     cmd_buffers.reserve(sessions.size() * 2);
@@ -237,15 +254,96 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         .pSignalSemaphores = info.signal_semas.data(),
     };
 
+    if (tracks_gpu_commands) {
+        const u64 last_seq = GpuCheckpoints::g_seq.load(std::memory_order_relaxed);
+        GpuCheckpoints::RecordSubmit(std::bit_cast<u64>(static_cast<VkSemaphore>(timeline)),
+                                     signal_value, submitted_seq + 1, last_seq,
+                                     work_semaphore.KnownGpuTick());
+        submitted_seq = last_seq;
+    }
+
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceFault("SubmitExecution");
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     work_semaphore.Refresh();
+    CollectGpuTiming();
     BeginSession();
 
     // Apply pending operations
     PopPendingOperations();
+}
+
+void Scheduler::EnableGpuTiming() {
+    if (!Common::PerfStats::Enabled()) {
+        return;
+    }
+    std::scoped_lock lk{submit_mutex};
+    const vk::QueryPoolCreateInfo pool_info = {
+        .queryType = vk::QueryType::eTimestamp,
+        .queryCount = GpuTimingSlots * 2,
+    };
+    auto [result, pool] = instance.GetDevice().createQueryPoolUnique(pool_info);
+    if (result != vk::Result::eSuccess) {
+        LOG_WARNING(Render_Vulkan, "Perf stats: no timestamp query pool ({}), gpu_ms stays 0",
+                    vk::to_string(result));
+        return;
+    }
+    gpu_timing_pool = std::move(pool);
+    gpu_timestamp_period_ns = instance.GetLimits().timestampPeriod;
+    // The command buffer already open has no start timestamp; timing begins with the next submit
+}
+
+void Scheduler::BeginGpuTiming() {
+    gpu_timing_open = -1;
+    if (!gpu_timing_pool) {
+        return;
+    }
+    const u32 slot = gpu_timing_next;
+    if (gpu_timing_busy[slot]) {
+        // The GPU is more than GpuTimingSlots submits behind; skip this one
+        return;
+    }
+    gpu_timing_next = (gpu_timing_next + 1) % GpuTimingSlots;
+    const auto cmdbuf = sessions.back().primary;
+    cmdbuf.resetQueryPool(*gpu_timing_pool, slot * 2, 2);
+    cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *gpu_timing_pool, slot * 2);
+    gpu_timing_open = static_cast<s32>(slot);
+}
+
+void Scheduler::EndGpuTiming(u64 submit_tick) {
+    if (gpu_timing_open < 0) {
+        return;
+    }
+    const u32 slot = static_cast<u32>(gpu_timing_open);
+    sessions.back().primary.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe,
+                                           *gpu_timing_pool, slot * 2 + 1);
+    gpu_timing_busy[slot] = true;
+    gpu_timing_pending.push_back({slot, submit_tick});
+    gpu_timing_open = -1;
+    Common::PerfStats::Add(Common::PerfStats::Id::VkSubmits);
+}
+
+void Scheduler::CollectGpuTiming() {
+    while (!gpu_timing_pending.empty() &&
+           work_semaphore.IsFree(gpu_timing_pending.front().tick)) {
+        const u32 slot = gpu_timing_pending.front().slot;
+        std::array<u64, 2> stamps{};
+        const vk::Result result = instance.GetDevice().getQueryPoolResults(
+            *gpu_timing_pool, slot * 2, 2, sizeof(stamps), stamps.data(), sizeof(u64),
+            vk::QueryResultFlagBits::e64);
+        if (result == vk::Result::eSuccess && stamps[1] >= stamps[0]) {
+            Common::PerfStats::Add(
+                Common::PerfStats::Id::GpuNs,
+                static_cast<u64>(static_cast<double>(stamps[1] - stamps[0]) *
+                                 gpu_timestamp_period_ns));
+        }
+        gpu_timing_busy[slot] = false;
+        gpu_timing_pending.pop_front();
+    }
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {

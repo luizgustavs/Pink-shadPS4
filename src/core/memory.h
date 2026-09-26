@@ -3,10 +3,15 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <boost/container/small_vector.hpp>
+#include <boost/icl/interval_map.hpp>
 #include "common/enum.h"
 #include "common/shared_first_mutex.h"
 #include "common/singleton.h"
@@ -304,6 +309,49 @@ public:
 
     void InvalidateMemory(VAddr addr, u64 size) const;
 
+    /// IsValidMapping for callers that do not hold the memory manager lock (other threads map and unmap
+    /// concurrently)
+    bool IsValidMappingLocked(VAddr virtual_addr, u64 size = 0) {
+        std::shared_lock lk{mutex};
+        return IsValidMapping(virtual_addr, size);
+    }
+
+    /// True when the whole range is mapped, unlike IsValidMapping, which also accepts free or reserved areas
+    bool IsMappedLocked(VAddr virtual_addr, u64 size) {
+        std::shared_lock lk{mutex};
+        if (size == 0 || !IsValidMapping(virtual_addr, size)) {
+            return false;
+        }
+        for (auto vma = FindVMA(virtual_addr);
+             vma != vma_map.end() && vma->second.base < virtual_addr + size; ++vma) {
+            if (!vma->second.IsMapped()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Reads guest memory through its physical backing, bypassing page protection. Returns false when part of
+    /// the range is unmapped or has no physical backing
+    bool TryReadBacking(VAddr virtual_addr, void* out, u64 size);
+
+    /// Return the physical run containing virtual_addr, with its guest start and size, or nullptr if absent
+    /// With try_lock, also return nullptr when a writer holds the lock; a fault handler may be that writer
+    const u8* GetBackingRun(VAddr virtual_addr, VAddr* run_start, u64* run_size,
+                            bool try_lock = false);
+
+    using StackPieces = boost::container::small_vector<std::pair<VAddr, u64>, 4>;
+
+    /// Keep guest thread and fiber stacks writable when cpu_authoritative_stacks is enabled
+    /// The host OS cannot dispatch faults raised while pushing to a protected stack page
+    void RegisterStackRange(VAddr virtual_addr, u64 size);
+    void UnregisterStackRange(VAddr virtual_addr, u64 size);
+    bool OverlapsStackRange(VAddr virtual_addr, u64 size);
+    /// Returns the parts of [virtual_addr, virtual_addr + size) that are not stack memory
+    StackPieces SubtractStackRanges(VAddr virtual_addr, u64 size);
+    /// Returns the parts of [virtual_addr, virtual_addr + size) that are stack memory
+    StackPieces GetStackRangesIn(VAddr virtual_addr, u64 size);
+
 private:
     VMAHandle FindVMA(VAddr target) {
         return std::prev(vma_map.upper_bound(target));
@@ -317,7 +365,7 @@ private:
         return std::prev(fmem_map.upper_bound(target));
     }
 
-    bool HasPhysicalBacking(VirtualMemoryArea vma) {
+    bool HasPhysicalBacking(const VirtualMemoryArea& vma) {
         return vma.type == VMAType::Direct || vma.type == VMAType::Flexible ||
                vma.type == VMAType::Pooled;
     }
@@ -356,6 +404,11 @@ private:
     u64 pool_budget{};
     s32 sdk_version{};
     Vulkan::Rasterizer* rasterizer{};
+    // Registration count per range: fiber contexts can live inside a thread stack
+    boost::icl::interval_map<VAddr, u32> stack_ranges;
+    std::shared_mutex stack_ranges_mutex;
+    // Lets every stack query return without locking while no stack is registered
+    std::atomic<bool> has_stack_ranges{false};
 
     struct PrtArea {
         VAddr start;

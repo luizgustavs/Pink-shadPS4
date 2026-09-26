@@ -13,113 +13,119 @@ namespace Libraries::SystemGesture {
 
 using Input::GameController;
 
+// System gestures only read pad touch data, so these stubs return no touch without affecting game state
+// Sony's out-parameter layouts are undocumented here; leave them untouched rather than risk corrupting memory
+// Keep per-frame polling at DEBUG to avoid flooding the log
+// The SotC fault at 0xb93994a is a null dereference in game code, likely from an earlier failed lookup
+// Fabricating gesture handles here would hide the cause
+
 int PS4_SYSV_ABI sceSystemGestureAppendTouchRecognizer() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureClose() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureCreateTouchRecognizer() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureFinalizePrimitiveTouchRecognizer() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureGetPrimitiveTouchEventByIndex() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureGetPrimitiveTouchEventByPrimitiveID() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureGetPrimitiveTouchEvents() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureGetPrimitiveTouchEventsCount() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureGetTouchEventByEventID() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureGetTouchEventByIndex() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureGetTouchEvents() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureGetTouchEventsCount() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureGetTouchRecognizerInformation() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureInitializePrimitiveTouchRecognizer() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureOpen() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureRemoveTouchRecognizer() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureResetPrimitiveTouchRecognizer() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureResetTouchRecognizer() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureUpdateAllTouchRecognizer() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureUpdatePrimitiveTouchRecognizer() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureUpdateTouchRecognizer() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceSystemGestureUpdateTouchRecognizerRectangle() {
-    LOG_ERROR(Lib_SystemGesture, "(STUBBED) called");
+    LOG_DEBUG(Lib_SystemGesture, "(STUBBED) called");
     return ORBIS_OK;
 }
 

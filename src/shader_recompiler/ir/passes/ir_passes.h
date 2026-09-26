@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <unordered_set>
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/passes/resource_pass.h"
 #include "shader_recompiler/ir/program.h"
@@ -20,6 +21,11 @@ void PhiSimplificationPass(IR::Program& program);
 void InverseBallotEliminationPass(IR::Program& program);
 void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info,
                            const Profile& profile);
+/// Blocks where LowerWave64BallotPass lowers ReadLane/Ballot to workgroup-uniform values. With uniform_insts,
+/// conditions that depend only on those instructions count as uniform too
+std::vector<IR::Block*> FindWave64UniformBlocks(
+    const IR::Program& program,
+    const std::unordered_set<const IR::Inst*>* uniform_insts = nullptr);
 void LowerHardwareIntrinsics(IR::Program& program);
 void LowerPhisToRegsPass(IR::Program& program);
 void DeadCodeEliminationPass(IR::Program& program);

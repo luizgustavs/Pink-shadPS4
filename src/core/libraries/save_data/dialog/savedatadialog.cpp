@@ -4,6 +4,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/elf_info.h"
+#include "common/harness.h"
 #include "common/logging/log.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/system/commondialog.h"
@@ -78,6 +79,8 @@ Error PS4_SYSV_ABI sceSaveDataDialogOpen(const OrbisSaveDataDialogParam* param) 
         LOG_DEBUG(Lib_SaveDataDialog, "called param:(NULL)");
         return Error::ARG_NULL;
     }
+    LOG_HARNESS_MARKER_ONCE(Lib_SaveDataDialog, "first sceSaveDataDialogOpen mode={}",
+                            magic_enum::enum_name(param->mode));
     LOG_DEBUG(Lib_SaveDataDialog, "called param->mode: {}", magic_enum::enum_name(param->mode));
     ASSERT(param->size == sizeof(OrbisSaveDataDialogParam));
     ASSERT(param->baseParam.size == sizeof(CommonDialog::BaseParam));

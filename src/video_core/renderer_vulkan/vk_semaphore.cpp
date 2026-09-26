@@ -34,6 +34,9 @@ void Semaphore::Refresh() {
     do {
         this_tick = gpu_tick.load(std::memory_order_acquire);
         auto [counter_result, cntr] = instance.GetDevice().getSemaphoreCounterValue(*semaphore);
+        if (counter_result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceFault("Semaphore::Refresh");
+        }
         ASSERT_MSG(counter_result == vk::Result::eSuccess,
                    "Failed to get master semaphore value: {}", vk::to_string(counter_result));
         counter = cntr;
@@ -62,7 +65,14 @@ void Semaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
-    while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
+    vk::Result result;
+    while ((result = instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT)) !=
+           vk::Result::eSuccess) {
+        // A lost device never signals; spinning here would hang without any report
+        if (result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceFault("Semaphore::Wait");
+            UNREACHABLE_MSG("Device lost while waiting for tick {}", tick);
+        }
     }
     Refresh();
 }

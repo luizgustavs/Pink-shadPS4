@@ -349,12 +349,15 @@ static thread_local std::vector<u8> file_buf{};
 s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
     const auto* memory = Core::Memory::Instance();
     // Invalidate up to the actual number of bytes that could be read.
-    const auto remaining = file->GetSize() - file->Tell();
+    const auto position = file->Tell();
+    const auto remaining = file->GetSize() - position;
     memory->InvalidateMemory(reinterpret_cast<VAddr>(buf), std::min<u64>(nbytes, remaining));
     if (file_buf.capacity() < nbytes) {
         file_buf.reserve(nbytes);
     }
     s64 bytes = file->Read(file_buf.data(), nbytes);
+    LOG_DEBUG(Kernel_Fs, "read {} offset={:#x} len={:#x} dst={} result={:#x}", file->m_guest_name,
+              position, nbytes, fmt::ptr(buf), bytes);
     if (bytes < 0) {
         return bytes;
     }

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <deque>
 #include <boost/container/small_vector.hpp>
 
@@ -63,6 +64,11 @@ public:
         return fault_manager->GetFaultBuffer();
     }
 
+    /// Retrieves the compute_loop_cap hit counter buffer
+    [[nodiscard]] const Buffer* GetLoopCapBuffer() const noexcept {
+        return &loop_cap_buffer;
+    }
+
     /// Retrieves the stream buffer.
     [[nodiscard]] StreamBuffer& GetStreamBuffer() noexcept {
         return stream_buffer;
@@ -85,6 +91,9 @@ public:
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
+
+    /// Returns a guest stack range that stopped being a stack to normal tracking, CPU-modified
+    void ReleaseCpuAuthoritativeRange(VAddr device_addr, u64 size);
 
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
@@ -131,6 +140,9 @@ private:
 
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
+    /// Logs compute_loop_cap hits: the first one, then a count per minute
+    void ReportLoopCapHits();
+
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     Vulkan::Runtime& runtime;
@@ -142,7 +154,12 @@ private:
 
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
+    Buffer loop_cap_buffer;
     RangeSet gpu_modified_ranges;
+    u32 loop_cap_hits_reported{};
+    u32 loop_cap_hits_minute{};
+    std::chrono::steady_clock::time_point loop_cap_last_check{};
+    std::chrono::steady_clock::time_point loop_cap_last_report{};
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;

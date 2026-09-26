@@ -4,7 +4,9 @@
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
+#include "common/harness.h"
 #include "common/path_util.h"
+#include "common/perf_stats.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
@@ -607,6 +609,9 @@ Frame* Presenter::PrepareLastFrame() {
         if (result == vk::Result::eTimeout) {
             continue;
         }
+        if (result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceFault("PrepareLastFrame");
+        }
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
     }
@@ -1080,9 +1085,70 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
     }
 
+    VideoCore::PollScheduledCaptures();
+    ReportDiagnostics(is_reusing_frame, is_game_frame);
+
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
+    }
+}
+
+void Presenter::ReportDiagnostics(bool is_reusing_frame, bool is_game_frame) {
+    const bool new_game_frame = !is_reusing_frame && is_game_frame;
+    // SHADPS4_PERF_STATS: frame-cost counters since the previous report (common/perf_stats.h)
+    if (Common::PerfStats::Enabled()) {
+        static u64 perf_game_frames = 0;
+        static u64 perf_presentations = 0;
+        static auto perf_last_report = std::chrono::steady_clock::now();
+        ++perf_presentations;
+        perf_game_frames += new_game_frame;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - perf_last_report >= std::chrono::seconds{10}) {
+            const auto interval_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - perf_last_report)
+                    .count();
+            LOG_WARNING(Render_Vulkan,
+                        "Harness perf: interval_ms={} game_frames={} presentations={} {}",
+                        interval_ms, perf_game_frames, perf_presentations,
+                        Common::PerfStats::TakeReport());
+            LOG_WARNING(Render_Vulkan, "Harness perf faults: {}",
+                        Common::PerfStats::TakeFaultRegionReport());
+            perf_game_frames = 0;
+            perf_presentations = 0;
+            perf_last_report = now;
+        }
+    }
+    // SHADPS4_HARNESS_PROGRESS: progress independent of image changes (a static menu may still present new
+    // frames), with VRAM use and the texture cache size
+    if (Common::HarnessEnabled()) {
+        static u64 presentation_count = 0;
+        static u64 game_frame_count = 0;
+        static auto last_report = std::chrono::steady_clock::now();
+        ++presentation_count;
+        game_frame_count += new_game_frame;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_report >= std::chrono::seconds{10}) {
+            std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+            vmaGetHeapBudgets(instance.GetAllocator(), budgets.data());
+            const auto heaps = instance.GetPhysicalDevice().getMemoryProperties().memoryHeaps;
+            u64 vram_usage = 0;
+            u64 vram_budget = 0;
+            for (u32 i = 0; i < VK_MAX_MEMORY_HEAPS; ++i) {
+                if ((heaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) &&
+                    budgets[i].budget > vram_budget) {
+                    vram_usage = budgets[i].usage;
+                    vram_budget = budgets[i].budget;
+                }
+            }
+            const auto [images, largest_image] = rasterizer->GetTextureCache().GetImageStats();
+            LOG_WARNING(Render_Vulkan,
+                        "Harness progress: presentations={} game_frames={} vram_mb={} "
+                        "vram_budget_mb={} images={} largest_image_mb={}",
+                        presentation_count, game_frame_count, vram_usage >> 20, vram_budget >> 20,
+                        images, largest_image >> 20);
+            last_report = now;
+        }
     }
 }
 
@@ -1109,6 +1175,9 @@ Frame* Presenter::GetRenderFrame() {
 
     // Wait for the presentation to be finished so all frame resources are free
     while (wait() != vk::Result::eSuccess) {
+        if (result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceFault("GetRenderFrame");
+        }
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
         // Retry if the waiting times out

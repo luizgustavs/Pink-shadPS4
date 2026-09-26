@@ -307,6 +307,8 @@ public:
         bool is_integer = false;
         bool is_storage = false;
         MipStorageFallbackMode mip_fallback_mode{};
+        /// Descriptor array size (0 = single image), see ImageResource::array_size
+        u32 array_size{};
     };
 
     enum class PointerType : u32 {
@@ -359,6 +361,7 @@ public:
     size_t flatbuf_index{};
     size_t bda_pagetable_index{};
     size_t fault_buffer_index{};
+    size_t loop_cap_buffer_index{};
     Id physical_pointer_type_u32;
 
     Id sampler_type{};

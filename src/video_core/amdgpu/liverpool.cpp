@@ -3,8 +3,13 @@
 
 #include <boost/preprocessor/stringize.hpp>
 
+#include <chrono>
+
 #include "common/assert.h"
+#include "common/cp_profiler.h"
 #include "common/debug.h"
+#include "common/guest_write_journal.h"
+#include "common/perf_stats.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -16,9 +21,40 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_draw_trace.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
+
+/// IT_COND_EXEC: true when the packets that follow must be skipped. The condition address comes from the
+/// command buffer; a garbage one must not crash the host, so the packets then execute, like a condition that
+/// always passes
+static bool CondExecSkips(const PM4CmdCondExec* cond_exec, const char* queue) {
+    if (cond_exec->command.Value() != 0) {
+        LOG_WARNING(Render, "IT_COND_EXEC used a reserved command ({})", queue);
+    }
+    const bool* cond_addr = cond_exec->Address();
+    if (!Core::Memory::Instance()->IsMappedLocked(reinterpret_cast<VAddr>(cond_addr),
+                                                  sizeof(bool))) {
+        LOG_WARNING(Render, "IT_COND_EXEC with unmapped address {:#x}, executing ({})",
+                    reinterpret_cast<VAddr>(cond_addr), queue);
+        return false;
+    }
+    return *cond_addr == false;
+}
+
+/// SHADPS4_DRAW_TRACE: the synchronization packets of the traced frames, with their queue, so a trace shows
+/// what each dispatch waited for (or did not wait for) before it ran. The next step on the SotC TDR root
+/// cause (§17 of the port guide) is a dispatch that runs before the game wrote its constant buffer
+static bool TraceSync() {
+    return Vulkan::DrawTrace::Instance().Active();
+}
+
+template <typename... Args>
+static void LogSync(std::string_view queue, fmt::format_string<Args...> format, Args&&... args) {
+    LOG_WARNING(Render, "DrawTrace f={} {} {}", Vulkan::DrawTrace::Instance().Frame(), queue,
+                fmt::format(format, std::forward<Args>(args)...));
+}
 
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
@@ -95,6 +131,8 @@ void Liverpool::Process(std::stop_token stoken) {
 #ifdef __linux__
     gpu_tid = gettid();
 #endif
+    Common::PerfStats::MarkGpuThread();
+    Common::CpProfiler::RegisterCurrentThread();
 
     while (!stoken.stop_requested()) {
         {
@@ -105,6 +143,9 @@ void Liverpool::Process(std::stop_token stoken) {
         if (stoken.stop_requested()) {
             break;
         }
+        const bool perf = Common::PerfStats::Enabled();
+        const auto busy_start =
+            perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
         VideoCore::StartCapture();
 
@@ -132,6 +173,9 @@ void Liverpool::Process(std::stop_token stoken) {
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
+                if (!queue.submit_times.empty()) {
+                    queue.submit_times.pop();
+                }
 
                 --num_submits;
                 std::scoped_lock lock2{submit_mutex};
@@ -146,6 +190,12 @@ void Liverpool::Process(std::stop_token stoken) {
                 rasterizer->Flush();
             }
             submit_done = false;
+        }
+        if (perf) {
+            Common::PerfStats::Add(Common::PerfStats::Id::CpBusyNs,
+                                   std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - busy_start)
+                                       .count());
         }
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
@@ -187,6 +237,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                     buffer_cache.FlushSyncBatch();
                 }
             }
+            Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::DumpConstRam,
+                                              dump_const->Address<VAddr>(), size,
+                                              cblock.constants_heap.data() + dump_const->Offset());
             memcpy(dump_const->Address<void*>(),
                    cblock.constants_heap.data() + dump_const->Offset(), size);
             break;
@@ -211,6 +264,19 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             while (!task.handle.done()) {
                 YIELD_CE();
                 RESUME_CE(task);
+            }
+            break;
+        }
+        case PM4ItOpcode::PredExec: {
+            // Executed unconditionally, like a predicate that always passes (as in the DE)
+            LOG_DEBUG(Render, "IT_PRED_EXEC ignored (CE)");
+            break;
+        }
+        case PM4ItOpcode::CondExec: {
+            const auto* cond_exec = reinterpret_cast<const PM4CmdCondExec*>(header);
+            if (CondExecSkips(cond_exec, "CE")) {
+                ccb = NextPacket(ccb, header->type3.NumWords() + 1 + cond_exec->exec_count.Value());
+                continue;
             }
             break;
         }
@@ -643,6 +709,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
                           magic_enum::enum_name(event->event_type.Value()),
                           magic_enum::enum_name(event->event_index.Value()));
+                if (TraceSync()) {
+                    LogSync("DE", "EVENT_WRITE type={} index={}",
+                            magic_enum::enum_name(event->event_type.Value()),
+                            magic_enum::enum_name(event->event_index.Value()));
+                }
                 if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
                     // TODO: handle proper synchronization, for now signal that update is done
                     // immediately
@@ -662,11 +733,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEos: {
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+                if (TraceSync()) {
+                    LogSync("DE", "EVENT_WRITE_EOS type={} command={} addr={:#x} data={:#x}",
+                            event_eos->event_type.Value(), u32(event_eos->command.Value()),
+                            event_eos->Address<VAddr>(), event_eos->data);
+                }
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
+                RecordLabelLag(GfxQueueId);
                 event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
                     auto* memory = Core::Memory::Instance();
+                    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Label,
+                                                      reinterpret_cast<u64>(address), num_bytes,
+                                                      &data, 0);
                     ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                 });
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
@@ -681,12 +761,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                if (TraceSync()) {
+                    LogSync("DE", "EVENT_WRITE_EOP type={} data_sel={} int_sel={} addr={} data={:#x}",
+                            event_eop->event_type.Value(), u32(event_eop->data_sel.Value()),
+                            u32(event_eop->int_sel.Value()), fmt::ptr(event_eop->Address<u32>()),
+                            event_eop->data_lo);
+                }
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
+                RecordLabelLag(GfxQueueId);
                 event_eop->SignalFence(
                     [](void* address, u64 data, u32 num_bytes) {
                         auto* memory = Core::Memory::Instance();
+                        Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Label,
+                                                          reinterpret_cast<u64>(address),
+                                                          num_bytes, &data, 1);
                         ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                     },
                     [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
@@ -698,6 +788,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 ASSERT(dma_data->command.das == 0);
+                if (Vulkan::DrawTrace::Instance().Active()) {
+                    LOG_WARNING(Render, "DrawTrace f={} DMA_DATA src_sel={} dst_sel={} src={:#x} "
+                                        "dst={:#x} bytes={:#x}",
+                                Vulkan::DrawTrace::Instance().Frame(), u32(dma_data->src_sel),
+                                u32(dma_data->dst_sel), dma_data->SrcAddress<VAddr>(),
+                                dma_data->DstAddress<VAddr>(), dma_data->NumBytes());
+                }
                 if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
                     rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(),
                                            dma_data->data, true);
@@ -734,10 +831,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
+                if (Vulkan::DrawTrace::Instance().Active()) {
+                    LOG_WARNING(Render, "DrawTrace f={} WRITE_DATA dst={} bytes={:#x}",
+                                Vulkan::DrawTrace::Instance().Frame(), fmt::ptr(address),
+                                data_size);
+                }
                 if (!write_data->wr_one_addr.Value()) {
                     if (rasterizer) {
                         rasterizer->OnFence();
                     }
+                    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::WriteData,
+                                                      reinterpret_cast<u64>(address), data_size,
+                                                      write_data->data, 0);
                     std::memcpy(address, write_data->data, data_size);
                 } else {
                     UNREACHABLE();
@@ -756,6 +861,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::MemSemaphore: {
                 const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+                if (TraceSync()) {
+                    LogSync("DE", "MEM_SEMAPHORE {} addr={:#x}",
+                            mem_semaphore->IsSignaling() ? "signal" : "wait",
+                            mem_semaphore->Address<VAddr>());
+                }
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
@@ -767,7 +877,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::AcquireMem: {
-                // const auto* acquire_mem = reinterpret_cast<PM4CmdAcquireMem*>(header);
+                const auto* acquire_mem = reinterpret_cast<const PM4CmdAcquireMem*>(header);
+                if (TraceSync()) {
+                    LogSync("DE", "ACQUIRE_MEM cntl={:#x} base={:#x}", acquire_mem->cp_coher_cntl,
+                            acquire_mem->cp_coher_base_lo);
+                }
                 break;
             }
             case PM4ItOpcode::Rewind: {
@@ -788,12 +902,25 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
+                if (TraceSync()) {
+                    LogSync("DE", "WAIT_REG_MEM {} {:#x} func={} ref={:#x} mask={:#x} passes={}",
+                            wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory
+                                ? "mem"
+                                : "reg",
+                            wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory
+                                ? reinterpret_cast<VAddr>(wait_addr)
+                                : VAddr{wait_reg_mem->Reg()},
+                            u32(wait_reg_mem->function.Value()), wait_reg_mem->ref,
+                            wait_reg_mem->mask, wait_reg_mem->Test(regs.reg_array));
+                }
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    const Common::PerfStats::ScopedNs perf_timer{Common::PerfStats::Id::CpVoWaitNs};
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
                 while (!wait_reg_mem->Test(regs.reg_array)) {
+                    Common::PerfStats::Add(Common::PerfStats::Id::CpWaitYields);
                     YIELD_GFX();
                 }
                 break;
@@ -834,16 +961,25 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::GetLodStats: {
-                LOG_WARNING(Render_Vulkan, "Unimplemented IT_GET_LOD_STATS");
+                const auto* lod_stats = reinterpret_cast<const PM4CmdGetLodStats*>(header);
+                if (rasterizer &&
+                    rasterizer->WriteLodStats(lod_stats->Address(), lod_stats->NumBytes())) {
+                    break;
+                }
+                // Safely ignored unless lod_stats_from_bindings is on. Kept at DEBUG: some titles emit it
+                // every frame
+                LOG_DEBUG(Render_Vulkan, "IT_GET_LOD_STATS ignored");
+                break;
+            }
+            case PM4ItOpcode::PredExec: {
+                // Predicated execution of the next packets on a GPU-evaluated condition; the packets are
+                // executed unconditionally, like a predicate that always passes
+                LOG_DEBUG(Render, "IT_PRED_EXEC ignored");
                 break;
             }
             case PM4ItOpcode::CondExec: {
                 const auto* cond_exec = reinterpret_cast<const PM4CmdCondExec*>(header);
-                if (cond_exec->command.Value() != 0) {
-                    LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
-                }
-                const auto skip = *cond_exec->Address() == false;
-                if (skip) {
+                if (CondExecSkips(cond_exec, "DE")) {
                     dcb = NextPacket(dcb,
                                      header->type3.NumWords() + 1 + cond_exec->exec_count.Value());
                     continue;
@@ -991,6 +1127,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::AcquireMem: {
+            if (TraceSync()) {
+                const auto* acquire_mem = reinterpret_cast<const PM4CmdAcquireMem*>(header);
+                LogSync(fmt::format("ASC{}", vqid), "ACQUIRE_MEM cntl={:#x} base={:#x}",
+                        acquire_mem->cp_coher_cntl, acquire_mem->cp_coher_base_lo);
+            }
             break;
         }
         case PM4ItOpcode::Rewind: {
@@ -1027,6 +1168,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::DispatchDirect: {
             const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
+            if (TraceSync()) {
+                LogSync(fmt::format("ASC{}", vqid), "DISPATCH_DIRECT {}x{}x{}",
+                        dispatch_direct->dim_x, dispatch_direct->dim_y, dispatch_direct->dim_z);
+            }
             if (auto it = std::ranges::find(indirect_patches, header, &IndirectPatch::header);
                 it != indirect_patches.end()) {
                 const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
@@ -1056,6 +1201,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 reinterpret_cast<const PM4CmdDispatchIndirectMec*>(header);
             auto& cs_program = GetCsRegs();
             const auto ib_address = dispatch_indirect->Address<VAddr>();
+            if (TraceSync()) {
+                LogSync(fmt::format("ASC{}", vqid), "DISPATCH_INDIRECT args={:#x}", ib_address);
+            }
             const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
             if (DebugState.DumpingCurrentReg()) {
                 DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
@@ -1074,10 +1222,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
+            if (TraceSync()) {
+                LogSync(fmt::format("ASC{}", vqid), "WRITE_DATA dst={:#x} bytes={:#x}",
+                        write_data->Address<VAddr>(), data_size);
+            }
             if (!write_data->wr_one_addr.Value()) {
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
+                Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::WriteData,
+                                                  write_data->Address<VAddr>(), data_size,
+                                                  write_data->data, 1);
                 std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
             } else {
                 UNREACHABLE();
@@ -1086,6 +1241,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::MemSemaphore: {
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+            if (TraceSync()) {
+                LogSync(fmt::format("ASC{}", vqid), "MEM_SEMAPHORE {} addr={:#x}",
+                        mem_semaphore->IsSignaling() ? "signal" : "wait",
+                        mem_semaphore->Address<VAddr>());
+            }
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
@@ -1099,16 +1259,36 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            if (TraceSync()) {
+                const bool is_mem =
+                    wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory;
+                LogSync(fmt::format("ASC{}", vqid),
+                        "WAIT_REG_MEM {} {:#x} func={} ref={:#x} mask={:#x} passes={}",
+                        is_mem ? "mem" : "reg",
+                        is_mem ? wait_reg_mem->Address<VAddr>() : VAddr{wait_reg_mem->Reg()},
+                        u32(wait_reg_mem->function.Value()), wait_reg_mem->ref,
+                        wait_reg_mem->mask, wait_reg_mem->Test(regs.reg_array));
+            }
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                Common::PerfStats::Add(Common::PerfStats::Id::CpWaitYields);
                 YIELD_ASC(vqid);
             }
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
+            if (TraceSync()) {
+                LogSync(fmt::format("ASC{}", vqid),
+                        "RELEASE_MEM type={} data_sel={} int_sel={} addr={:#x} data={:#x}",
+                        release_mem->event_type.Value(), u32(release_mem->data_sel.Value()),
+                        u32(release_mem->int_sel.Value()),
+                        u64(release_mem->address_hi) << 32 | release_mem->address_lo,
+                        release_mem->data_lo);
+            }
             if (rasterizer) {
                 rasterizer->OnFence();
             }
+            RecordLabelLag(vqid + 1);
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
@@ -1120,6 +1300,35 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::EventWrite: {
             // const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+            break;
+        }
+        case PM4ItOpcode::GetLodStats: {
+            const auto* lod_stats = reinterpret_cast<const PM4CmdGetLodStats*>(header);
+            if (!rasterizer ||
+                !rasterizer->WriteLodStats(lod_stats->Address(), lod_stats->NumBytes())) {
+                LOG_DEBUG(Render_Vulkan, "IT_GET_LOD_STATS ignored (ASC)");
+            }
+            break;
+        }
+        case PM4ItOpcode::PredExec: {
+            // Executed unconditionally, like a predicate that always passes (as on the DE)
+            LOG_DEBUG(Render, "IT_PRED_EXEC ignored (ASC)");
+            break;
+        }
+        case PM4ItOpcode::CondExec: {
+            const auto* cond_exec = reinterpret_cast<const PM4CmdCondExec*>(header);
+            if (CondExecSkips(cond_exec, "ASC")) {
+                // The skipped packets must be in this submission: past its end they wrap around the ring and
+                // would need the next one. Those are executed instead
+                const u32 exec_count = cond_exec->exec_count.Value();
+                if (next_dw_off + exec_count <= acb.size()) {
+                    next_dw_off += exec_count;
+                } else {
+                    LOG_WARNING(Render, "IT_COND_EXEC skip of {} dwords crosses the end of the "
+                                        "ASC submission, executing",
+                                exec_count);
+                }
+            }
             break;
         }
         default:
@@ -1171,6 +1380,27 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
     return std::make_pair(dcb, ccb);
 }
 
+void Liverpool::RecordLabelLag(u32 qid) {
+    if (!Common::PerfStats::Enabled()) {
+        return;
+    }
+    auto& queue = mapped_queues[qid];
+    std::chrono::steady_clock::time_point submitted;
+    {
+        std::scoped_lock lock{queue.m_access};
+        if (queue.submit_times.empty()) {
+            return;
+        }
+        submitted = queue.submit_times.front();
+    }
+    const u64 lag_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - submitted)
+                           .count();
+    Common::PerfStats::Add(Common::PerfStats::Id::LabelWrites);
+    Common::PerfStats::Add(Common::PerfStats::Id::LabelLagNs, lag_ns);
+    Common::PerfStats::Max(Common::PerfStats::Id::LabelLagMaxNs, lag_ns);
+}
+
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
 
@@ -1182,6 +1412,10 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        if (Common::PerfStats::Enabled()) {
+            queue.submit_times.emplace(std::chrono::steady_clock::now());
+            Common::PerfStats::Max(Common::PerfStats::Id::GfxQueueMax, queue.submits.size());
+        }
     }
 
     std::scoped_lock lk{submit_mutex};
@@ -1198,6 +1432,9 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        if (Common::PerfStats::Enabled()) {
+            queue.submit_times.emplace(std::chrono::steady_clock::now());
+        }
     }
 
     std::scoped_lock lk{submit_mutex};
