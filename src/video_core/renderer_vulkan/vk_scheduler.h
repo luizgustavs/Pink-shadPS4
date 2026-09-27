@@ -543,6 +543,7 @@ private:
     vk::UniqueCommandPool ahead_pool;
     vk::CommandBuffer ahead_cmdbuf;
     vk::UniqueFence ahead_fence;
+    u64 ahead_submits{}; // gpu_checkpoints: numbers the ahead submits in the submit ledger
 };
 
 } // namespace Vulkan

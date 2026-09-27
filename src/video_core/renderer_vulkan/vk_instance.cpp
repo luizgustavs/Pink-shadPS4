@@ -899,15 +899,25 @@ void Instance::ReportGpuCheckpoints(const char* where) const {
         return;
     }
     GpuCheckpoints::DumpRecent(where);
-    GpuCheckpoints::DumpSubmits(where, [this](u64 semaphore, u64& counter) {
-        const auto [result, value] =
-            device->getSemaphoreCounterValue(vk::Semaphore{std::bit_cast<VkSemaphore>(semaphore)});
-        if (result != vk::Result::eSuccess) {
-            return false;
-        }
-        counter = value;
-        return true;
-    });
+    GpuCheckpoints::DumpSubmits(
+        where,
+        [this](u64 semaphore, u64& counter) {
+            const auto [result, value] = device->getSemaphoreCounterValue(
+                vk::Semaphore{std::bit_cast<VkSemaphore>(semaphore)});
+            if (result != vk::Result::eSuccess) {
+                return false;
+            }
+            counter = value;
+            return true;
+        },
+        [this](u64 fence) -> std::optional<bool> {
+            const vk::Result result =
+                device->getFenceStatus(vk::Fence{std::bit_cast<VkFence>(fence)});
+            if (result != vk::Result::eSuccess && result != vk::Result::eNotReady) {
+                return std::nullopt;
+            }
+            return result == vk::Result::eSuccess;
+        });
     if (!nv_diagnostic_checkpoints) {
         return;
     }

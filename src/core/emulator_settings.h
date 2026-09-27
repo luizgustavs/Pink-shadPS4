@@ -469,7 +469,8 @@ struct GPUSettings {
     // bytes has a writer there, instead of submitting and draining the whole batch recorded so far
     Setting<bool> readback_ahead{false};
     // Submit without waiting after this many guest draws/dispatches (0 = off), so the GPU runs the frame
-    // while it is recorded instead of at the readback drains
+    // while it is recorded instead of at the readback drains. Use it only with readback_ahead: the fork lost
+    // the device once (WriteInvalid) with 128 and readback_ahead off; with readback_ahead and 64 it held
     Setting<u32> periodic_flush_commands{0};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides

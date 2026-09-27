@@ -174,6 +174,14 @@ void Scheduler::SubmitAhead() {
         .pCommandBuffers = &ahead_cmdbuf,
     };
     std::scoped_lock lk{submit_mutex};
+    if (tracks_gpu_commands) {
+        // gpu_checkpoints: the ahead copy carries no guest command and runs after the submitted ones. The
+        // previous one was waited for, so it is the last known completed
+        GpuCheckpoints::RecordSubmit(std::bit_cast<u64>(static_cast<VkFence>(*ahead_fence)),
+                                     ahead_submits + 1, submitted_seq + 1, submitted_seq,
+                                     ahead_submits, true);
+    }
+    ++ahead_submits;
     const auto submit_result = instance.GetGraphicsQueue().submit(submit_info, *ahead_fence);
     if (submit_result == vk::Result::eErrorDeviceLost) {
         instance.ReportDeviceFault("SubmitAhead");

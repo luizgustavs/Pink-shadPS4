@@ -513,6 +513,14 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         }
     }
     scheduler.EnableGpuTiming();
+    if (periodic_flush_commands != 0) {
+        LOG_WARNING(Render_Vulkan, "Workaround periodic_flush_commands enabled: submit every {} commands",
+                    periodic_flush_commands);
+        if (!EmulatorSettings.IsReadbackAhead()) {
+            LOG_WARNING(Render_Vulkan, "periodic_flush_commands without readback_ahead: one device "
+                                       "loss (WriteInvalid) was seen in this combination");
+        }
+    }
 }
 
 Rasterizer::~Rasterizer() = default;

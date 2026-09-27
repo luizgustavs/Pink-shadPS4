@@ -9,7 +9,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <string_view>
+#include <utility>
 #include "common/logging/log.h"
 #include "common/types.h"
 
@@ -131,6 +133,9 @@ struct SubmitRecord {
     u64 last_seq;
     u64 known_tick; // last completed tick the host had observed on this timeline
     u64 time_us;
+    // readback_ahead: `semaphore` is a VkFence signalled by this submit alone and `tick` numbers the submits
+    // on it (one in flight at a time). It carries no guest command and runs after command last_seq
+    bool fence;
 };
 
 constexpr size_t SubmitRingSize = 1 << 12;
@@ -143,7 +148,8 @@ inline u64 NowUs() {
         .count();
 }
 
-inline void RecordSubmit(u64 semaphore, u64 tick, u64 first_seq, u64 last_seq, u64 known_tick) {
+inline void RecordSubmit(u64 semaphore, u64 tick, u64 first_seq, u64 last_seq, u64 known_tick,
+                         bool fence = false) {
     const u64 id = g_submit_id.fetch_add(1, std::memory_order_relaxed) + 1;
     g_submits[id % SubmitRingSize] = SubmitRecord{
         .id = id,
@@ -153,6 +159,7 @@ inline void RecordSubmit(u64 semaphore, u64 tick, u64 first_seq, u64 last_seq, u
         .last_seq = last_seq,
         .known_tick = known_tick,
         .time_us = NowUs(),
+        .fence = fence,
     };
 }
 
@@ -315,9 +322,10 @@ inline void DumpSubmitCommands(const SubmitRecord& submit, u64 newest_seq, u64 l
 }
 
 /// Reports, per timeline, the first submit that the GPU never completed. query_counter returns false when the
-/// counter cannot be read after the loss and leaves the last known value
-template <typename QueryCounter>
-inline void DumpSubmits(const char* where, QueryCounter&& query_counter) {
+/// counter cannot be read after the loss and leaves the last known value. query_fence tells whether a fence
+/// (readback_ahead) is signalled, or nothing when it cannot be read
+template <typename QueryCounter, typename QueryFence>
+inline void DumpSubmits(const char* where, QueryCounter&& query_counter, QueryFence&& query_fence) {
     static std::mutex report_mutex;
     std::scoped_lock lock{report_mutex};
     const u64 last_id = g_submit_id.load(std::memory_order_relaxed);
@@ -327,33 +335,49 @@ inline void DumpSubmits(const char* where, QueryCounter&& query_counter) {
     LOG_CRITICAL(Render_Vulkan, "=== Submit ledger ({}): submits {}..{}, newest command seq {} ===",
                  where, first_id, last_id, newest_seq);
 
-    std::array<u64, 8> semaphores{};
+    // Handles of different Vulkan object types may share a value, so a timeline is the pair
+    std::array<std::pair<u64, bool>, 8> semaphores{};
     size_t num_semaphores = 0;
     for (u64 id = first_id; id <= last_id; ++id) {
-        const u64 sem = g_submits[id % SubmitRingSize].semaphore;
+        const auto& record = g_submits[id % SubmitRingSize];
+        const std::pair<u64, bool> key{record.semaphore, record.fence};
         bool seen = false;
         for (size_t i = 0; i < num_semaphores; ++i) {
-            seen |= semaphores[i] == sem;
+            seen |= semaphores[i] == key;
         }
         if (!seen && num_semaphores < semaphores.size()) {
-            semaphores[num_semaphores++] = sem;
+            semaphores[num_semaphores++] = key;
         }
     }
     for (size_t i = 0; i < num_semaphores; ++i) {
-        const u64 sem = semaphores[i];
+        const auto [sem, fence] = semaphores[i];
+        const auto matches = [&](const SubmitRecord& submit, u64 id) {
+            return submit.id == id && submit.semaphore == sem && submit.fence == fence;
+        };
         u64 counter = 0;
+        u64 newest_tick = 0;
         for (u64 id = first_id; id <= last_id; ++id) {
             const auto& submit = g_submits[id % SubmitRingSize];
-            if (submit.id == id && submit.semaphore == sem) {
+            if (matches(submit, id)) {
                 counter = std::max(counter, submit.known_tick);
+                newest_tick = std::max(newest_tick, submit.tick);
             }
         }
-        const bool queried = query_counter(sem, counter);
+        bool queried = false;
+        if (fence) {
+            // Only the newest fence submit can be pending: each one is waited for before the next
+            if (const std::optional<bool> signalled = query_fence(sem)) {
+                queried = true;
+                counter = *signalled ? newest_tick : newest_tick - 1;
+            }
+        } else {
+            queried = query_counter(sem, counter);
+        }
         const SubmitRecord* first_pending = nullptr;
         u32 pending = 0;
         for (u64 id = first_id; id <= last_id; ++id) {
             const auto& submit = g_submits[id % SubmitRingSize];
-            if (submit.id != id || submit.semaphore != sem || submit.tick <= counter) {
+            if (!matches(submit, id) || submit.tick <= counter) {
                 continue;
             }
             ++pending;
@@ -361,12 +385,20 @@ inline void DumpSubmits(const char* where, QueryCounter&& query_counter) {
                 first_pending = &submit;
             }
         }
-        LOG_CRITICAL(Render_Vulkan, "timeline {:#x}: completed tick {} ({}), {} submits pending",
-                     sem, counter, queried ? "queried" : "last known", pending);
+        LOG_CRITICAL(Render_Vulkan, "{} {:#x}: completed {} {} ({}), {} submits pending",
+                     fence ? "readback-ahead fence" : "timeline", sem, fence ? "copy" : "tick",
+                     counter, queried ? "queried" : "last known", pending);
         if (!first_pending) {
             continue;
         }
         const auto& submit = *first_pending;
+        if (fence) {
+            LOG_CRITICAL(Render_Vulkan,
+                         "first incomplete readback-ahead copy id={} copy={}, queued after command "
+                         "seq {}, submitted {} ms before the report",
+                         submit.id, submit.tick, submit.last_seq, (now - submit.time_us) / 1000);
+            continue;
+        }
         LOG_CRITICAL(Render_Vulkan,
                      "first incomplete submit id={} tick={} commands seq {}..{} submitted {} ms "
                      "before the report",
