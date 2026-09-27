@@ -273,14 +273,17 @@ void UpdateSinks() {
     // Anything but "events" keeps the old console that mirrors the log file
     g_console_all = EmulatorSettings.GetLogConsoleMode() != "events";
 
-    const auto file_chain = MakeSinkChain({g_shad_file_sink});
-    const auto class_chain =
-        g_console_all ? MakeSinkChain({g_console_sink, g_shad_file_sink}) : file_chain;
+    // In "all" mode nothing writes events, so the event logger gets no sinks (no second async
+    // worker for the file); in "events" mode it shares the class loggers' file chain
+    const auto class_chain = MakeSinkChain(
+        g_console_all ? std::vector<spdlog::sink_ptr>{g_console_sink, g_shad_file_sink}
+                      : std::vector<spdlog::sink_ptr>{g_shad_file_sink});
     for (auto& logger : ALL_LOGGERS) {
         logger->sinks() = class_chain;
     }
     if (g_event_file_logger) {
-        g_event_file_logger->sinks() = file_chain;
+        g_event_file_logger->sinks() =
+            g_console_all ? std::vector<spdlog::sink_ptr>{} : class_chain;
     }
 }
 

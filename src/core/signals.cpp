@@ -351,11 +351,14 @@ static LONG WINAPI TopLevelExceptionFilter(EXCEPTION_POINTERS* pExp) noexcept {
     WriteCrashReportRaw(pExp);
     if (pExp != nullptr && pExp->ExceptionRecord != nullptr &&
         pExp->ExceptionRecord->ExceptionCode == MSVC_CPP_EXCEPTION) {
-        Common::Log::Event(Common::Log::EventKind::Crash,
-                           fmt::format("Unhandled C++ exception thrown at {}",
-                                       DescribeCodeAddress(reinterpret_cast<u64>(
-                                           pExp->ExceptionRecord->ExceptionAddress))),
-                           {fmt::format("thread: {}", Common::GetCurrentThreadName())});
+        // Checked here so the "all" console mode does not even format the event
+        if (Common::Log::EventsEnabled()) {
+            Common::Log::Event(Common::Log::EventKind::Crash,
+                               fmt::format("Unhandled C++ exception thrown at {}",
+                                           DescribeCodeAddress(reinterpret_cast<u64>(
+                                               pExp->ExceptionRecord->ExceptionAddress))),
+                               {fmt::format("thread: {}", Common::GetCurrentThreadName())});
+        }
         Common::Log::Detail::FileOnlyCriticals file_only;
         LOG_CRITICAL(Debug, "Unhandled C++ exception at {}",
                      pExp->ExceptionRecord->ExceptionAddress);
@@ -377,9 +380,12 @@ static void AbortSignalHandler(int) {
     record.ExceptionAddress = reinterpret_cast<PVOID>(context.Rip);
     EXCEPTION_POINTERS pointers{&record, &context};
     WriteCrashReportRaw(&pointers);
-    Common::Log::Event(Common::Log::EventKind::Crash,
-                       "abort() on a host thread (std::terminate, e.g. an uncaught C++ exception)",
-                       {fmt::format("thread: {}", Common::GetCurrentThreadName())});
+    if (Common::Log::EventsEnabled()) {
+        Common::Log::Event(
+            Common::Log::EventKind::Crash,
+            "abort() on a host thread (std::terminate, e.g. an uncaught C++ exception)",
+            {fmt::format("thread: {}", Common::GetCurrentThreadName())});
+    }
     Common::Log::Detail::FileOnlyCriticals file_only;
     LOG_CRITICAL(Debug, "abort() on a host thread (std::terminate, e.g. an uncaught C++ exception)");
     Common::Singleton<Core::Emulator>::Instance()->Shutdown();
