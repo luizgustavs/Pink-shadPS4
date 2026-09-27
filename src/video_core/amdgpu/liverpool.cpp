@@ -9,6 +9,7 @@
 #include "common/cp_profiler.h"
 #include "common/debug.h"
 #include "common/guest_write_journal.h"
+#include "common/logging/events.h"
 #include "common/perf_stats.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
@@ -571,7 +572,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::SetPredication: {
-                LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+                LOG_RENDER_PROBLEM(Render, Warning, "Unimplemented IT_SET_PREDICATION");
                 break;
             }
             case PM4ItOpcode::IndexType: {
@@ -939,12 +940,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::CopyData: {
                 const auto* copy_data = reinterpret_cast<const PM4CmdCopyData*>(header);
-                LOG_WARNING(Render,
-                            "unhandled IT_COPY_DATA src_sel = {}, dst_sel = {}, "
-                            "count_sel = {}, wr_confirm = {}, engine_sel = {}",
-                            u32(copy_data->src_sel.Value()), u32(copy_data->dst_sel.Value()),
-                            copy_data->count_sel.Value(), copy_data->wr_confirm.Value(),
-                            u32(copy_data->engine_sel.Value()));
+                LOG_RENDER_PROBLEM(Render, Warning,
+                                   "unhandled IT_COPY_DATA src_sel = {}, dst_sel = {}, "
+                                   "count_sel = {}, wr_confirm = {}, engine_sel = {}",
+                                   u32(copy_data->src_sel.Value()), u32(copy_data->dst_sel.Value()),
+                                   copy_data->count_sel.Value(), copy_data->wr_confirm.Value(),
+                                   u32(copy_data->engine_sel.Value()));
                 break;
             }
             case PM4ItOpcode::MemSemaphore: {
@@ -1040,12 +1041,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::StrmoutBufferUpdate: {
                 const auto* strmout = reinterpret_cast<const PM4CmdStrmoutBufferUpdate*>(header);
-                LOG_WARNING(Render_Vulkan,
-                            "Unimplemented IT_STRMOUT_BUFFER_UPDATE, update_memory = {}, "
-                            "source_select = {}, buffer_select = {}",
-                            strmout->update_memory.Value(),
-                            magic_enum::enum_name(strmout->source_select.Value()),
-                            strmout->buffer_select.Value());
+                LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                                   "Unimplemented IT_STRMOUT_BUFFER_UPDATE, update_memory = {}, "
+                                   "source_select = {}, buffer_select = {}",
+                                   strmout->update_memory.Value(),
+                                   magic_enum::enum_name(strmout->source_select.Value()),
+                                   strmout->buffer_select.Value());
                 break;
             }
             case PM4ItOpcode::GetLodStats: {

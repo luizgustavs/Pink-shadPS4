@@ -27,6 +27,7 @@ using spdlog_stdout = spdlog::sinks::stdout_color_sink_mt;
 #endif
 
 #include "common/assert.h"
+#include "common/logging/events.h"
 #include "common/logging/log.h"
 #include "common/logging/log_file_sink.h"
 #include "common/path_util.h"
@@ -39,6 +40,14 @@ namespace Common::Log {
 static std::shared_ptr<spdlog_stdout> g_console_sink;
 static std::shared_ptr<LogFileSink> g_shad_file_sink;
 static std::array<std::unique_ptr<spdlog::logger>, NUM_LOG_CLASSES> ALL_LOGGERS{};
+// Console events and, in "events" console mode, Critical messages
+static std::unique_ptr<spdlog::logger> g_console_logger;
+// Event lines of the log file
+static std::unique_ptr<spdlog::logger> g_event_file_logger;
+static bool g_console_all = true;
+
+static thread_local std::string t_last_critical;
+static thread_local bool t_file_only_criticals = false;
 
 std::array<Level, NUM_LOG_CLASSES> g_class_levels{};
 
@@ -65,11 +74,74 @@ void VLog(Class log_class, Level level, const char* file, int line, const char* 
     fmt::memory_buffer msg;
     fmt::vformat_to(fmt::appender(msg), format, args);
     const std::string_view fn = std::string_view(func) == "operator()" ? "lambda" : func;
+    const std::string_view text{msg.data(), msg.size()};
+    const auto thread_name = Common::GetCurrentThreadName();
     logger->log(ToSpdlog(level), "[{}] <{}> ({}) {}:{} {}: {}", NameOf(log_class),
-                NameOf(ToSpdlog(level)), Common::GetCurrentThreadName(),
-                spdlog::source_loc::basename(file), line, fn,
-                std::string_view(msg.data(), msg.size()));
+                NameOf(ToSpdlog(level)), thread_name, spdlog::source_loc::basename(file), line, fn,
+                text);
+    if (g_console_all || level < Level::Warning) {
+        return;
+    }
+    Detail::CountMessage(log_class, level, file, line, text);
+    if (level < Level::Error) {
+        return;
+    }
+    if (auto* scope = CurrentErrorScope()) {
+        Detail::ErrorScopeCallGuard guard;
+        scope->OnError(log_class, level, text);
+    }
+    if (level < Level::Critical) {
+        return;
+    }
+    t_last_critical =
+        fmt::format("{}:{} {}: {}", spdlog::source_loc::basename(file), line, fn, text);
+    // Failed assertions become a Crash event (see assert.cpp); other Criticals are echoed
+    const bool assertion =
+        text.starts_with("Assertion Failed!") || text.starts_with("Unreachable code!");
+    if (!t_file_only_criticals && !assertion && g_console_logger) {
+        g_console_logger->log(spdlog::level::critical, "[{}] <Critical> ({}) {}:{} {}: {}",
+                              NameOf(log_class), thread_name, spdlog::source_loc::basename(file),
+                              line, fn, text);
+    }
 }
+
+bool EventsEnabled() {
+    return !g_console_all;
+}
+
+std::string LastCriticalMessage() {
+    return t_last_critical;
+}
+
+namespace Detail {
+
+void WriteEvent(Level level, std::string_view console_text, std::string_view file_text) {
+    if (!console_text.empty() && g_console_logger) {
+        g_console_logger->log(ToSpdlog(level), "{}", console_text);
+        g_console_logger->flush();
+    }
+    if (!file_text.empty() && g_event_file_logger) {
+        g_event_file_logger->log(ToSpdlog(level), "{}", file_text);
+    }
+}
+
+std::string LogFilePath() {
+    if (!g_shad_file_sink) {
+        return {};
+    }
+    const auto& session = g_shad_file_sink->session_file_helper_.filename();
+    return (session.empty() ? g_shad_file_sink->main_file_helper_.filename() : session).string();
+}
+
+FileOnlyCriticals::FileOnlyCriticals() : previous{t_file_only_criticals} {
+    t_file_only_criticals = true;
+}
+
+FileOnlyCriticals::~FileOnlyCriticals() {
+    t_file_only_criticals = previous;
+}
+
+} // namespace Detail
 
 template <typename T>
 static auto UpdateColorLevels(T sink) {
@@ -136,6 +208,10 @@ void Setup(std::string_view shadps4_filename) {
 #endif
 
     g_console_sink->set_pattern("%^%v%$");
+    g_console_logger = std::make_unique<spdlog::logger>("Console", g_console_sink);
+    g_console_logger->set_level(spdlog::level::trace);
+    g_event_file_logger = std::make_unique<spdlog::logger>("Event");
+    g_event_file_logger->set_level(spdlog::level::trace);
 
     // Setup file
 
@@ -159,9 +235,12 @@ void Switch(std::string_view game_filename, bool append_log) {
 }
 
 void Shutdown() {
+    PrintSessionSummary();
     for (auto& logger : ALL_LOGGERS) {
         logger.reset();
     }
+    g_console_logger.reset();
+    g_event_file_logger.reset();
 
     g_shad_file_sink.reset();
     g_console_sink.reset();
@@ -177,21 +256,31 @@ void Flush() {
     }
 }
 
+// Wraps sinks in the async and duplicate filter sinks the settings ask for
+static std::vector<spdlog::sink_ptr> MakeSinkChain(std::vector<spdlog::sink_ptr> sinks) {
+    if (!EmulatorSettings.IsLogSync()) {
+        sinks = {std::make_shared<spdlog::sinks::async_sink>(
+            spdlog::sinks::async_sink::config{.sinks = std::move(sinks)})};
+    }
+    if (EmulatorSettings.IsLogSkipDuplicate()) {
+        sinks = {std::make_shared<spdlog::sinks::dup_filter_sink_mt>(
+            std::chrono::milliseconds(EmulatorSettings.GetLogMaxSkipDuration()), std::move(sinks))};
+    }
+    return sinks;
+}
+
 void UpdateSinks() {
-    std::initializer_list<spdlog::sink_ptr> sinks{g_console_sink, g_shad_file_sink};
+    // Anything but "events" keeps the old console that mirrors the log file
+    g_console_all = EmulatorSettings.GetLogConsoleMode() != "events";
 
-    std::initializer_list<spdlog::sink_ptr> async_sink{std::make_shared<spdlog::sinks::async_sink>(
-        spdlog::sinks::async_sink::config{.sinks = sinks})};
-
-    std::initializer_list<spdlog::sink_ptr> dup_filter{
-        std::make_shared<spdlog::sinks::dup_filter_sink_mt>(
-            std::chrono::milliseconds(EmulatorSettings.GetLogMaxSkipDuration()),
-            EmulatorSettings.IsLogSync() ? sinks : async_sink)};
-
+    const auto file_chain = MakeSinkChain({g_shad_file_sink});
+    const auto class_chain =
+        g_console_all ? MakeSinkChain({g_console_sink, g_shad_file_sink}) : file_chain;
     for (auto& logger : ALL_LOGGERS) {
-        logger->sinks() = EmulatorSettings.IsLogSkipDuplicate()
-                              ? dup_filter
-                              : (EmulatorSettings.IsLogSync() ? sinks : async_sink);
+        logger->sinks() = class_chain;
+    }
+    if (g_event_file_logger) {
+        g_event_file_logger->sinks() = file_chain;
     }
 }
 

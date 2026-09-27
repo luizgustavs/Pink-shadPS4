@@ -3,6 +3,7 @@
 
 #include <ranges>
 #include "common/assert.h"
+#include "common/logging/events.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -170,9 +171,10 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     const auto image_format_properties =
         instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
     if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
-        LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
-                  vk::to_string(supported_format), vk::to_string(format_info.type),
-                  vk::to_string(format_info.flags), vk::to_string(format_info.usage));
+        LOG_RENDER_PROBLEM(Render_Vulkan, Error,
+                           "image format {} type {} is not supported (flags {}, usage {})",
+                           vk::to_string(supported_format), vk::to_string(format_info.type),
+                           vk::to_string(format_info.flags), vk::to_string(format_info.usage));
     }
     supported_samples = image_format_properties.result == vk::Result::eSuccess
                             ? image_format_properties.value.imageFormatProperties.sampleCounts

@@ -9,8 +9,10 @@
 #include "common/assert.h"
 #include "common/decoder.h"
 #include "common/guest_write_journal.h"
+#include "common/logging/events.h"
 #include "common/memory_patcher.h"
 #include "common/signal_context.h"
+#include "common/thread.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/threads/exception.h"
@@ -260,6 +262,87 @@ static void WriteCrashReportRaw(EXCEPTION_POINTERS* pExp) noexcept {
     InterlockedExchange(&crash_file_busy, 0);
 }
 
+// "eboot.bin+0x1234 (game code)", "shadps4.exe+0x1234 (emulator code)", ...
+static std::string DescribeCodeAddress(u64 address) {
+    const u64 eboot = MemoryPatcher::g_eboot_address;
+    if (eboot != 0 && address >= eboot && address < eboot + MemoryPatcher::g_eboot_image_size) {
+        return fmt::format("eboot.bin+{:#x} (game code)", address - eboot);
+    }
+    HMODULE module = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(address), &module) &&
+        module != nullptr) {
+        char name[MAX_PATH]{};
+        GetModuleFileNameA(module, name, MAX_PATH);
+        const std::string_view path{name};
+        const auto file = path.substr(path.find_last_of("\\/") + 1);
+        return fmt::format("{}+{:#x}{}", file, address - reinterpret_cast<u64>(module),
+                           module == GetModuleHandleA(nullptr) ? " (emulator code)" : "");
+    }
+    return fmt::format("{:#x} (game module or generated code)", address);
+}
+
+// Console Crash event for an exception nothing handled
+static void ReportCrashEvent(EXCEPTION_POINTERS* pExp) {
+    if (!Common::Log::EventsEnabled()) {
+        return;
+    }
+    const auto* record = pExp != nullptr ? pExp->ExceptionRecord : nullptr;
+    const auto* ctx = pExp != nullptr ? pExp->ContextRecord : nullptr;
+    const DWORD code = record != nullptr ? record->ExceptionCode : 0;
+    std::string what;
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+        if (record->NumberParameters >= 2) {
+            const auto type = record->ExceptionInformation[0];
+            what = fmt::format("Access violation {} {:#x}",
+                               type == 0   ? "reading"
+                               : type == 8 ? "executing"
+                                           : "writing",
+                               record->ExceptionInformation[1]);
+        } else {
+            what = "Access violation";
+        }
+        break;
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+        what = "Illegal instruction";
+        break;
+    case EXCEPTION_PRIV_INSTRUCTION:
+        what = "Privileged instruction";
+        break;
+    case EXCEPTION_STACK_OVERFLOW:
+        what = "Stack overflow";
+        break;
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+        what = "Integer division by zero";
+        break;
+    case EXCEPTION_IN_PAGE_ERROR:
+        what = "In-page I/O error";
+        break;
+    case EXCEPTION_BREAKPOINT:
+        what = "Breakpoint";
+        break;
+    default:
+        what = fmt::format("Exception {:#x}", code);
+        break;
+    }
+    const u64 rip = ctx != nullptr      ? ctx->Rip
+                    : record != nullptr ? reinterpret_cast<u64>(record->ExceptionAddress)
+                                        : 0;
+    if (auto* scope = Common::Log::CurrentErrorScope()) {
+        Common::Log::Detail::ErrorScopeCallGuard guard;
+        scope->OnFatal(what);
+    }
+    char cwd[MAX_PATH]{};
+    GetCurrentDirectoryA(MAX_PATH, cwd);
+    Common::Log::Event(Common::Log::EventKind::Crash,
+                       fmt::format("{} at {}", what, DescribeCodeAddress(rip)),
+                       {fmt::format("thread: {}", Common::GetCurrentThreadName()),
+                        fmt::format("registers and stack: {}\\shadps4_crash_raw.txt", cwd),
+                        fmt::format("log: {}", Common::Log::Detail::LogFilePath())});
+}
+
 static LPTOP_LEVEL_EXCEPTION_FILTER previous_top_level_filter = nullptr;
 
 // Last-resort filter for exceptions that leave the vectored handler unhandled, e.g. a host C++ exception
@@ -268,6 +351,12 @@ static LONG WINAPI TopLevelExceptionFilter(EXCEPTION_POINTERS* pExp) noexcept {
     WriteCrashReportRaw(pExp);
     if (pExp != nullptr && pExp->ExceptionRecord != nullptr &&
         pExp->ExceptionRecord->ExceptionCode == MSVC_CPP_EXCEPTION) {
+        Common::Log::Event(Common::Log::EventKind::Crash,
+                           fmt::format("Unhandled C++ exception thrown at {}",
+                                       DescribeCodeAddress(reinterpret_cast<u64>(
+                                           pExp->ExceptionRecord->ExceptionAddress))),
+                           {fmt::format("thread: {}", Common::GetCurrentThreadName())});
+        Common::Log::Detail::FileOnlyCriticals file_only;
         LOG_CRITICAL(Debug, "Unhandled C++ exception at {}",
                      pExp->ExceptionRecord->ExceptionAddress);
     }
@@ -288,6 +377,10 @@ static void AbortSignalHandler(int) {
     record.ExceptionAddress = reinterpret_cast<PVOID>(context.Rip);
     EXCEPTION_POINTERS pointers{&record, &context};
     WriteCrashReportRaw(&pointers);
+    Common::Log::Event(Common::Log::EventKind::Crash,
+                       "abort() on a host thread (std::terminate, e.g. an uncaught C++ exception)",
+                       {fmt::format("thread: {}", Common::GetCurrentThreadName())});
+    Common::Log::Detail::FileOnlyCriticals file_only;
     LOG_CRITICAL(Debug, "abort() on a host thread (std::terminate, e.g. an uncaught C++ exception)");
     Common::Singleton<Core::Emulator>::Instance()->Shutdown();
 }
@@ -446,7 +539,11 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
                 reinterpret_cast<u64>(record->ExceptionAddress),
                 record->NumberParameters > 1 ? record->ExceptionInformation[1] : 0);
         }
-        LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        ReportCrashEvent(pExp);
+        {
+            Common::Log::Detail::FileOnlyCriticals file_only;
+            LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        }
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 

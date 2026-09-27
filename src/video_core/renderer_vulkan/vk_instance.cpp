@@ -10,6 +10,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/logging/events.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
@@ -957,11 +958,17 @@ void Instance::ReportDeviceFault(const char* where) const {
     static std::mutex report_mutex;
     static bool reported = false;
     std::scoped_lock lock{report_mutex};
+    // The report goes to the log file; the console gets one Render event
+    Common::Log::Detail::FileOnlyCriticals file_only;
     if (reported) {
         LOG_CRITICAL(Render_Vulkan, "Device lost ({}); already reported", where);
         return;
     }
     reported = true;
+    Common::Log::Event(
+        Common::Log::EventKind::Render,
+        fmt::format("GPU crashed or hung (VK_ERROR_DEVICE_LOST), detected in {}", where),
+        {"GPU checkpoints and the driver fault report are in the log file"});
     ReportGpuCheckpoints(where);
     if (!device_fault) {
         LOG_CRITICAL(Render_Vulkan, "Device lost ({}); device fault report unavailable", where);

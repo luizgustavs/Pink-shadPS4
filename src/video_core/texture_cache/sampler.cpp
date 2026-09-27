@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include "common/logging/events.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/sampler.h"
@@ -20,7 +21,8 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
     auto border_color = LiverpoolToVK::BorderColor(sampler.border_color_type);
     if (border_color == vk::BorderColor::eFloatCustomEXT &&
         !instance.IsCustomBorderColorSupported()) {
-        LOG_WARNING(Render_Vulkan, "Custom border color is not supported, falling back to black");
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                           "Custom border color is not supported, falling back to black");
         border_color = vk::BorderColor::eFloatOpaqueBlack;
     }
 

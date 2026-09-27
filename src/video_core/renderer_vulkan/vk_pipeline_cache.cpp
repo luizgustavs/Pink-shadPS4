@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <ranges>
 
 #include "common/hash.h"
 #include "common/io_file.h"
+#include "common/logging/events.h"
 #include "common/path_util.h"
 #include "common/perf_stats.h"
 #include "core/debug_state.h"
@@ -615,11 +617,13 @@ bool PipelineCache::RefreshGraphicsStages() {
     switch (regs.stage_enable.raw) {
     case AmdGpu::ShaderStageEnable::VgtStages::EsGs:
         if (!instance.IsGeometryStageSupported()) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
+            LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                               "Geometry shader stage unsupported, skipping");
             return false;
         }
         if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
+            LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                               "Geometry shader features unsupported, skipping");
             return false;
         }
         if (!bind_stage(HwStage::Export, SwStage::Vertex)) {
@@ -648,11 +652,13 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
         if (!instance.IsGeometryStageSupported()) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
+            LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                               "Geometry shader stage unsupported, skipping");
             return false;
         }
         if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
+            LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                               "Geometry shader features unsupported, skipping");
             return false;
         }
         if (!bind_stage(HwStage::Hull, SwStage::TessellationControl)) {
@@ -672,7 +678,8 @@ bool PipelineCache::RefreshGraphicsStages() {
         bind_stage(HwStage::Vertex, SwStage::Vertex);
         break;
     default:
-        LOG_WARNING(Render_Vulkan, "unimplemented shader stage {}", (u32)regs.stage_enable.raw);
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning, "unimplemented shader stage {}",
+                           (u32)regs.stage_enable.raw);
         return false;
     }
 
@@ -703,6 +710,92 @@ bool PipelineCache::RefreshComputeKey() {
     return true;
 }
 
+namespace {
+
+// Watches one shader compile (only with Log.console_mode = "events"): a recompiler error, or a
+// crash while compiling, marks the shader as broken, which is reported once as a Broken Shader
+// console event. The event points to the GPU.dump_shaders files of the shader when that is on
+class BrokenShaderWatch final : public Common::Log::ErrorScope {
+public:
+    BrokenShaderWatch(Shader::HwStage stage_, u64 hash_, size_t perm_idx_,
+                      std::span<const u32> code_)
+        : stage{stage_}, hash{hash_}, perm_idx{perm_idx_}, code{code_} {}
+
+    void SetSpirv(std::span<const u32> spirv_) {
+        spirv = spirv_;
+    }
+
+    void OnError(Common::Log::Class log_class, Common::Log::Level level,
+                 std::string_view message) override {
+        if (level < Common::Log::Level::Critical &&
+            log_class != Common::Log::Class::Render_Recompiler) {
+            return;
+        }
+        if (errors++ == 0) {
+            first_error = message;
+        }
+    }
+
+    void OnFatal(std::string_view reason) override {
+        Report(first_error.empty() ? reason : first_error, true);
+    }
+
+    // The compile finished without crashing
+    void Finish() {
+        if (errors > 0) {
+            Report(first_error, false);
+        }
+    }
+
+private:
+    // Detail line of the event: where GPU.dump_shaders put the shader (see DumpShader)
+    std::string DumpLocation() const {
+        if (!EmulatorSettings.IsDumpShaders()) {
+            return "not dumped (enable GPU.dump_shaders to keep shader binaries)";
+        }
+        const auto base = Common::FS::GetUserPath(Common::FS::PathType::ShaderDir) / "dumps" /
+                          PipelineCache::GetShaderName(stage, hash, perm_idx);
+        return fmt::format("dump: {}.bin{}", base.string(), spirv.empty() ? "" : " (+ .spv)");
+    }
+
+    void Report(std::string_view reason, bool fatal) {
+        if (reported) {
+            return;
+        }
+        reported = true;
+        if (!Common::Log::FirstTime(fmt::format("broken shader {:#x}", hash))) {
+            return;
+        }
+        std::string message{reason};
+        if (constexpr std::string_view assertion = "Assertion Failed!\n";
+            message.starts_with(assertion)) {
+            message = "assertion failed: " + message.substr(assertion.size());
+        }
+        std::ranges::replace(message, '\n', ' ');
+        const auto perm =
+            perm_idx != 0 ? fmt::format(" (permutation {})", perm_idx) : std::string{};
+        Common::Log::Event(Common::Log::EventKind::BrokenShader,
+                           fmt::format("{} shader {:#018x}{}: {}", stage, hash, perm, message),
+                           {fatal ? "compiling it crashed the emulator"
+                                  : "compiled anyway; draws using it may render wrong",
+                            errors > 1 ? fmt::format("{} more recompiler error{} in the log file",
+                                                     errors - 1, errors > 2 ? "s" : "")
+                                       : std::string{},
+                            DumpLocation()});
+    }
+
+    Shader::HwStage stage;
+    u64 hash;
+    size_t perm_idx;
+    std::span<const u32> code;
+    std::span<const u32> spirv;
+    u32 errors = 0;
+    std::string first_error;
+    bool reported = false;
+};
+
+} // Anonymous namespace
+
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
@@ -711,9 +804,16 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
+    std::optional<BrokenShaderWatch> broken_watch;
+    if (Common::Log::EventsEnabled()) {
+        broken_watch.emplace(info.hw_stage, info.pgm_hash, perm_idx, code);
+    }
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    if (broken_watch) {
+        broken_watch->SetSpirv(spv);
+    }
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
     vk::ShaderModule module;
@@ -725,6 +825,9 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         module = CompileSPV(*patch, instance.GetDevice());
     } else {
         module = CompileSPV(spv, instance.GetDevice());
+    }
+    if (broken_watch) {
+        broken_watch->Finish();
     }
 
     RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);

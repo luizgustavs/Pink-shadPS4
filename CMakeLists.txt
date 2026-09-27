@@ -771,6 +771,8 @@ set(DEV_TOOLS src/core/devtools/layer.cpp
 
 set(COMMON src/common/logging/classes.cpp
            src/common/logging/classes.h
+           src/common/logging/events.cpp
+           src/common/logging/events.h
            src/common/logging/formatter.h
            src/common/logging/log.cpp
            src/common/logging/log.h

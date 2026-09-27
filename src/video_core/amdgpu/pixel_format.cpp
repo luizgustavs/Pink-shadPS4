@@ -5,6 +5,7 @@
 #include <mutex>
 #include <set>
 #include "common/assert.h"
+#include "common/logging/events.h"
 #include "common/logging/log.h"
 #include "video_core/amdgpu/pixel_format.h"
 
@@ -19,8 +20,8 @@ void WarnInvalidDescriptorOnce(std::string_view operation, u64 value, std::strin
             return;
         }
     }
-    LOG_WARNING(Render, "Unsupported descriptor/register value: {}={:#x}, using {}", operation,
-                value, fallback);
+    LOG_RENDER_PROBLEM(Render, Warning, "Unsupported descriptor/register value: {}={:#x}, using {}",
+                       operation, value, fallback);
 }
 
 std::string_view NameOf(DataFormat fmt) {

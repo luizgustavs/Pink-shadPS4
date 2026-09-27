@@ -167,6 +167,9 @@ int main(int argc, char* argv[]) {
     std::shared_ptr<EmulatorSettingsImpl> emu_settings = std::make_shared<EmulatorSettingsImpl>();
     EmulatorSettingsImpl::SetInstance(emu_settings);
     emu_settings->Load();
+    // The log was set up with defaults; apply the loaded settings (e.g. Log.console_mode) before
+    // the boot messages
+    Common::Log::UpdateSinks();
 
     if (bigPicture) {
         BigPictureMode::Launch(argv[0], sameProcess);

@@ -23,6 +23,7 @@
 #include "common/discord_rpc_handler.h"
 #endif
 #include "common/elf_info.h"
+#include "common/logging/events.h"
 #include "common/memory_patcher.h"
 #include "common/ntapi.h"
 #include "common/path_util.h"
@@ -90,6 +91,7 @@ void Emulator::Shutdown() {
     if (exit_done) {
         return;
     }
+    Common::Log::PrintSessionSummary();
     Common::Log::Flush();
     Libraries::SaveData::Backup::StopThread();
     Storage::DataBase::Instance().Close();

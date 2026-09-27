@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/static_vector.hpp>
+#include "common/logging/events.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/ir/microinstruction.h"
@@ -275,7 +276,7 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod
             // Normally IMAGE_LOAD_MIP should translate -> OpImageFetch
             UNREACHABLE_MSG("Unsupported ImageRead with Lod");
 #else
-            LOG_WARNING(Render, "Fallback for ImageRead with LOD");
+            LOG_RENDER_PROBLEM(Render, Warning, "Fallback for ImageRead with LOD");
             ASSERT(texture.mip_fallback_mode == MipStorageFallbackMode::DynamicIndex);
             const Id single_image_ptr_type =
                 ctx.TypePointer(spv::StorageClass::UniformConstant, texture.image_type);
@@ -298,7 +299,7 @@ void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id 
     if (ctx.profile.supports_image_load_store_lod) {
         operands.Add(spv::ImageOperandsMask::Lod, lod);
     } else if (Sirit::ValidId(lod)) {
-        LOG_WARNING(Render, "Fallback for ImageWrite with LOD");
+        LOG_RENDER_PROBLEM(Render, Warning, "Fallback for ImageWrite with LOD");
         ASSERT(texture.mip_fallback_mode == MipStorageFallbackMode::DynamicIndex);
         const Id single_image_ptr_type =
             ctx.TypePointer(spv::StorageClass::UniformConstant, texture.image_type);

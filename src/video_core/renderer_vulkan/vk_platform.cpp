@@ -17,6 +17,7 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/logging/events.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
@@ -52,9 +53,17 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL DebugUtilsCallback(
         level = Common::Log::Level::Info;
     }
 
-    LOG_GENERIC(Render_Vulkan, level, "{}: {}",
-                callback_data->pMessageIdName ? callback_data->pMessageIdName : "<null>",
+    const char* message_id =
+        callback_data->pMessageIdName ? callback_data->pMessageIdName : "<null>";
+    LOG_GENERIC(Render_Vulkan, level, "{}: {}", message_id,
                 callback_data->pMessage ? callback_data->pMessage : "<null>");
+    if (level == Common::Log::Level::Error && Common::Log::EventsEnabled() &&
+        Common::Log::FirstTime(fmt::format("validation {}", message_id))) {
+        Common::Log::ReportRenderProblem(
+            fmt::format("Vulkan validation error {}: {}", message_id,
+                        callback_data->pMessage ? callback_data->pMessage : "<null>"),
+            "validation layer");
+    }
 
     return VK_FALSE;
 }

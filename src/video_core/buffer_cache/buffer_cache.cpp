@@ -10,6 +10,7 @@
 
 #include "common/alignment.h"
 #include "common/guest_write_journal.h"
+#include "common/logging/events.h"
 #include "common/perf_stats.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -719,7 +720,8 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
             RecordGpuWrite(device_addr, size);
             return true;
         } else {
-            LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));
+            LOG_RENDER_PROBLEM(Render_Vulkan, Warning, "Unhandled metadata type {}",
+                               magic_enum::enum_name(*type));
         }
     }
     const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);

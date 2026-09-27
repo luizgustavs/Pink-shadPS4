@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/logging/events.h"
 #include "common/number_utils.h"
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -9,7 +10,8 @@
 #include <magic_enum/magic_enum.hpp>
 
 #define INVALID_NUMBER_FORMAT_COMBO                                                                \
-    LOG_ERROR(Render_Vulkan, "Unsupported number type {} for format {}", number_type, format);
+    LOG_RENDER_PROBLEM(Render_Vulkan, Error, "Unsupported number type {} for format {}",           \
+                       number_type, format);
 
 namespace Vulkan::LiverpoolToVK {
 
@@ -36,8 +38,8 @@ vk::StencilOp StencilOp(AmdGpu::StencilFunc op) {
     case AmdGpu::StencilFunc::ReplaceOp:
         return vk::StencilOp::eReplace;
     case AmdGpu::StencilFunc::Ones:
-        LOG_WARNING(Render_Vulkan, "Unsupported stencil op {}, using Replace.",
-                    static_cast<u32>(op));
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning, "Unsupported stencil op {}, using Replace.",
+                           static_cast<u32>(op));
         return vk::StencilOp::eReplace;
     case AmdGpu::StencilFunc::And:
     case AmdGpu::StencilFunc::Or:
@@ -46,8 +48,8 @@ vk::StencilOp StencilOp(AmdGpu::StencilFunc op) {
     case AmdGpu::StencilFunc::Nor:
     case AmdGpu::StencilFunc::Xnor:
         // Bitwise stencil operations have no Vulkan equivalent; eKeep is the safest fallback.
-        LOG_WARNING(Render_Vulkan, "Unsupported bitwise stencil op {}, using Keep.",
-                    static_cast<u32>(op));
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning, "Unsupported bitwise stencil op {}, using Keep.",
+                           static_cast<u32>(op));
         return vk::StencilOp::eKeep;
     default:
         AmdGpu::WarnInvalidDescriptorOnce("StencilOp", u32(op), "vk::StencilOp::eKeep");
@@ -122,7 +124,8 @@ vk::PrimitiveTopology PrimitiveType(AmdGpu::PrimitiveType type) {
     case AmdGpu::PrimitiveType::TriangleStrip:
         return vk::PrimitiveTopology::eTriangleStrip;
     case AmdGpu::PrimitiveType::QuadStrip:
-        LOG_WARNING(Render_Vulkan, "Unimplemented primitive type, using TriangleStrip.");
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                           "Unimplemented primitive type, using TriangleStrip.");
         return vk::PrimitiveTopology::eTriangleStrip;
     case AmdGpu::PrimitiveType::AdjLineList:
         return vk::PrimitiveTopology::eLineListWithAdjacency;
@@ -280,8 +283,8 @@ vk::LogicOp LogicOp(AmdGpu::ColorControl::LogicOp logic_op) {
     case LogicOp::Invert:
         return vk::LogicOp::eInvert;
     case LogicOp::BrushXor:
-        LOG_WARNING(Render_Vulkan, "Unimplemented logic op {:#x}, using closest equivalent",
-                    u32(logic_op));
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                           "Unimplemented logic op {:#x}, using closest equivalent", u32(logic_op));
         [[fallthrough]];
     case LogicOp::Xor:
         return vk::LogicOp::eXor;
@@ -320,14 +323,16 @@ vk::SamplerAddressMode ClampMode(AmdGpu::ClampMode mode) {
         return vk::SamplerAddressMode::eClampToEdge;
     case AmdGpu::ClampMode::MirrorOnceHalfBorder:
     case AmdGpu::ClampMode::MirrorOnceBorder:
-        LOG_WARNING(Render_Vulkan, "Unimplemented clamp mode {}, using closest equivalent.",
-                    static_cast<u32>(mode));
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                           "Unimplemented clamp mode {}, using closest equivalent.",
+                           static_cast<u32>(mode));
         [[fallthrough]];
     case AmdGpu::ClampMode::MirrorOnceLastTexel:
         return vk::SamplerAddressMode::eMirrorClampToEdge;
     case AmdGpu::ClampMode::ClampHalfBorder:
-        LOG_WARNING(Render_Vulkan, "Unimplemented clamp mode {}, using closest equivalent.",
-                    static_cast<u32>(mode));
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                           "Unimplemented clamp mode {}, using closest equivalent.",
+                           static_cast<u32>(mode));
         [[fallthrough]];
     case AmdGpu::ClampMode::ClampBorder:
         return vk::SamplerAddressMode::eClampToBorder;
@@ -1178,7 +1183,7 @@ vk::ClearValue ColorBufferClearValue(const AmdGpu::ColorBuffer& color_buffer) {
         color.float32[3] = NumberUtils::U4ToUnorm(c0 >> 12);
         break;
     default:
-        LOG_ERROR(Render_Vulkan, "Unsupported color buffer format: {}", format);
+        LOG_RENDER_PROBLEM(Render_Vulkan, Error, "Unsupported color buffer format: {}", format);
         break;
     }
 

@@ -274,6 +274,10 @@ struct LogSettings {
     Setting<unsigned long long> size_limit{100_MB};
     Setting<bool> skip_duplicate{true};
     Setting<bool> sync{true};
+    // "all": the console mirrors the log file. "events": the console only shows crash/broken
+    // shader/render problem events, Critical messages and a session summary on exit (the log file
+    // keeps everything and also gets the events)
+    Setting<std::string> console_mode{"all"};
 #ifdef _WIN32
     Setting<std::string> type{"wincolor"};
 #endif
@@ -290,6 +294,7 @@ struct LogSettings {
             make_override<LogSettings>("size_limit", &LogSettings::size_limit),
             make_override<LogSettings>("skip_duplicate", &LogSettings::skip_duplicate),
             make_override<LogSettings>("sync", &LogSettings::sync),
+            make_override<LogSettings>("console_mode", &LogSettings::console_mode),
 #ifdef _WIN32
             make_override<LogSettings>("type", &LogSettings::type),
 #endif
@@ -299,10 +304,11 @@ struct LogSettings {
 #ifdef _WIN32
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LogSettings, append, enable, filter, flush_level,
                                    max_skip_duration, separate, size_limit, skip_duplicate, sync,
-                                   type)
+                                   console_mode, type)
 #else
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LogSettings, append, enable, filter, flush_level,
-                                   max_skip_duration, separate, size_limit, skip_duplicate, sync)
+                                   max_skip_duration, separate, size_limit, skip_duplicate, sync,
+                                   console_mode)
 #endif
 
 // -------------------------------
@@ -799,6 +805,7 @@ public:
     SETTING_FORWARD(m_log, LogSizeLimit, size_limit)
     SETTING_FORWARD_BOOL(m_log, LogSkipDuplicate, skip_duplicate)
     SETTING_FORWARD_BOOL(m_log, LogSync, sync)
+    SETTING_FORWARD(m_log, LogConsoleMode, console_mode)
 #ifdef _WIN32
     SETTING_FORWARD(m_log, LogType, type)
 #endif

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/logging/events.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -135,8 +136,9 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         },
     };
     if (!IsViewTypeCompatible(info.type, image.info.type)) {
-        LOG_ERROR(Render_Vulkan, "image view type {} is incompatible with image type {}",
-                  magic_enum::enum_name(info.type), magic_enum::enum_name(image.info.type));
+        LOG_RENDER_PROBLEM(
+            Render_Vulkan, Error, "image view type {} is incompatible with image type {}",
+            magic_enum::enum_name(info.type), magic_enum::enum_name(image.info.type));
         info.type = image.info.type;
         image_view_ci.viewType = ConvertImageViewType(info.type);
     }
