@@ -98,6 +98,9 @@ enum class Id : u32 {
     ReadbackAheadNs,
     ReadbackAheadIdle,
     ReadbackAheadIdleNs,
+    // periodic_flush_commands: submits after N guest commands, and those that cut a render pass
+    FlushPeriodic,
+    FlushPeriodicInPass,
     // EOP/EOS/RELEASE_MEM writes, their submit-to-write lag and the longest graphics submit queue
     LabelWrites,
     LabelLagNs,

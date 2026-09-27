@@ -303,6 +303,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         cmd_buffers.push_back(session.primary);
     }
     sessions.clear();
+    commands_since_submit = 0;
 
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);

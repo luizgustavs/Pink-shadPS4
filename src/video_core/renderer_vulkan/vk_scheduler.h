@@ -408,6 +408,19 @@ public:
         this->on_submit = std::move(on_submit);
     }
 
+    /// Returns true inside a render pass
+    [[nodiscard]] bool IsRendering() const noexcept {
+        return is_rendering;
+    }
+
+    /// Idea B (periodic_flush_commands): counts a guest draw or dispatch recorded since the last submit
+    void CountRecordedCommand() noexcept {
+        ++commands_since_submit;
+    }
+    [[nodiscard]] u32 CommandsSinceSubmit() const noexcept {
+        return commands_since_submit;
+    }
+
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
         return render_state;
@@ -513,6 +526,7 @@ private:
 
     bool tracks_gpu_commands{};
     u64 submitted_seq{};
+    u32 commands_since_submit{};
 
     static constexpr u32 GpuTimingSlots = 256;
     struct GpuTimingPending {

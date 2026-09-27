@@ -89,6 +89,8 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::ReadbackAheadNs, "rb_ahead_ms", Unit::Ms},
     {Id::ReadbackAheadIdle, "rb_ahead_idle", Unit::Count},
     {Id::ReadbackAheadIdleNs, "rb_ahead_idle_ms", Unit::Ms},
+    {Id::FlushPeriodic, "flush_periodic", Unit::Count},
+    {Id::FlushPeriodicInPass, "flush_periodic_pass", Unit::Count},
     {Id::LabelWrites, "labels", Unit::Count},
     {Id::LabelLagNs, "label_lag_ms", Unit::Ms},
     {Id::LabelLagMaxNs, "label_lag_max_ms", Unit::Ms},

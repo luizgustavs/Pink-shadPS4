@@ -155,6 +155,8 @@ private:
     void BindIndexBuffer(u32 index_offset = 0);
 
     void ResetBindings(bool is_compute);
+    /// periodic_flush_commands: submits without waiting after N guest commands
+    void FlushPeriodic();
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
@@ -214,6 +216,7 @@ private:
     // lod_stats_from_bindings: bindings per T# counter_bank_id since the last IT_GET_LOD_STATS. Only the GPU
     // command processor thread binds textures and processes the packet
     const bool lod_stats_enabled;
+    const u32 periodic_flush_commands;
     std::array<u32, 256> lod_stats_uses{};
     u64 lod_stats_packets_minute{};
     u64 lod_stats_banks_minute{};

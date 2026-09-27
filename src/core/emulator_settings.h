@@ -468,6 +468,9 @@ struct GPUSettings {
     // Copy a readback in a command buffer submitted ahead of the one being recorded when none of its
     // bytes has a writer there, instead of submitting and draining the whole batch recorded so far
     Setting<bool> readback_ahead{false};
+    // Submit without waiting after this many guest draws/dispatches (0 = off), so the GPU runs the frame
+    // while it is recorded instead of at the readback drains
+    Setting<u32> periodic_flush_commands{0};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -514,6 +517,8 @@ struct GPUSettings {
             make_override<GPUSettings>("shader_code_clean_reads",
                                        &GPUSettings::shader_code_clean_reads),
             make_override<GPUSettings>("readback_ahead", &GPUSettings::readback_ahead),
+            make_override<GPUSettings>("periodic_flush_commands",
+                                       &GPUSettings::periodic_flush_commands),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -530,7 +535,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    lod_stats_from_bindings, dynamic_tsharp_array_size,
                                    wave64_uniform_branches, gpu_checkpoints,
                                    srt_walker_clean_reads, shader_code_clean_reads,
-                                   readback_ahead)
+                                   readback_ahead, periodic_flush_commands)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -829,6 +834,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, SrtWalkerCleanReads, srt_walker_clean_reads)
     SETTING_FORWARD_BOOL(m_gpu, ShaderCodeCleanReads, shader_code_clean_reads)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackAhead, readback_ahead)
+    SETTING_FORWARD(m_gpu, PeriodicFlushCommands, periodic_flush_commands)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

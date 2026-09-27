@@ -486,7 +486,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
-      lod_stats_enabled{EmulatorSettings.IsLodStatsFromBindings()} {
+      lod_stats_enabled{EmulatorSettings.IsLodStatsFromBindings()},
+      periodic_flush_commands{EmulatorSettings.GetPeriodicFlushCommands()} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -1214,6 +1215,30 @@ void Rasterizer::ResetBindings(bool is_compute) {
     needs_barrier = false;
     // The draw or dispatch is recorded: its written bindings belong to the current command buffer
     buffer_cache.CloseGpuWrites();
+    scheduler.CountRecordedCommand();
+    FlushPeriodic();
+}
+
+void Rasterizer::FlushPeriodic() {
+    // With readback_ahead most readbacks no longer submit, so the GPU would only receive the frame at the
+    // remaining drains and sit idle while the command processor records it. Submitting every N commands
+    // lets it run the frame during the recording. A submit inside a render pass cuts it, so it waits for
+    // the next command outside one, up to PassOverrun * N commands
+    constexpr u32 PassOverrun = 4;
+    const u32 every = periodic_flush_commands;
+    const u32 recorded = scheduler.CommandsSinceSubmit();
+    if (every == 0 || recorded < every) {
+        return;
+    }
+    const bool in_pass = scheduler.IsRendering();
+    if (in_pass && recorded < every * PassOverrun) {
+        return;
+    }
+    Common::PerfStats::Add(Common::PerfStats::Id::FlushPeriodic);
+    if (in_pass) {
+        Common::PerfStats::Add(Common::PerfStats::Id::FlushPeriodicInPass);
+    }
+    scheduler.Flush();
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
