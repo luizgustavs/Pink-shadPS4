@@ -513,7 +513,8 @@ struct GPUSettings {
     // skip re-adding every resident range to the sync batch when a DMA sync since the last flush covered it
     Setting<bool> cp_recording_cuts{false};
     // GPU overhead cuts (Idea G): detile textures uploaded from guest memory out of VRAM instead of reading
-    // the host staging buffer across PCIe with the detiler's scattered loads
+    // the host staging buffer across PCIe with the detiler's scattered loads, and drop pipeline binds of the
+    // pipeline the command buffer already has bound
     Setting<bool> gpu_overhead_cuts{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides

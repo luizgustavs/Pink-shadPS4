@@ -72,6 +72,8 @@ enum class Id : u32 {
     TextureDetileHostBytes,
     // SHADPS4_AB_TOGGLE: 1 in each report interval that ran with the toggled keys on
     AbToggleOn,
+    // Pipeline binds Scheduler::BindPipeline dropped because the command buffer already had the pipeline
+    PipelineBindsSkipped,
     BufferUploadBytes,
     // Buffer cache sync batch flushes (uploads of CPU-modified ranges before GPU use)
     SyncFlushes,

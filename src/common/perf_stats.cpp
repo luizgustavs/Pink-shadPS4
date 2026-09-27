@@ -70,6 +70,7 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::TextureDetilesHost, "tex_detiles_host", Unit::Count},
     {Id::TextureDetileHostBytes, "tex_detile_host_kb", Unit::Kb},
     {Id::AbToggleOn, "ab_on", Unit::Count},
+    {Id::PipelineBindsSkipped, "pipeline_binds_skipped", Unit::Count},
     {Id::BufferUploadBytes, "buf_upload_kb", Unit::Kb},
     {Id::SyncFlushes, "sync_flushes", Unit::Count},
     {Id::Protects, "protects", Unit::Count},

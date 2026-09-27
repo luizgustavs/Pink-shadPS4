@@ -11,6 +11,7 @@
 #include <queue>
 
 #include "common/interval_set.h"
+#include "common/perf_stats.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
@@ -436,6 +437,29 @@ public:
         return sessions.back().primary;
     }
 
+    /// Binds a pipeline to the current command buffer. With SkipRedundantPipelineBinds() on (Idea G), a bind of
+    /// the pipeline the command buffer already has at that bind point is dropped: ~70 % of the rasterizer's
+    /// ~7 k binds per frame in the SotC sanctuary. Every bind on this scheduler's command buffer must come
+    /// through here or be followed by InvalidatePipelineBinds()
+    void BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline) {
+        auto& bound = bound_pipelines[point == vk::PipelineBindPoint::eCompute ? 1 : 0];
+        if (skip_redundant_binds && bound == pipeline && Common::PerfStats::AbToggleActive()) {
+            Common::PerfStats::Add(Common::PerfStats::Id::PipelineBindsSkipped);
+            return;
+        }
+        bound = pipeline;
+        CommandBuffer().bindPipeline(point, pipeline);
+    }
+
+    /// Forgets the tracked binds after a pipeline bound directly on the current command buffer
+    void InvalidatePipelineBinds() noexcept {
+        bound_pipelines = {};
+    }
+
+    void SkipRedundantPipelineBinds(bool enable) noexcept {
+        skip_redundant_binds = enable;
+    }
+
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return work_semaphore.CurrentTick();
@@ -525,6 +549,9 @@ private:
     tracy::VkCtxScope* profiler_scope{};
 
     bool tracks_gpu_commands{};
+    // Pipelines bound to the current command buffer (graphics, compute), for BindPipeline
+    std::array<vk::Pipeline, 2> bound_pipelines{};
+    bool skip_redundant_binds{};
     u64 submitted_seq{};
     u32 commands_since_submit{};
 
