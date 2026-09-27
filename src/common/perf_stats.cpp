@@ -66,6 +66,10 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::TextureUploads, "tex_uploads", Unit::Count},
     {Id::TextureUploadNs, "tex_upload_ms", Unit::Ms},
     {Id::TextureUploadBytes, "tex_upload_kb", Unit::Kb},
+    {Id::TextureDetiles, "tex_detiles", Unit::Count},
+    {Id::TextureDetilesHost, "tex_detiles_host", Unit::Count},
+    {Id::TextureDetileHostBytes, "tex_detile_host_kb", Unit::Kb},
+    {Id::AbToggleOn, "ab_on", Unit::Count},
     {Id::BufferUploadBytes, "buf_upload_kb", Unit::Kb},
     {Id::SyncFlushes, "sync_flushes", Unit::Count},
     {Id::Protects, "protects", Unit::Count},
@@ -136,6 +140,31 @@ bool Enabled() {
 
 std::atomic<u64>& Detail::Slot(Id id) {
     return slots[static_cast<size_t>(id)];
+}
+
+namespace {
+// Seconds of reports before SHADPS4_AB_TOGGLE starts flipping, or a negative value without it
+double AbToggleStart() {
+    const char* env = std::getenv("SHADPS4_AB_TOGGLE");
+    if (!env || !std::getenv("SHADPS4_PERF_STATS")) {
+        return -1.0;
+    }
+    return std::max(std::strtod(env, nullptr), 0.0);
+}
+const double ab_toggle_start = AbToggleStart();
+} // Anonymous namespace
+
+std::atomic<bool> Detail::ab_toggle_on{ab_toggle_start < 0.0};
+
+void OnReportEmitted(double seconds_since_start) {
+    if (ab_toggle_start < 0.0 || seconds_since_start < ab_toggle_start) {
+        return;
+    }
+    const bool on = !Detail::ab_toggle_on.load(std::memory_order_relaxed);
+    Detail::ab_toggle_on.store(on, std::memory_order_relaxed);
+    if (on) {
+        Add(Id::AbToggleOn);
+    }
 }
 
 void MarkGpuThread() {

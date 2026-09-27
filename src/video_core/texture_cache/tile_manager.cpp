@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/perf_stats.h"
+#include "core/emulator_settings.h"
 #include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -38,7 +40,8 @@ struct TilingInfo {
 
 TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          Vulkan::Runtime& runtime_, StreamBuffer& stream_buffer_)
-    : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, stream_buffer{stream_buffer_} {
+    : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, stream_buffer{stream_buffer_},
+      gpu_overhead_cuts{EmulatorSettings.IsGpuOverheadCuts()} {
     const auto device = instance.GetDevice();
     const std::array<vk::DescriptorSetLayoutBinding, 3> bindings = {{
         {
@@ -222,6 +225,33 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal,
                                                           256, false, true);
 
+    // Guest memory the GPU never wrote comes in a host staging copy (BufferCache::ObtainBufferForImage)
+    const bool from_host = in_buffer->mem_type == MemoryType::HostUncached ||
+                           in_buffer->mem_type == MemoryType::HostCached;
+    if (Common::PerfStats::Enabled()) {
+        Common::PerfStats::Add(Common::PerfStats::Id::TextureDetiles);
+        if (from_host) {
+            Common::PerfStats::Add(Common::PerfStats::Id::TextureDetilesHost);
+            Common::PerfStats::Add(Common::PerfStats::Id::TextureDetileHostBytes, info.guest_size);
+        }
+    }
+    const bool via_vram = from_host && gpu_overhead_cuts && Common::PerfStats::AbToggleActive();
+    if (via_vram) {
+        // The detiler's loads are scattered, and from host memory each one crosses PCIe: ~680 us for 4 MB
+        // (~6 GB/s) in the SotC sanctuary. One linear copy into VRAM runs at PCIe bandwidth and the detile
+        // then reads VRAM. Requested after the unsynchronized output so the two cannot share bytes
+        const auto local = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal,
+                                                            256);
+        const vk::BufferCopy copy{
+            .srcOffset = in_offset,
+            .dstOffset = local.offset,
+            .size = info.guest_size,
+        };
+        runtime.CopyBuffer(in_buffer, local.buffer, {&copy, 1});
+        in_buffer = local.buffer;
+        in_offset = local.offset;
+    }
+
     scheduler.EndRendering();
     runtime.FlushBarriers();
 
@@ -279,6 +309,12 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     }
     cmdbuf.dispatch(dim_x, 1, 1);
 
+    if (via_vram) {
+        // A later unsynchronized staging request may reuse these bytes: order its write after this read
+        runtime.AccessBuffer(in_buffer, in_offset, info.guest_size,
+                             vk::PipelineStageFlagBits2::eComputeShader,
+                             vk::AccessFlagBits2::eShaderRead);
+    }
     runtime.AccessBuffer(staging.buffer, staging.offset, info.guest_size,
                          vk::PipelineStageFlagBits2::eComputeShader,
                          vk::AccessFlagBits2::eShaderWrite);

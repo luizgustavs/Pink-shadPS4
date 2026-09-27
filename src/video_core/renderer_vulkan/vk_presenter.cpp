@@ -1101,6 +1101,7 @@ void Presenter::ReportDiagnostics(bool is_reusing_frame, bool is_game_frame) {
         static u64 perf_game_frames = 0;
         static u64 perf_presentations = 0;
         static auto perf_last_report = std::chrono::steady_clock::now();
+        static const auto perf_first_report = perf_last_report;
         ++perf_presentations;
         perf_game_frames += new_game_frame;
         const auto now = std::chrono::steady_clock::now();
@@ -1117,6 +1118,8 @@ void Presenter::ReportDiagnostics(bool is_reusing_frame, bool is_game_frame) {
             perf_game_frames = 0;
             perf_presentations = 0;
             perf_last_report = now;
+            Common::PerfStats::OnReportEmitted(
+                std::chrono::duration<double>(now - perf_first_report).count());
         }
     }
     // SHADPS4_HARNESS_PROGRESS: progress independent of image changes (a static menu may still present new

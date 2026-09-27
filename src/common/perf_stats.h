@@ -65,6 +65,13 @@ enum class Id : u32 {
     TextureUploads,
     TextureUploadNs,
     TextureUploadBytes,
+    // Tiled texture uploads detiled on the GPU, and those whose source is a host staging copy of guest memory
+    // (not GPU-modified) with its bytes
+    TextureDetiles,
+    TextureDetilesHost,
+    TextureDetileHostBytes,
+    // SHADPS4_AB_TOGGLE: 1 in each report interval that ran with the toggled keys on
+    AbToggleOn,
     BufferUploadBytes,
     // Buffer cache sync batch flushes (uploads of CPU-modified ranges before GPU use)
     SyncFlushes,
@@ -126,7 +133,18 @@ bool Enabled();
 
 namespace Detail {
 std::atomic<u64>& Slot(Id id);
+extern std::atomic<bool> ab_toggle_on;
 }
+
+/// SHADPS4_AB_TOGGLE=<start_s> (with SHADPS4_PERF_STATS): keys that honour it (gpu_overhead_cuts) run only on
+/// every other perf report interval from <start_s> seconds of reports on, so one run compares both sides without
+/// the run-to-run variance; ab_on=1 marks the on intervals. Always true without the variables
+inline bool AbToggleActive() {
+    return Detail::ab_toggle_on.load(std::memory_order_relaxed);
+}
+
+/// Called after each perf report with the seconds since the first one; flips SHADPS4_AB_TOGGLE
+void OnReportEmitted(double seconds_since_start);
 
 inline void Add(Id id, u64 value = 1) {
     if (Enabled()) {
