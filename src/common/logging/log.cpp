@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -44,7 +45,8 @@ static std::array<std::unique_ptr<spdlog::logger>, NUM_LOG_CLASSES> ALL_LOGGERS{
 static std::unique_ptr<spdlog::logger> g_console_logger;
 // Event lines of the log file
 static std::unique_ptr<spdlog::logger> g_event_file_logger;
-static bool g_console_all = true;
+// Written by UpdateSinks while other threads log
+static std::atomic<bool> g_console_all{true};
 
 static thread_local std::string t_last_critical;
 static thread_local bool t_file_only_criticals = false;
@@ -79,7 +81,7 @@ void VLog(Class log_class, Level level, const char* file, int line, const char* 
     logger->log(ToSpdlog(level), "[{}] <{}> ({}) {}:{} {}: {}", NameOf(log_class),
                 NameOf(ToSpdlog(level)), thread_name, spdlog::source_loc::basename(file), line, fn,
                 text);
-    if (g_console_all || level < Level::Warning) {
+    if (g_console_all.load(std::memory_order_relaxed) || level < Level::Warning) {
         return;
     }
     Detail::CountMessage(log_class, level, file, line, text);
@@ -106,7 +108,7 @@ void VLog(Class log_class, Level level, const char* file, int line, const char* 
 }
 
 bool EventsEnabled() {
-    return !g_console_all;
+    return !g_console_all.load(std::memory_order_relaxed);
 }
 
 std::string LastCriticalMessage() {
@@ -271,19 +273,20 @@ static std::vector<spdlog::sink_ptr> MakeSinkChain(std::vector<spdlog::sink_ptr>
 
 void UpdateSinks() {
     // Anything but "events" keeps the old console that mirrors the log file
-    g_console_all = EmulatorSettings.GetLogConsoleMode() != "events";
+    const bool console_all = EmulatorSettings.GetLogConsoleMode() != "events";
+    g_console_all.store(console_all, std::memory_order_relaxed);
 
     // In "all" mode nothing writes events, so the event logger gets no sinks (no second async
     // worker for the file); in "events" mode it shares the class loggers' file chain
     const auto class_chain = MakeSinkChain(
-        g_console_all ? std::vector<spdlog::sink_ptr>{g_console_sink, g_shad_file_sink}
+        console_all ? std::vector<spdlog::sink_ptr>{g_console_sink, g_shad_file_sink}
                       : std::vector<spdlog::sink_ptr>{g_shad_file_sink});
     for (auto& logger : ALL_LOGGERS) {
         logger->sinks() = class_chain;
     }
     if (g_event_file_logger) {
         g_event_file_logger->sinks() =
-            g_console_all ? std::vector<spdlog::sink_ptr>{} : class_chain;
+            console_all ? std::vector<spdlog::sink_ptr>{} : class_chain;
     }
 }
 

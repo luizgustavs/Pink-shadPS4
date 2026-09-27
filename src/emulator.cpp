@@ -444,7 +444,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                                                                           : "shad_log.txt",
                         append_log);
 #ifdef _WIN32
-    // H1: cpu_affinity_mask pins the process (every thread it creates from here on inherits it), not a
+    // H1: cpu_affinity_mask pins the process (its current threads and every thread it creates), not a
     // thread: pinning the command processor to one core was 5-12 ms per frame slower in SotC
     if (const u64 mask = EmulatorSettings.GetCpuAffinityMask(); mask != 0) {
         if (SetProcessAffinityMask(GetCurrentProcess(), static_cast<DWORD_PTR>(mask))) {

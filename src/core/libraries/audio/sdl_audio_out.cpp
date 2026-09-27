@@ -223,11 +223,11 @@ private:
             return;
         }
         // Below 1.0 SDL consumes the queued data slower, which lowers the pitch.
-        if (SDL_SetAudioStreamFrequencyRatio(stream, speed)) {
-            applied_speed = speed;
-        } else {
+        if (!SDL_SetAudioStreamFrequencyRatio(stream, speed)) {
             LOG_ERROR(Lib_AudioOut, "Failed to set audio stream speed: {}", SDL_GetError());
         }
+        // Not retried on failure: this runs for every buffer
+        applied_speed = speed;
     }
 
     void HandleTiming(u64 current_time, float speed) {

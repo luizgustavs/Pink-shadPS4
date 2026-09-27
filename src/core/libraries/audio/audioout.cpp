@@ -33,6 +33,9 @@ static std::atomic<int> lazy_init{0};
 
 // Audio follows game speed: flips/s measured over a window, divided by the target frame rate.
 static constexpr u64 GAME_SPEED_WINDOW_US = 500'000;
+// A window stretched this long by a gap between flips (loading, a hitch) restarts instead of
+// counting as speed
+static constexpr u64 GAME_SPEED_MAX_GAP_US = 4 * GAME_SPEED_WINDOW_US;
 static std::atomic<float> game_speed{1.0f};
 static std::mutex game_speed_mutex;
 static u64 game_speed_window_start = 0;
@@ -166,6 +169,11 @@ void NotifyGuestFlip(s32 flip_rate) {
         game_speed_window_start = now;
         return;
     }
+    if (now - game_speed_window_start > GAME_SPEED_MAX_GAP_US) {
+        game_speed_window_start = now;
+        game_speed_window_flips = 0;
+        return;
+    }
     ++game_speed_window_flips;
     const u64 elapsed = now - game_speed_window_start;
     if (elapsed < GAME_SPEED_WINDOW_US) {
@@ -174,7 +182,8 @@ void NotifyGuestFlip(s32 flip_rate) {
 
     u32 target_fps = EmulatorSettings.GetAudioGameTargetFps();
     if (target_fps == 0) {
-        target_fps = 60 / (static_cast<u32>(std::max(flip_rate, 0)) + 1);
+        // Flip rates 0, 1, 2 = 60, 30, 20 fps; anything else is out of range
+        target_fps = 60 / (static_cast<u32>(std::clamp(flip_rate, 0, 2)) + 1);
     }
     if (target_fps != game_speed_logged_target) {
         LOG_WARNING(Lib_AudioOut, "Audio follows game speed: target {} fps (flip rate {})",
