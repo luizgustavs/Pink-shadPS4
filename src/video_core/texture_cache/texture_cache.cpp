@@ -815,6 +815,7 @@ void TextureCache::RefreshImage(Image& image) {
 
     scheduler.EndRendering();
     Common::PerfStats::Add(Common::PerfStats::Id::TextureUploadBytes, image.info.guest_size);
+    Common::PerfStats::RecordUploadRegion(image.info.guest_address, image.info.guest_size, true);
 
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);

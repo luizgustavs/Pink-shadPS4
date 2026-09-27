@@ -108,6 +108,12 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::LabelLagNs, "label_lag_ms", Unit::Ms},
     {Id::LabelLagMaxNs, "label_lag_max_ms", Unit::Ms},
     {Id::GfxQueueMax, "gfx_queue_max", Unit::Count},
+    {Id::BufferUploadStackBytes, "buf_upload_stack_kb", Unit::Kb},
+    {Id::BufferUploadWrittenBytes, "buf_upload_written_kb", Unit::Kb},
+    {Id::PipelineBinds, "pipeline_binds", Unit::Count},
+    {Id::PipelineBindsSame, "pipeline_binds_same", Unit::Count},
+    {Id::DmaSweeps, "dma_sweeps", Unit::Count},
+    {Id::DmaSweepStackBytes, "dma_sweep_stack_kb", Unit::Kb},
 }};
 
 constexpr bool FieldsMatchIds() {
@@ -126,7 +132,7 @@ thread_local bool is_gpu_thread = false;
 // Fault regions: only touched on handled faults, which already cost microseconds or more
 constexpr u32 RegionBits = 20;
 constexpr size_t TopRegions = 6;
-enum RegionKind : size_t { GpuThread, GuestRead, GuestWrite, NumRegionKinds };
+enum RegionKind : size_t { GpuThread, GuestRead, GuestWrite, Upload, TexUpload, NumRegionKinds };
 std::mutex region_mutex;
 std::array<std::unordered_map<u64, u64>, NumRegionKinds> region_counts;
 constexpr u32 PageBits = 12;
@@ -188,8 +194,17 @@ void RecordFaultRegion(u64 address, bool is_write) {
     }
 }
 
+void RecordUploadRegion(u64 address, u64 bytes, bool texture) {
+    if (!Enabled()) {
+        return;
+    }
+    std::scoped_lock lk{region_mutex};
+    region_counts[texture ? TexUpload : Upload][address >> RegionBits] += bytes >> 10;
+}
+
 std::string TakeFaultRegionReport() {
-    static constexpr std::array<const char*, NumRegionKinds> names{"gpu", "guest_r", "guest_w"};
+    static constexpr std::array<const char*, NumRegionKinds> names{"gpu", "guest_r", "guest_w",
+                                                                   "upload", "tex_upload"};
     std::array<std::unordered_map<u64, u64>, NumRegionKinds> counts;
     {
         std::scoped_lock lk{region_mutex};

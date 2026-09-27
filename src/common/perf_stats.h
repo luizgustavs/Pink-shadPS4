@@ -128,6 +128,17 @@ enum class Id : u32 {
     LabelLagNs,
     LabelLagMaxNs,
     GfxQueueMax,
+    // Frametime audit (2026-09-27): sync-batch upload bytes that lie in guest stacks (CPU-authoritative) and
+    // that belong to ranges bound as GPU-written
+    BufferUploadStackBytes,
+    BufferUploadWrittenBytes,
+    // Pipeline binds recorded by the rasterizer, and those binding the pipeline already bound last in the same
+    // command buffer
+    PipelineBinds,
+    PipelineBindsSame,
+    // DMA syncs that re-add every resident range to the sync batch, and the guest-stack bytes those ranges hold
+    DmaSweeps,
+    DmaSweepStackBytes,
     Count,
 };
 
@@ -227,6 +238,10 @@ std::string TakeReport();
 /// Counts a handled fault against its 1 MiB region, split by faulting thread and access. Guest write faults
 /// also count the distinct pages they hit (FaultWritePages)
 void RecordFaultRegion(u64 address, bool is_write);
+
+/// Adds a sync-batch upload (or a texture upload) to its 1 MiB region in KiB, reported as "upload=" (or
+/// "tex_upload=") in the fault region line
+void RecordUploadRegion(u64 address, u64 bytes, bool texture = false);
 
 /// Top regions since the previous call ("gpu=0x242300000:1234,... guest_r=... guest_w=..."), then resets them
 std::string TakeFaultRegionReport();

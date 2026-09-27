@@ -601,11 +601,20 @@ void BufferCache::SynchronizeDmaBuffers() {
         return;
     }
     dma_sync_covered = true;
+    const bool perf = Common::PerfStats::Enabled();
+    if (perf) {
+        Common::PerfStats::Add(Common::PerfStats::Id::DmaSweeps);
+    }
     for (const auto& range : resident_ranges) {
         const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
         const VAddr device_addr = range.start << block_shift;
         const u64 size = (range.end - range.start) << block_shift;
         sync_batch.Add(device_addr, device_addr + size, false);
+        if (perf) {
+            for (const auto& [lo, len] : memory->GetStackRangesIn(device_addr, size)) {
+                Common::PerfStats::Add(Common::PerfStats::Id::DmaSweepStackBytes, len);
+            }
+        }
     }
 }
 
@@ -823,6 +832,16 @@ void BufferCache::FlushSyncBatch(bool from_scheduler) {
             range.start, range.end - range.start, range.written, [&](u64 addr, u64 range_size) {
                 copies.emplace_back(total_size_bytes, addr, range_size);
                 total_size_bytes += range_size;
+                if (Common::PerfStats::Enabled()) {
+                    Common::PerfStats::RecordUploadRegion(addr, range_size);
+                    if (range.written) {
+                        Common::PerfStats::Add(Common::PerfStats::Id::BufferUploadWrittenBytes,
+                                               range_size);
+                    }
+                    for (const auto& [lo, len] : memory->GetStackRangesIn(addr, range_size)) {
+                        Common::PerfStats::Add(Common::PerfStats::Id::BufferUploadStackBytes, len);
+                    }
+                }
             });
     }
     sync_batch.Clear();

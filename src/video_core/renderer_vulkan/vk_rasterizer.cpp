@@ -41,6 +41,24 @@
 namespace Vulkan {
 
 namespace {
+// Frametime audit probe (perf stats only): how many pipeline binds repeat the last bind of the same command
+// buffer and bind point
+void CountPipelineBind(vk::CommandBuffer cmdbuf, vk::PipelineBindPoint point, vk::Pipeline pipeline) {
+    if (!Common::PerfStats::Enabled()) {
+        return;
+    }
+    thread_local std::array<std::pair<VkCommandBuffer, VkPipeline>, 2> last{};
+    auto& slot = last[point == vk::PipelineBindPoint::eCompute ? 1 : 0];
+    Common::PerfStats::Add(Common::PerfStats::Id::PipelineBinds);
+    if (slot.first == static_cast<VkCommandBuffer>(cmdbuf) &&
+        slot.second == static_cast<VkPipeline>(pipeline)) {
+        Common::PerfStats::Add(Common::PerfStats::Id::PipelineBindsSame);
+    }
+    slot = {static_cast<VkCommandBuffer>(cmdbuf), static_cast<VkPipeline>(pipeline)};
+}
+} // Anonymous namespace
+
+namespace {
 
 /// Diagnostic: SHADPS4_WRITE_WATCH=<addr> (hex) logs the first 64 distinct stage/range pairs that mark it
 /// GPU-modified, i.e. the writers of a corrupted address
@@ -707,6 +725,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     scheduler.BindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    CountPipelineBind(cmdbuf, vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
     if (GpuCheckpoints::Enabled()) {
         const auto* fs_info = TryGetStage(pipeline, Shader::SwStage::Fragment);
@@ -800,6 +819,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     const auto cmdbuf = scheduler.CommandBuffer();
     scheduler.BindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    CountPipelineBind(cmdbuf, vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
     if (GpuCheckpoints::Enabled()) {
         const auto* vs_info = TryGetStage(pipeline, Shader::SwStage::Vertex);
@@ -881,6 +901,7 @@ void Rasterizer::DispatchDirect() {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     scheduler.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    CountPipelineBind(cmdbuf, vk::PipelineBindPoint::eCompute, pipeline->Handle());
     if (GpuCheckpoints::Enabled()) {
         const auto* record =
             GpuCheckpoints::Push(GpuCheckpoints::Kind::Dispatch, cs.pgm_hash, 0, cs_program.dim_x,
@@ -941,6 +962,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     scheduler.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    CountPipelineBind(cmdbuf, vk::PipelineBindPoint::eCompute, pipeline->Handle());
     if (GpuCheckpoints::Enabled()) {
         const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
         const auto* record = GpuCheckpoints::Push(GpuCheckpoints::Kind::DispatchIndirect,
