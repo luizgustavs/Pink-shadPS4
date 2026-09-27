@@ -1753,6 +1753,7 @@ void MemoryManager::RegisterStackRange(VAddr virtual_addr, u64 size) {
         std::unique_lock lk{stack_ranges_mutex};
         stack_ranges += std::make_pair(boost::icl::interval<VAddr>::right_open(start, end), 1u);
         has_stack_ranges.store(true, std::memory_order_release);
+        stack_ranges_generation.fetch_add(1, std::memory_order_acq_rel);
     }
     Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::StackRegister, start,
                                       end - start, nullptr, virtual_addr);
@@ -1774,6 +1775,7 @@ void MemoryManager::UnregisterStackRange(VAddr virtual_addr, u64 size) {
     {
         std::unique_lock lk{stack_ranges_mutex};
         stack_ranges -= std::make_pair(boost::icl::interval<VAddr>::right_open(start, end), 1u);
+        stack_ranges_generation.fetch_add(1, std::memory_order_acq_rel);
     }
     Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::StackUnregister, start,
                                       end - start, nullptr, virtual_addr);

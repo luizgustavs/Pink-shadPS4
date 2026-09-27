@@ -269,6 +269,15 @@ private:
     /// lists, so this stays true until the batch is flushed or a range becomes resident
     bool dma_sync_covered{};
     const bool recording_cuts;
+    /// dma_sweep_skip_stacks: the sweep leaves stack ranges out, so it no longer covers a range that stops
+    /// being a stack; dma_sync_covered holds only while the stack ranges are those of the last sweep
+    const bool sweep_skip_stacks;
+    u64 dma_sync_stack_generation{};
+    /// dma_sweep_skip_stacks: the resident ranges minus the stacks, rebuilt when a range becomes resident or the
+    /// stack ranges change
+    std::vector<std::pair<VAddr, u64>> dma_sweep_pieces;
+    u64 dma_sweep_pieces_generation{};
+    bool dma_sweep_pieces_valid{};
     u32 num_flushes_per_frame{};
 
     u32 arena_memory_type_index{};

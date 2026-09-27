@@ -516,6 +516,9 @@ struct GPUSettings {
     // the host staging buffer across PCIe with the detiler's scattered loads, and drop pipeline binds of the
     // pipeline the command buffer already has bound
     Setting<bool> gpu_overhead_cuts{false};
+    // Leave guest stacks out of the DMA sync sweep: stack pages are never write-watched, so every sweep
+    // re-uploaded all resident stack bytes. Explicit bindings that cover a stack still upload it
+    Setting<bool> dma_sweep_skip_stacks{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -566,6 +569,8 @@ struct GPUSettings {
                                        &GPUSettings::periodic_flush_commands),
             make_override<GPUSettings>("cp_recording_cuts", &GPUSettings::cp_recording_cuts),
             make_override<GPUSettings>("gpu_overhead_cuts", &GPUSettings::gpu_overhead_cuts),
+            make_override<GPUSettings>("dma_sweep_skip_stacks",
+                                       &GPUSettings::dma_sweep_skip_stacks),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -583,7 +588,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    wave64_uniform_branches, gpu_checkpoints,
                                    srt_walker_clean_reads, shader_code_clean_reads,
                                    readback_ahead, periodic_flush_commands,
-                                   cp_recording_cuts, gpu_overhead_cuts)
+                                   cp_recording_cuts, gpu_overhead_cuts, dma_sweep_skip_stacks)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -892,6 +897,7 @@ public:
     SETTING_FORWARD(m_gpu, PeriodicFlushCommands, periodic_flush_commands)
     SETTING_FORWARD_BOOL(m_gpu, CpRecordingCuts, cp_recording_cuts)
     SETTING_FORWARD_BOOL(m_gpu, GpuOverheadCuts, gpu_overhead_cuts)
+    SETTING_FORWARD_BOOL(m_gpu, DmaSweepSkipStacks, dma_sweep_skip_stacks)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

@@ -66,7 +66,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       loop_cap_buffer{instance, 0, 256, MemoryType::HostCached, "Loop Cap Buffer"},
       readback_ahead{EmulatorSettings.IsReadbackAhead()},
       track_writers{readback_ahead || Common::PerfStats::Enabled()}, memory_semaphore{instance},
-      recording_cuts{EmulatorSettings.IsCpRecordingCuts()} {
+      recording_cuts{EmulatorSettings.IsCpRecordingCuts()},
+      sweep_skip_stacks{EmulatorSettings.IsDmaSweepSkipStacks()} {
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -595,22 +596,49 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 
 void BufferCache::SynchronizeDmaBuffers() {
     fault_process_pending = true;
+    // Stack pages are never write-watched (cpu_authoritative_stacks), so they stay CPU-modified and a sweep
+    // over them uploads every resident stack byte again. Like the FaultManager, which never turns stack pages
+    // into GPU buffers, the sweep leaves them out; bindings whose V# covers a stack still upload it
+    const bool skip_stacks = sweep_skip_stacks && Common::PerfStats::AbToggleActive();
+    const u64 stack_generation = skip_stacks ? memory->StackRangesGeneration() : 0;
     // Every compute dispatch that uses DMA lands here, and re-adding all resident ranges to a batch that
     // already covers them changes nothing: SyncRange::Dominant keeps written ranges written
-    if (recording_cuts && dma_sync_covered) {
+    if (recording_cuts && dma_sync_covered && stack_generation == dma_sync_stack_generation) {
         return;
     }
     dma_sync_covered = true;
+    dma_sync_stack_generation = stack_generation;
     const bool perf = Common::PerfStats::Enabled();
     if (perf) {
         Common::PerfStats::Add(Common::PerfStats::Id::DmaSweeps);
     }
-    for (const auto& range : resident_ranges) {
-        const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
-        const VAddr device_addr = range.start << block_shift;
-        const u64 size = (range.end - range.start) << block_shift;
-        sync_batch.Add(device_addr, device_addr + size, false);
-        if (perf) {
+    if (!skip_stacks) {
+        for (const auto& range : resident_ranges) {
+            const VAddr device_addr = range.start << block_shift;
+            sync_batch.Add(device_addr, range.end << block_shift, false);
+        }
+    } else {
+        if (!dma_sweep_pieces_valid || dma_sweep_pieces_generation != stack_generation) {
+            dma_sweep_pieces.clear();
+            for (const auto& range : resident_ranges) {
+                const VAddr device_addr = range.start << block_shift;
+                const u64 size = (range.end - range.start) << block_shift;
+                for (const auto& piece : memory->SubtractStackRanges(device_addr, size)) {
+                    dma_sweep_pieces.push_back(piece);
+                }
+            }
+            dma_sweep_pieces_generation = stack_generation;
+            dma_sweep_pieces_valid = true;
+        }
+        for (const auto& [lo, len] : dma_sweep_pieces) {
+            sync_batch.Add(lo, lo + len, false);
+        }
+    }
+    if (perf) {
+        // Resident stack bytes, left out or not
+        for (const auto& range : resident_ranges) {
+            const VAddr device_addr = range.start << block_shift;
+            const u64 size = (range.end - range.start) << block_shift;
             for (const auto& [lo, len] : memory->GetStackRangesIn(device_addr, size)) {
                 Common::PerfStats::Add(Common::PerfStats::Id::DmaSweepStackBytes, len);
             }
@@ -706,6 +734,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.offset = memory_offset;
         resident_ranges.Add(backing);
         dma_sync_covered = false;
+        dma_sweep_pieces_valid = false;
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
 

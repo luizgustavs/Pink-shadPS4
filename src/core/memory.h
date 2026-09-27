@@ -360,6 +360,10 @@ public:
     StackPieces SubtractStackRanges(VAddr virtual_addr, u64 size);
     /// Returns the parts of [virtual_addr, virtual_addr + size) that are stack memory
     StackPieces GetStackRangesIn(VAddr virtual_addr, u64 size);
+    /// Changes whenever a stack range is registered or unregistered
+    u64 StackRangesGeneration() const {
+        return stack_ranges_generation.load(std::memory_order_acquire);
+    }
 
 private:
     VMAHandle FindVMA(VAddr target) {
@@ -418,6 +422,7 @@ private:
     std::shared_mutex stack_ranges_mutex;
     // Lets every stack query return without locking while no stack is registered
     std::atomic<bool> has_stack_ranges{false};
+    std::atomic<u64> stack_ranges_generation{0};
 
     struct PrtArea {
         VAddr start;
