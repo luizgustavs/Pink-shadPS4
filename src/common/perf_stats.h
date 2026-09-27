@@ -149,9 +149,10 @@ std::atomic<u64>& Slot(Id id);
 extern std::atomic<bool> ab_toggle_on;
 }
 
-/// SHADPS4_AB_TOGGLE=<start_s> (with SHADPS4_PERF_STATS): keys that honour it (gpu_overhead_cuts) run only on
-/// every other perf report interval from <start_s> seconds of reports on, so one run compares both sides without
-/// the run-to-run variance; ab_on=1 marks the on intervals. Always true without the variables
+/// SHADPS4_AB_TOGGLE=<start_s> (with SHADPS4_PERF_STATS): keys that honour it (gpu_overhead_cuts,
+/// dma_sweep_skip_stacks) run only on every other perf report interval from <start_s> seconds of reports on, so
+/// one run compares both sides without the run-to-run variance; ab_on=1 marks the on intervals. Always true
+/// without the variables
 inline bool AbToggleActive() {
     return Detail::ab_toggle_on.load(std::memory_order_relaxed);
 }

@@ -917,6 +917,8 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
                 compute_pipelines.erase(compute_key);
             }
         }
+        // A rebuilt pipeline can get the handle of the one just destroyed (gpu_overhead_cuts)
+        scheduler.InvalidatePipelineBinds();
     }
     return new_module;
 }

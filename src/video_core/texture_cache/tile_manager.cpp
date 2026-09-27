@@ -235,13 +235,19 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
             Common::PerfStats::Add(Common::PerfStats::Id::TextureDetileHostBytes, info.guest_size);
         }
     }
-    const bool via_vram = from_host && gpu_overhead_cuts && Common::PerfStats::AbToggleActive();
+    bool via_vram = from_host && gpu_overhead_cuts && Common::PerfStats::AbToggleActive();
+    Vulkan::StagingBufferRef local{};
     if (via_vram) {
         // The detiler's loads are scattered, and from host memory each one crosses PCIe: ~680 us for 4 MB
         // (~6 GB/s) in the SotC sanctuary. One linear copy into VRAM runs at PCIe bandwidth and the detile
-        // then reads VRAM. Requested after the unsynchronized output so the two cannot share bytes
-        const auto local = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal,
-                                                            256);
+        // then reads VRAM. Requested after the unsynchronized output so the two cannot share bytes, except
+        // when the ring was full: the output then got offset 0 of a block without reserving it, and this
+        // request may reserve the same bytes. The detile then reads the host copy as before
+        local = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal, 256);
+        via_vram = local.buffer != staging.buffer || local.offset >= staging.offset + info.guest_size ||
+                   staging.offset >= local.offset + info.guest_size;
+    }
+    if (via_vram) {
         const vk::BufferCopy copy{
             .srcOffset = in_offset,
             .dstOffset = local.offset,
