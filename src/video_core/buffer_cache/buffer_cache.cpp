@@ -344,6 +344,7 @@ bool BufferCache::FillCleanPage(VAddr page_addr, u64 generation) {
         dirty_lo = std::min<u32>(dirty_lo, static_cast<u32>(start - page_addr));
         dirty_hi = std::max<u32>(dirty_hi, static_cast<u32>(end - page_addr));
     });
+    clean_pages_used = true;
     clean_pages[(page_addr >> CleanPageBits) % NumCleanPages] = {
         .page_addr = page_addr,
         .map_generation = generation,
@@ -355,6 +356,10 @@ bool BufferCache::FillCleanPage(VAddr page_addr, u64 generation) {
 }
 
 void BufferCache::InvalidateCleanPages(VAddr addr, u64 size) {
+    if (!clean_pages_used) {
+        // Without clean reads the page cache stays empty: written binds and readbacks pay one branch
+        return;
+    }
     const u64 first = addr >> CleanPageBits;
     const u64 last = (addr + size - 1) >> CleanPageBits;
     if (last - first >= NumCleanPages) {

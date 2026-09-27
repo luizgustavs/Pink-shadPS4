@@ -37,12 +37,12 @@ std::optional<SrtLoad> DecodeSrtLoad(void* context);
 /// Writes `value` to the load's destination register and skips the instruction
 void CompleteSrtLoad(void* context, const SrtLoad& load, u64 value);
 
-/// srt_walker_clean_reads without exceptions: every guest load of a generated walker first tests its page
-/// in `clean_pages`, one bit per 4 KiB page below SrtCleanPageLimit. A page gets its bit when the fault
-/// handler serves a clean read from it; later loads from it call `clean_load`, which serves bytes the GPU
-/// never wrote without raising an access violation. When it returns false the walker runs the plain load,
-/// so GPU-written bytes and unmapped descriptors reach the fault handlers as before. The generated code
-/// reads the fields at fixed offsets
+/// srt_walker_clean_reads without exceptions: with the key, every guest load of a generated walker first
+/// tests its page in `clean_pages`, one bit per 4 KiB page below SrtCleanPageLimit. A page gets its bit when
+/// the fault handler serves a clean read from it; later loads from it call `clean_load`, which serves bytes
+/// the GPU never wrote without raising an access violation. When it returns false the walker runs the plain
+/// load, so GPU-written bytes and unmapped descriptors reach the fault handlers as before. The generated
+/// code reads the fields at fixed offsets
 struct SrtWalkerContext {
     u64* clean_pages;                                                 // offset 0
     bool PS4_SYSV_ABI (*clean_load)(u64 address, u32 size, u64* out); // offset 8

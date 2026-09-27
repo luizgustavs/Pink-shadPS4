@@ -506,7 +506,7 @@ bool PipelineCache::CachedBytesMatch(const u32* code, const CachedBinaryInfo& ca
     // SotC keeps shader code on pages it shares with GPU-written buffers: reading it through the protected
     // page faults, reads the page back and drains the GPU. Bytes the GPU never wrote already hold their
     // value in the backing (shader_code_clean_reads)
-    const bool clean = EmulatorSettings.IsShaderCodeCleanReads() && read_clean_memory;
+    const bool clean = static_cast<bool>(read_clean_memory);
     const auto* base = reinterpret_cast<const u8*>(code);
     const u8* expected = cached.bytes.data();
     for (const auto& [offset, size] : cached.ranges) {
@@ -528,6 +528,10 @@ bool PipelineCache::CachedBytesMatch(const u32* code, const CachedBinaryInfo& ca
 
 template <typename Program>
 Shader::ShaderParams PipelineCache::GetParamsCached(const Program& pgm) {
+    // Per-game shader_code_clean_reads; without it the search runs on every draw and dispatch as before
+    if (!EmulatorSettings.IsShaderCodeCleanReads()) {
+        return AmdGpu::GetParams(pgm);
+    }
     const auto* code = pgm.template Address<u32*>();
     const auto make_params = [&](const AmdGpu::BinaryInfo& info) {
         return Shader::ShaderParams{
@@ -544,7 +548,9 @@ Shader::ShaderParams PipelineCache::GetParamsCached(const Program& pgm) {
     auto& cached = binary_info_cache[code];
     cached.ranges.clear();
     cached.bytes.clear();
-    std::memcpy(&cached.info, &info, sizeof(info));
+    // Only the bytes the search read: sizeof(info) includes tail padding past crc32
+    constexpr u32 info_extent = offsetof(AmdGpu::BinaryInfo, crc32) + sizeof(u32);
+    std::memcpy(&cached.info, &info, info_extent);
     const auto* base = reinterpret_cast<const u8*>(code);
     const auto add_range = [&](const u8* begin, u32 size) {
         cached.ranges.emplace_back(static_cast<u64>(begin - base), size);
@@ -553,7 +559,6 @@ Shader::ShaderParams PipelineCache::GetParamsCached(const Program& pgm) {
     // The bytes SearchBinaryInfo read: the header of code starting with s_mov_b32 vcc_hi points at the block,
     // otherwise the code is scanned up to the block
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
-    constexpr u32 info_extent = offsetof(AmdGpu::BinaryInfo, crc32) + sizeof(u32);
     const auto* found = reinterpret_cast<const u8*>(&info);
     const auto* header_target =
         code[0] == token_mov_vcchi ? reinterpret_cast<const u8*>(code + (code[1] + 1) * 2) : nullptr;

@@ -89,11 +89,24 @@ bool PS4_SYSV_ABI NoCleanLoad(u64, u32, u64*) {
     return false;
 }
 
+u64* AllocateCleanPages() {
+    // One bit per page of the guest address space (32 MiB), only with srt_walker_clean_reads (the per-game
+    // settings are loaded before the rasterizer first asks for the context); calloc leaves the untouched
+    // pages of such a large block without physical memory
+    if (!EmulatorSettings.IsSrtWalkerCleanReads()) {
+        return nullptr;
+    }
+    auto* const pages = static_cast<u64*>(std::calloc(SrtCleanPageLimit >> 18, sizeof(u64)));
+    if (!pages) {
+        LOG_ERROR(Render_Recompiler, "srt_walker_clean_reads: no memory for the clean-page bitmap, "
+                                     "walker loads fault as without the key");
+    }
+    return pages;
+}
+
 SrtWalkerContext& WalkerContext() {
-    // One bit per page of the guest address space (32 MiB); calloc leaves the untouched pages of such a large
-    // block without physical memory
     static SrtWalkerContext context{
-        .clean_pages = static_cast<u64*>(std::calloc(SrtCleanPageLimit >> 18, sizeof(u64))),
+        .clean_pages = AllocateCleanPages(),
         .clean_load = &NoCleanLoad,
     };
     return context;
@@ -110,6 +123,9 @@ void SetSrtCleanLoad(bool PS4_SYSV_ABI (*clean_load)(u64, u32, u64*)) {
 
 void MarkSrtCleanPages(u64 address, u32 size) {
     auto& context = WalkerContext();
+    if (!context.clean_pages) {
+        return;
+    }
     for (u64 page = address >> 12; page <= (address + size - 1) >> 12; ++page) {
         if ((page << 12) < SrtCleanPageLimit) {
             context.clean_pages[page >> 6] |= 1ULL << (page & 63);
@@ -320,6 +336,9 @@ struct PassInfo {
     // Bumped during codegen to assign offsets to readconsts
     u16 dst_off_dw;
 
+    // Per-game srt_walker_clean_reads: guest loads test the clean-page bitmap. Without the key the walker is
+    // the plain loads of before (the key is part of the codegen settings key of the pipeline cache)
+    bool clean_loads = false;
     // Clean-load stub shared by the guest loads of the walker being generated (EmitGuestLoad)
     Xbyak::Label clean_load_stub;
     bool uses_clean_load_stub = false;
@@ -728,6 +747,14 @@ enum class GuestLoadDst { Rdi, R10d };
 /// not use
 static void EmitGuestLoad(Xbyak::CodeGenerator& c, PassInfo& pass_info, GuestLoadDst dst,
                           const Xbyak::Address& src) {
+    if (!pass_info.clean_loads) {
+        if (dst == GuestLoadDst::Rdi) {
+            c.mov(rdi, src);
+        } else {
+            c.mov(r10d, src);
+        }
+        return;
+    }
     Xbyak::Label plain, done;
     const u32 size = dst == GuestLoadDst::Rdi ? 8 : 4;
     c.lea(r11, src);
@@ -880,6 +907,8 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     c.reset();
 
     pass_info.dst_off_dw = NUM_USER_DATA_REGS;
+    // Without the bitmap (key off, or its allocation failed) the walker loads fault as before
+    pass_info.clean_loads = GetSrtWalkerContext()->clean_pages != nullptr;
     ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
 
     bool emitted = true;

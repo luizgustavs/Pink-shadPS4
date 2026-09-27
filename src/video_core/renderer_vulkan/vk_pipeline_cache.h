@@ -116,7 +116,7 @@ private:
         AmdGpu::BinaryInfo info;
     };
 
-    /// AmdGpu::GetParams without scanning the shader code on every draw and dispatch
+    /// shader_code_clean_reads: AmdGpu::GetParams without scanning the shader code on every draw and dispatch
     template <typename Program>
     Shader::ShaderParams GetParamsCached(const Program& pgm);
     bool CachedBytesMatch(const u32* code, const CachedBinaryInfo& cached);

@@ -196,6 +196,7 @@ private:
     static constexpr u64 CleanPageSize = 1ULL << CleanPageBits;
     static constexpr size_t NumCleanPages = 1024;
     std::array<CleanPage, NumCleanPages> clean_pages{};
+    bool clean_pages_used = false; // Set by the first FillCleanPage
     std::atomic<u64> clean_map_generation{};
     u32 loop_cap_hits_reported{};
     u32 loop_cap_hits_minute{};
