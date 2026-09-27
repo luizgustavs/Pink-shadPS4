@@ -54,6 +54,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/ir_emitter.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/microinstruction.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/opcodes.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/lower_buffer_format_to_raw.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/shared_memory_barrier_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/patch.cpp
@@ -85,6 +86,7 @@ set(GCN_TEST_SOURCES
     stubs/signals_stub.cpp
 
     # Tests
+    gcn/test_buffer_format_lowering.cpp
     gcn/test_dma_fault_bitmap.cpp
     gcn/test_graphics_workarounds.cpp
 )

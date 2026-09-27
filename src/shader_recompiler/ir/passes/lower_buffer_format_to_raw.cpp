@@ -26,6 +26,40 @@ static bool IsBufferFormatStore(const IR::Inst& inst) {
     return inst.GetOpcode() == IR::Opcode::StoreBufferFormatF32;
 }
 
+/// Whether LoadBufferFormat/StoreBufferFormat, and the pack/unpack emitters they call, can lower this format.
+/// A garbage V# (SotC cs 0x41d379bc: data format 15, "FormatUnknown") can carry pairs that reach their
+/// UNREACHABLE/ASSERT: a data format with no case, an 8-bit or 2_10_10_10 format with a float number format, or
+/// a 32-bit format with snorm
+static bool IsLowerableFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format) {
+    using AmdGpu::DataFormat;
+    using AmdGpu::NumberFormat;
+    const bool is_norm_or_int = num_format == NumberFormat::Unorm ||
+                                num_format == NumberFormat::Snorm ||
+                                num_format == NumberFormat::Uint || num_format == NumberFormat::Sint;
+    switch (data_format) {
+    case DataFormat::FormatInvalid:
+    case DataFormat::Format10_11_11: // Other number formats fall back to unsigned float
+        return true;
+    case DataFormat::Format8:
+    case DataFormat::Format8_8:
+    case DataFormat::Format8_8_8_8:
+    case DataFormat::Format2_10_10_10:
+        return is_norm_or_int;
+    case DataFormat::Format16:
+    case DataFormat::Format16_16:
+    case DataFormat::Format16_16_16_16:
+        return is_norm_or_int || num_format == NumberFormat::Float;
+    case DataFormat::Format32:
+    case DataFormat::Format32_32:
+    case DataFormat::Format32_32_32:
+    case DataFormat::Format32_32_32_32:
+        return num_format == NumberFormat::Uint || num_format == NumberFormat::Sint ||
+               num_format == NumberFormat::Float;
+    default:
+        return false;
+    }
+}
+
 static IR::Value LoadBufferFormat(IR::IREmitter& ir, const IR::Value handle, const IR::U32 address,
                                   const IR::BufferInstInfo info, const FormatInfo& format_info) {
     IR::Value interpreted;
@@ -212,8 +246,17 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
         .num_components = AmdGpu::NumComponents(data_format),
     };
 
-    if (data_format == AmdGpu::DataFormat::FormatInvalid) {
+    bool lower_as_null = data_format == AmdGpu::DataFormat::FormatInvalid;
+    if (lower_as_null) {
         LOG_WARNING(Render_Recompiler, "Skipping lowering for null buffer sharp");
+    } else if (!IsLowerableFormat(data_format, format_info.num_format)) {
+        // Garbage V#: lower it like a null buffer (loads read zero, stores are dropped) instead of aborting
+        AmdGpu::WarnInvalidDescriptorOnce("LowerBufferFormat(data_format << 8 | num_format)",
+                                          (u32(data_format) << 8) | u32(format_info.num_format),
+                                          "FormatInvalid (null buffer)");
+        lower_as_null = true;
+    }
+    if (lower_as_null) {
         if (IsBufferFormatLoad(inst)) {
             inst.ReplaceUsesWithAndRemove(
                 ir.CompositeConstruct(ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)));
