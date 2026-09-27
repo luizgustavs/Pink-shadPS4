@@ -210,6 +210,11 @@ public:
         return impl.SystemReservedVirtualBase();
     }
 
+    /// Start of the guest address space: no guest memory lies below it
+    VAddr SystemManagedVirtualBase() noexcept {
+        return impl.SystemManagedVirtualBase();
+    }
+
     bool IsValidGpuMapping(VAddr virtual_addr, u64 size) {
         // The PS4's GPU can only handle 40 bit addresses.
         const VAddr max_gpu_address{0x10000000000};

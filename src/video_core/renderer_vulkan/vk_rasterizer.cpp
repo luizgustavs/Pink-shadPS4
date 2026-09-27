@@ -1522,7 +1522,23 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             return false;
         }
 
-        return IsPlausibleImage(VideoCore::TextureCache::ImageDesc{tsharp, image_desc}.info);
+        const VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+        if (!IsPlausibleImage(desc.info)) {
+            return false;
+        }
+
+        // A garbage T# with a low address (seen in SotC: 0x0, 0x29000, 0x5c000) passes the 40-bit check above;
+        // the texture cache then tracks pages below the guest address space and Protect asserts ("out of
+        // bounds"). No guest memory lies below the first region of the address space
+        if (desc.info.guest_address < memory->SystemManagedVirtualBase()) {
+            LOG_WARNING(Render_Vulkan,
+                        "Rejecting T# below the guest address space address={:#x}, size={:#x}, "
+                        "width={}, data_format={}",
+                        desc.info.guest_address, desc.info.guest_size, tsharp.width,
+                        static_cast<u32>(data_fmt));
+            return false;
+        }
+        return true;
     };
     const auto count_lod_stats = [&](const AmdGpu::Image& tsharp, bool is_written) {
         if (tsharp.lod_hw_cnt_en && lod_stats_enabled) {
