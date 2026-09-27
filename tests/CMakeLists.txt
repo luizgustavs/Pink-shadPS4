@@ -22,8 +22,8 @@ set(BUFFER_CACHE_TEST_SOURCES
     test_fault_address.cpp
 )
 
-# SPIR-V and IR passes of the shader recompiler, checked without a GPU. With SHADPS4_TEST_SPIRV_DIR set, the
-# graphics workaround tests write their modules there for spirv-val
+# SPIR-V and IR passes of the shader recompiler, checked without a GPU, plus the recursive locks. With
+# SHADPS4_TEST_SPIRV_DIR set, the graphics workaround tests write their modules there for spirv-val
 set(GCN_TEST_SOURCES
     # Under test
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv.cpp
@@ -65,6 +65,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/type.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/value.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/pixel_format.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/recursive_lock.cpp
 
     # Minimal common and core support
     ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
@@ -90,6 +91,7 @@ set(GCN_TEST_SOURCES
     stubs/signals_stub.cpp
 
     # Tests
+    common/test_recursive_lock.cpp
     gcn/test_buffer_format_lowering.cpp
     gcn/test_dma_fault_bitmap.cpp
     gcn/test_graphics_workarounds.cpp
