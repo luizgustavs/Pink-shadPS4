@@ -119,6 +119,7 @@ public:
 #endif
 
 private:
+    bool IsMappedCached(VAddr addr, VAddr end);
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
@@ -217,6 +218,8 @@ private:
     // command processor thread binds textures and processes the packet
     const bool lod_stats_enabled;
     const u32 periodic_flush_commands;
+    // cp_recording_cuts: IsMapped answers from a per-thread cache of mapped runs
+    const bool recording_cuts;
     std::array<u32, 256> lod_stats_uses{};
     u64 lod_stats_packets_minute{};
     u64 lod_stats_banks_minute{};

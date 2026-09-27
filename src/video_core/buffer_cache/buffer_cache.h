@@ -265,6 +265,10 @@ private:
         }
     };
     DomIntervalList<SyncRange> sync_batch{};
+    /// cp_recording_cuts: sync_batch already holds every resident range. Ranges are only ever added to both
+    /// lists, so this stays true until the batch is flushed or a range becomes resident
+    bool dma_sync_covered{};
+    const bool recording_cuts;
     u32 num_flushes_per_frame{};
 
     u32 arena_memory_type_index{};

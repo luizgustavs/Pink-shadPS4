@@ -509,6 +509,9 @@ struct GPUSettings {
     // while it is recorded instead of at the readback drains. Use it only with readback_ahead: the fork lost
     // the device once (WriteInvalid) with 128 and readback_ahead off; with readback_ahead and 64 it held
     Setting<u32> periodic_flush_commands{0};
+    // Command processor recording cuts (Idea E): lock-free cache of GPU-mapped runs for IsMapped, and
+    // skip re-adding every resident range to the sync batch when a DMA sync since the last flush covered it
+    Setting<bool> cp_recording_cuts{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -557,6 +560,7 @@ struct GPUSettings {
             make_override<GPUSettings>("readback_ahead", &GPUSettings::readback_ahead),
             make_override<GPUSettings>("periodic_flush_commands",
                                        &GPUSettings::periodic_flush_commands),
+            make_override<GPUSettings>("cp_recording_cuts", &GPUSettings::cp_recording_cuts),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -573,7 +577,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    lod_stats_from_bindings, dynamic_tsharp_array_size,
                                    wave64_uniform_branches, gpu_checkpoints,
                                    srt_walker_clean_reads, shader_code_clean_reads,
-                                   readback_ahead, periodic_flush_commands)
+                                   readback_ahead, periodic_flush_commands,
+                                   cp_recording_cuts)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -880,6 +885,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ShaderCodeCleanReads, shader_code_clean_reads)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackAhead, readback_ahead)
     SETTING_FORWARD(m_gpu, PeriodicFlushCommands, periodic_flush_commands)
+    SETTING_FORWARD_BOOL(m_gpu, CpRecordingCuts, cp_recording_cuts)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

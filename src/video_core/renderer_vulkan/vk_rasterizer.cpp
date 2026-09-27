@@ -487,7 +487,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
       lod_stats_enabled{EmulatorSettings.IsLodStatsFromBindings()},
-      periodic_flush_commands{EmulatorSettings.GetPeriodicFlushCommands()} {
+      periodic_flush_commands{EmulatorSettings.GetPeriodicFlushCommands()},
+      recording_cuts{EmulatorSettings.IsCpRecordingCuts()} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -2260,10 +2261,51 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
         // Memory range wrapped the address space, cannot be mapped.
         return false;
     }
+    if (recording_cuts) {
+        return IsMappedCached(addr, addr + size);
+    }
     const auto range = decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
 
     Common::RecursiveSharedLock lock{mapped_ranges_mutex};
     return boost::icl::contains(mapped_ranges, range);
+}
+
+bool Rasterizer::IsMappedCached(VAddr addr, VAddr end) {
+    // BindBuffers asks this for every V# of every draw, tens of thousands of times per frame, and the
+    // shared lock plus the interval tree walk cost several ms. The runs asked about change rarely: keep the
+    // last few mapped runs per thread, stamped with the mapping generation read before they were looked up.
+    // MapMemory/UnmapMemory bump the generation after changing mapped_ranges, so a stamped run is exact
+    // until the next change. Only positive answers are cached
+    struct MappedRun {
+        u64 generation = ~u64{0};
+        VAddr start = 0;
+        VAddr last = 0;
+    };
+    static constexpr size_t NumRuns = 4;
+    thread_local std::array<MappedRun, NumRuns> runs{};
+    thread_local size_t next_run{};
+
+    const u64 generation = buffer_cache.MappingGeneration();
+    for (const auto& run : runs) {
+        if (run.generation == generation && addr >= run.start && end - 1 <= run.last) {
+            return true;
+        }
+    }
+
+    Common::RecursiveSharedLock lock{mapped_ranges_mutex};
+    // interval_set joins touching intervals, so the interval holding addr is the whole mapped run
+    const auto it = mapped_ranges.find(addr);
+    if (it == mapped_ranges.end()) {
+        return false;
+    }
+    const VAddr run_start = boost::icl::first(*it);
+    const VAddr run_last = boost::icl::last(*it);
+    if (end - 1 > run_last) {
+        return false;
+    }
+    runs[next_run] = {generation, run_start, run_last};
+    next_run = (next_run + 1) % NumRuns;
+    return true;
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {

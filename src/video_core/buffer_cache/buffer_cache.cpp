@@ -65,7 +65,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       loop_cap_buffer{instance, 0, 256, MemoryType::HostCached, "Loop Cap Buffer"},
       readback_ahead{EmulatorSettings.IsReadbackAhead()},
-      track_writers{readback_ahead || Common::PerfStats::Enabled()}, memory_semaphore{instance} {
+      track_writers{readback_ahead || Common::PerfStats::Enabled()}, memory_semaphore{instance},
+      recording_cuts{EmulatorSettings.IsCpRecordingCuts()} {
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -594,6 +595,12 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 
 void BufferCache::SynchronizeDmaBuffers() {
     fault_process_pending = true;
+    // Every compute dispatch that uses DMA lands here, and re-adding all resident ranges to a batch that
+    // already covers them changes nothing: SyncRange::Dominant keeps written ranges written
+    if (recording_cuts && dma_sync_covered) {
+        return;
+    }
+    dma_sync_covered = true;
     for (const auto& range : resident_ranges) {
         const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
         const VAddr device_addr = range.start << block_shift;
@@ -689,6 +696,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.memory = device_memory;
         backing.offset = memory_offset;
         resident_ranges.Add(backing);
+        dma_sync_covered = false;
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
 
@@ -818,6 +826,7 @@ void BufferCache::FlushSyncBatch(bool from_scheduler) {
             });
     }
     sync_batch.Clear();
+    dma_sync_covered = false;
     if (copies.empty()) {
         return;
     }
