@@ -122,6 +122,15 @@ PRUNTIME_FUNCTION FindFunction(const Module& module, u64 pc) {
     return rva < it->EndAddress ? const_cast<PRUNTIME_FUNCTION>(it) : nullptr;
 }
 
+// The sampled stack region. A page without read access (a guest stack page the buffer cache tracks, a guard
+// page) gives an empty range: reading it would run the emulator's fault handler, which can ask the command
+// processor for a readback while the sampled thread is suspended
+void SetSampledStack(Target& target, const MEMORY_BASIC_INFORMATION& region) {
+    target.stack_low = reinterpret_cast<u64>(region.BaseAddress);
+    const bool readable = (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+    target.stack_high = readable ? target.stack_low + region.RegionSize : target.stack_low;
+}
+
 // Walks the suspended thread's stack from its context. Kept free of C++ objects that need unwinding so it can
 // sit inside __try: a torn stack must end the walk, not the emulator
 u32 Unwind(const std::vector<Module>& modules, const Target& target, CONTEXT* ctx, u64* frames) {
@@ -223,8 +232,7 @@ void Sample(Target target, double start_s, double duration_s, u32 hz, const char
                 MEMORY_BASIC_INFORMATION region{};
                 if (VirtualQuery(reinterpret_cast<void*>(ctx.Rsp), &region, sizeof(region)) &&
                     region.State == MEM_COMMIT) {
-                    sample_target.stack_low = reinterpret_cast<u64>(region.BaseAddress);
-                    sample_target.stack_high = sample_target.stack_low + region.RegionSize;
+                    SetSampledStack(sample_target, region);
                 }
             }
             count = Unwind(modules, sample_target, &ctx, frames.data());
@@ -337,8 +345,7 @@ void SampleGuests(GuestSampler* sampler) {
                     MEMORY_BASIC_INFORMATION region{};
                     if (VirtualQuery(reinterpret_cast<void*>(ctx.Rsp), &region, sizeof(region)) &&
                         region.State == MEM_COMMIT) {
-                        sample_target.stack_low = reinterpret_cast<u64>(region.BaseAddress);
-                        sample_target.stack_high = sample_target.stack_low + region.RegionSize;
+                        SetSampledStack(sample_target, region);
                     }
                 }
                 count = Unwind(modules, sample_target, &ctx, frames.data());

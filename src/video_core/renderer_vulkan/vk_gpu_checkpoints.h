@@ -141,6 +141,8 @@ struct SubmitRecord {
 constexpr size_t SubmitRingSize = 1 << 12;
 inline std::array<SubmitRecord, SubmitRingSize> g_submits{};
 inline std::atomic<u64> g_submit_id{0};
+/// readback_ahead: last ahead copy the host saw complete, for a report that cannot read the fence
+inline std::atomic<u64> g_ahead_completed{0};
 
 inline u64 NowUs() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -340,6 +342,9 @@ inline void DumpSubmits(const char* where, QueryCounter&& query_counter, QueryFe
     size_t num_semaphores = 0;
     for (u64 id = first_id; id <= last_id; ++id) {
         const auto& record = g_submits[id % SubmitRingSize];
+        if (record.id != id) {
+            continue;
+        }
         const std::pair<u64, bool> key{record.semaphore, record.fence};
         bool seen = false;
         for (size_t i = 0; i < num_semaphores; ++i) {
@@ -365,10 +370,12 @@ inline void DumpSubmits(const char* where, QueryCounter&& query_counter, QueryFe
         }
         bool queried = false;
         if (fence) {
-            // Only the newest fence submit can be pending: each one is waited for before the next
-            if (const std::optional<bool> signalled = query_fence(sem)) {
+            // Only the newest fence submit can be pending: each one is waited for before the next. The fence is
+            // reset before the next submit, so an unsignalled one may also mean the newest copy completed
+            counter = std::max(counter, g_ahead_completed.load(std::memory_order_relaxed));
+            if (const std::optional<bool> signalled = query_fence(sem); signalled && newest_tick > 0) {
                 queried = true;
-                counter = *signalled ? newest_tick : newest_tick - 1;
+                counter = std::max(counter, *signalled ? newest_tick : newest_tick - 1);
             }
         } else {
             queried = query_counter(sem, counter);

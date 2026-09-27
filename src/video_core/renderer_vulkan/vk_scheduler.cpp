@@ -201,6 +201,9 @@ void Scheduler::WaitAhead(bool writers_done) {
     }
     ASSERT_MSG(wait_result == vk::Result::eSuccess, "Ahead wait failed: {}",
                vk::to_string(wait_result));
+    if (tracks_gpu_commands) {
+        GpuCheckpoints::g_ahead_completed.store(ahead_submits, std::memory_order_relaxed);
+    }
     if (perf) {
         const u64 ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                            std::chrono::steady_clock::now() - start)

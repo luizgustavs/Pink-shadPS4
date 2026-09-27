@@ -1239,7 +1239,7 @@ void Rasterizer::FlushPeriodic() {
         return;
     }
     const bool in_pass = scheduler.IsRendering();
-    if (in_pass && recorded < every * PassOverrun) {
+    if (in_pass && recorded < u64{every} * PassOverrun) {
         return;
     }
     Common::PerfStats::Add(Common::PerfStats::Id::FlushPeriodic);
