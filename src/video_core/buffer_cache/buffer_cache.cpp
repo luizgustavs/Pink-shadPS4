@@ -67,7 +67,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       readback_ahead{EmulatorSettings.IsReadbackAhead()},
       track_writers{readback_ahead || Common::PerfStats::Enabled()}, memory_semaphore{instance},
       recording_cuts{EmulatorSettings.IsCpRecordingCuts()},
-      sweep_skip_stacks{EmulatorSettings.IsDmaSweepSkipStacks()} {
+      sweep_skip_stacks{EmulatorSettings.IsDmaSweepSkipStacks()},
+      sweep_skip_toggle{Common::PerfStats::AbToggleFollows("dma_sweep_skip_stacks")} {
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -603,7 +604,7 @@ void BufferCache::SynchronizeDmaBuffers() {
     // Stack pages are never write-watched (cpu_authoritative_stacks), so they stay CPU-modified and a sweep
     // over them uploads every resident stack byte again. Like the FaultManager, which never turns stack pages
     // into GPU buffers, the sweep leaves them out; bindings whose V# covers a stack still upload it
-    const bool skip_stacks = sweep_skip_stacks && Common::PerfStats::AbToggleActive();
+    const bool skip_stacks = sweep_skip_stacks && Common::PerfStats::AbToggleOn(sweep_skip_toggle);
     const u64 stack_generation = skip_stacks ? memory->StackRangesGeneration() : 0;
     // Every compute dispatch that uses DMA lands here, and re-adding all resident ranges to a batch that
     // already covers them changes nothing: SyncRange::Dominant keeps written ranges written

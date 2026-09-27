@@ -9,6 +9,7 @@
 #include "common/debug.h"
 #include "common/perf_stats.h"
 #include "common/thread.h"
+#include "core/emulator_settings.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -19,7 +20,8 @@ namespace Vulkan {
 std::mutex Scheduler::submit_mutex;
 
 Scheduler::Scheduler(const Instance& instance)
-    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
+    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore},
+      wait_spin_us{EmulatorSettings.GetWaitSpinUs()} {
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
@@ -194,8 +196,13 @@ void Scheduler::WaitAhead(bool writers_done) {
     using namespace Common::PerfStats;
     const bool perf = Enabled();
     const auto start = perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const vk::Device device = instance.GetDevice();
+    const bool spun = SpinUntil(wait_spin_us, [&] {
+        return device.getFenceStatus(*ahead_fence) != vk::Result::eNotReady;
+    });
     const auto wait_result =
-        instance.GetDevice().waitForFences(*ahead_fence, true, std::numeric_limits<u64>::max());
+        spun ? device.getFenceStatus(*ahead_fence)
+             : device.waitForFences(*ahead_fence, true, std::numeric_limits<u64>::max());
     if (wait_result == vk::Result::eErrorDeviceLost) {
         instance.ReportDeviceFault("WaitAhead");
     }

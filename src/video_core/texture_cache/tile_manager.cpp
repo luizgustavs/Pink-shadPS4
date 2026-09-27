@@ -41,7 +41,8 @@ struct TilingInfo {
 TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          Vulkan::Runtime& runtime_, StreamBuffer& stream_buffer_)
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, stream_buffer{stream_buffer_},
-      gpu_overhead_cuts{EmulatorSettings.IsGpuOverheadCuts()} {
+      gpu_overhead_cuts{EmulatorSettings.IsGpuOverheadCuts()},
+      gpu_overhead_cuts_toggle{Common::PerfStats::AbToggleFollows("gpu_overhead_cuts")} {
     const auto device = instance.GetDevice();
     const std::array<vk::DescriptorSetLayoutBinding, 3> bindings = {{
         {
@@ -235,7 +236,8 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
             Common::PerfStats::Add(Common::PerfStats::Id::TextureDetileHostBytes, info.guest_size);
         }
     }
-    bool via_vram = from_host && gpu_overhead_cuts && Common::PerfStats::AbToggleActive();
+    bool via_vram = from_host && gpu_overhead_cuts &&
+                    Common::PerfStats::AbToggleOn(gpu_overhead_cuts_toggle);
     Vulkan::StagingBufferRef local{};
     if (via_vram) {
         // The detiler's loads are scattered, and from host memory each one crosses PCIe: ~680 us for 4 MB

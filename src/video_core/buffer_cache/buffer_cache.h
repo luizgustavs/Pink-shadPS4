@@ -272,6 +272,7 @@ private:
     /// dma_sweep_skip_stacks: the sweep leaves stack ranges out, so it no longer covers a range that stops
     /// being a stack; dma_sync_covered holds only while the stack ranges are those of the last sweep
     const bool sweep_skip_stacks;
+    const bool sweep_skip_toggle;
     u64 dma_sync_stack_generation{};
     /// dma_sweep_skip_stacks: the resident ranges minus the stacks, rebuilt when a range becomes resident or the
     /// stack ranges change

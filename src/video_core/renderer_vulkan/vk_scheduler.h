@@ -443,7 +443,8 @@ public:
     /// through here or be followed by InvalidatePipelineBinds()
     void BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline) {
         auto& bound = bound_pipelines[point == vk::PipelineBindPoint::eCompute ? 1 : 0];
-        if (skip_redundant_binds && bound == pipeline && Common::PerfStats::AbToggleActive()) {
+        if (skip_redundant_binds && bound == pipeline &&
+            Common::PerfStats::AbToggleOn(skip_binds_toggle)) {
             Common::PerfStats::Add(Common::PerfStats::Id::PipelineBindsSkipped);
             return;
         }
@@ -458,6 +459,7 @@ public:
 
     void SkipRedundantPipelineBinds(bool enable) noexcept {
         skip_redundant_binds = enable;
+        skip_binds_toggle = Common::PerfStats::AbToggleFollows("gpu_overhead_cuts");
     }
 
     /// Returns the current command buffer tick.
@@ -552,6 +554,7 @@ private:
     // Pipelines bound to the current command buffer (graphics, compute), for BindPipeline
     std::array<vk::Pipeline, 2> bound_pipelines{};
     bool skip_redundant_binds{};
+    bool skip_binds_toggle{};
     u64 submitted_seq{};
     u32 commands_since_submit{};
 
@@ -571,6 +574,7 @@ private:
     vk::CommandBuffer ahead_cmdbuf;
     vk::UniqueFence ahead_fence;
     u64 ahead_submits{}; // gpu_checkpoints: numbers the ahead submits in the submit ledger
+    const u32 wait_spin_us;
 };
 
 } // namespace Vulkan

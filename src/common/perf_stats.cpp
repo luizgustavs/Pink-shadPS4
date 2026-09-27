@@ -114,6 +114,10 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::PipelineBindsSame, "pipeline_binds_same", Unit::Count},
     {Id::DmaSweeps, "dma_sweeps", Unit::Count},
     {Id::DmaSweepStackBytes, "dma_sweep_stack_kb", Unit::Kb},
+    {Id::WaitSpins, "wait_spins", Unit::Count},
+    {Id::WaitSpinHits, "wait_spin_hits", Unit::Count},
+    {Id::WaitSpinPolls, "wait_spin_polls", Unit::Count},
+    {Id::WaitSpinNs, "wait_spin_ms", Unit::Ms},
 }};
 
 constexpr bool FieldsMatchIds() {
@@ -162,6 +166,25 @@ const double ab_toggle_start = AbToggleStart();
 } // Anonymous namespace
 
 std::atomic<bool> Detail::ab_toggle_on{ab_toggle_start < 0.0};
+
+bool AbToggleFollows(std::string_view key) {
+    if (ab_toggle_start < 0.0) {
+        return false;
+    }
+    const char* env = std::getenv("SHADPS4_AB_TOGGLE_KEYS");
+    if (!env || !*env) {
+        return true;
+    }
+    std::string_view list{env};
+    while (!list.empty()) {
+        const size_t comma = list.find(',');
+        if (list.substr(0, comma) == key) {
+            return true;
+        }
+        list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+    }
+    return false;
+}
 
 void OnReportEmitted(double seconds_since_start) {
     if (ab_toggle_start < 0.0 || seconds_since_start < ab_toggle_start) {

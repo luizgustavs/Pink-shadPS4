@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <thread>
 #include <queue>
 #include "common/types.h"
@@ -14,6 +15,10 @@ namespace Vulkan {
 
 class Instance;
 class Scheduler;
+
+/// wait_spin_us: polls `done` for up to `spin_us` microseconds (0 = not at all) before a blocking wait,
+/// returning whether it came true. The thread wakes tens of microseconds after the GPU signals a sleeping wait
+bool SpinUntil(u32 spin_us, const std::function<bool()>& done);
 
 class Semaphore {
 public:
@@ -51,6 +56,7 @@ protected:
     vk::UniqueSemaphore semaphore;    ///< Timeline semaphore.
     std::atomic<u64> gpu_tick{0};     ///< Current known GPU tick.
     std::atomic<u64> current_tick{1}; ///< Current logical tick.
+    const u32 spin_us;                ///< wait_spin_us
 };
 
 } // namespace Vulkan

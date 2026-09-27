@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <string>
+#include <string_view>
 
 #include "common/types.h"
 
@@ -139,6 +140,12 @@ enum class Id : u32 {
     // DMA syncs that re-add every resident range to the sync batch, and the guest-stack bytes those ranges hold
     DmaSweeps,
     DmaSweepStackBytes,
+    // wait_spin_us (K3): blocking waits that polled first, those the GPU finished while polling, the polls, and
+    // the time spent polling (included in the wait timers)
+    WaitSpins,
+    WaitSpinHits,
+    WaitSpinPolls,
+    WaitSpinNs,
     Count,
 };
 
@@ -155,6 +162,15 @@ extern std::atomic<bool> ab_toggle_on;
 /// without the variables
 inline bool AbToggleActive() {
     return Detail::ab_toggle_on.load(std::memory_order_relaxed);
+}
+
+/// Whether the key follows SHADPS4_AB_TOGGLE: always with the toggle unless SHADPS4_AB_TOGGLE_KEYS lists other
+/// keys (comma separated), so keys held on both sides of an in-run A/B stay on. Read once, at key setup
+bool AbToggleFollows(std::string_view key);
+
+/// Whether a key that follows the toggle (AbToggleFollows) runs in this report interval
+inline bool AbToggleOn(bool follows) {
+    return !follows || AbToggleActive();
 }
 
 /// Called after each perf report with the seconds since the first one; flips SHADPS4_AB_TOGGLE

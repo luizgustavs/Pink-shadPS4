@@ -1,17 +1,59 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <limits>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
 #include "common/assert.h"
+#include "common/perf_stats.h"
+#include "core/emulator_settings.h"
 
 namespace Vulkan {
 
 constexpr u64 WAIT_TIMEOUT = std::numeric_limits<u64>::max();
 
-Semaphore::Semaphore(const Instance& instance_) : instance{instance_} {
+bool SpinUntil(u32 spin_us, const std::function<bool()>& done) {
+    using namespace Common::PerfStats;
+    static const bool follows_toggle = AbToggleFollows("wait_spin_us");
+    if (spin_us == 0 || !AbToggleOn(follows_toggle)) {
+        return false;
+    }
+    using Clock = std::chrono::steady_clock;
+    const auto start = Clock::now();
+    const auto deadline = start + std::chrono::microseconds(spin_us);
+    u64 polls = 0;
+    bool hit = false;
+    auto now = start;
+    while (now < deadline) {
+        ++polls;
+        if (done()) {
+            hit = true;
+            break;
+        }
+#if defined(_M_X64) || defined(__x86_64__)
+        _mm_pause();
+#endif
+        now = Clock::now();
+    }
+    if (Enabled()) {
+        Add(Id::WaitSpins);
+        Add(Id::WaitSpinPolls, polls);
+        Add(Id::WaitSpinNs,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+        if (hit) {
+            Add(Id::WaitSpinHits);
+        }
+    }
+    return hit;
+}
+
+Semaphore::Semaphore(const Instance& instance_)
+    : instance{instance_}, spin_us{EmulatorSettings.GetWaitSpinUs()} {
     const vk::StructureChain semaphore_chain = {
         vk::SemaphoreCreateInfo{},
         vk::SemaphoreTypeCreateInfo{
@@ -55,6 +97,12 @@ void Semaphore::Wait(u64 tick) {
     // Update the GPU tick and try again
     Refresh();
     if (IsFree(tick)) {
+        return;
+    }
+    if (SpinUntil(spin_us, [&] {
+            Refresh();
+            return IsFree(tick);
+        })) {
         return;
     }
 
