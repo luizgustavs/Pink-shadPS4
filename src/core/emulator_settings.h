@@ -223,6 +223,9 @@ struct GeneralSettings {
     // Processor affinity mask applied to the whole process at startup (0 = leave it alone). On a two-CCD
     // Ryzen, the CCD with the faster cores (0xFFFF on a 9950X) is ~10 % faster than landing on the other one
     Setting<u64> cpu_affinity_mask{0};
+    // One 125 Hz input timer instead of four 250 Hz ones (one per pad slot), pushing the state of the first slot
+    // (keyboard and main pad) and of slots with a pad connected. The SDL timer thread's cost follows its wake rate
+    Setting<bool> poll_connected_pads_only{false};
 
     // return a vector of override descriptors (runtime, but tiny)
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -253,7 +256,9 @@ struct GeneralSettings {
             make_override<GeneralSettings>("redirect_app0_logs",
                                            &GeneralSettings::redirect_app0_logs),
             make_override<GeneralSettings>("cpu_affinity_mask",
-                                           &GeneralSettings::cpu_affinity_mask)};
+                                           &GeneralSettings::cpu_affinity_mask),
+            make_override<GeneralSettings>("poll_connected_pads_only",
+                                           &GeneralSettings::poll_connected_pads_only)};
     }
 };
 
@@ -265,7 +270,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_
                                    discord_rpc_enabled, show_fps_counter, console_language,
                                    big_picture_scale, shadnet_server, shadnet_webapi_server,
                                    signaling_info, enable_upnp, redirect_app0_logs,
-                                   cpu_affinity_mask)
+                                   cpu_affinity_mask, poll_connected_pads_only)
 
 // -------------------------------
 // Log settings
@@ -801,6 +806,7 @@ public:
     SETTING_FORWARD_BOOL(m_general, UPnPEnabled, enable_upnp)
     SETTING_FORWARD_BOOL(m_general, RedirectApp0Logs, redirect_app0_logs)
     SETTING_FORWARD(m_general, CpuAffinityMask, cpu_affinity_mask)
+    SETTING_FORWARD_BOOL(m_general, PollConnectedPadsOnly, poll_connected_pads_only)
 
     // Log settings
     SETTING_FORWARD_BOOL(m_log, LogAppend, append)

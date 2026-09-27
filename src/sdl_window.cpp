@@ -87,6 +87,20 @@ static Uint32 SDLCALL PollController(void* userdata, SDL_TimerID timer_id, Uint3
     return interval;
 }
 
+// H4 (poll_connected_pads_only): one 8 ms timer instead of four 4 ms ones; the SDL timer thread costs ~11 % of a
+// core at 4 ms and half that at 8 ms. The first slot also carries the keyboard, so it is always polled; the others
+// only while a pad is connected to them
+static Uint32 SDLCALL PollConnectedControllers(void* userdata, SDL_TimerID timer_id, Uint32 interval) {
+    auto* controllers = reinterpret_cast<Input::GameControllers*>(userdata);
+    for (size_t i = 0; i < 4; ++i) {
+        auto* controller = (*controllers)[i];
+        if (i == 0 || controller->m_sdl_gamepad) {
+            controller->PollState();
+        }
+    }
+    return interval;
+}
+
 static Uint32 SDLCALL PollControllerLightColour(void* userdata, SDL_TimerID timer_id,
                                                 Uint32 interval) {
     auto* controller = reinterpret_cast<Input::GameController*>(userdata);
@@ -339,8 +353,12 @@ void WindowSDL::WaitEvent() {
 }
 
 void WindowSDL::InitTimers() {
-    for (int i = 0; i < 4; ++i) {
-        SDL_AddTimer(4, &PollController, controllers[i]);
+    if (EmulatorSettings.IsPollConnectedPadsOnly()) {
+        SDL_AddTimer(8, &PollConnectedControllers, &controllers);
+    } else {
+        for (int i = 0; i < 4; ++i) {
+            SDL_AddTimer(4, &PollController, controllers[i]);
+        }
     }
     SDL_AddTimer(33, Input::MousePolling, (void*)controllers[0]);
 }
