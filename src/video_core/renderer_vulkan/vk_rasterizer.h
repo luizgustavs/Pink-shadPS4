@@ -143,6 +143,8 @@ private:
     /// SHADPS4_CLEAN_READ_VERIFY: reads back the bytes a clean read served and reports any difference
     void VerifyCleanRead(VAddr addr, const void* served, u64 size);
     bool BindResources(const Pipeline* pipeline);
+    /// Sets each sampled image descriptor's layout to the one its subresource is in after the last transition
+    void RefreshImageDescriptorLayouts();
 
     /// gpu_checkpoints: attaches SHADPS4_GPU_DIAG details to the command just recorded and runs the
     /// SHADPS4_GPU_SYNC_EVERY bisection
@@ -188,6 +190,13 @@ private:
     static constexpr u32 MaxImageDescriptors =
         Shader::NUM_IMAGES + Shader::NUM_IMAGE_ARRAY_DESCRIPTORS;
     boost::container::static_vector<vk::DescriptorImageInfo, MaxImageDescriptors> image_infos;
+    // Sampled image descriptors of the current draw, for RefreshImageDescriptorLayouts
+    struct ImageDescriptorRef {
+        u32 info_index;
+        const VideoCore::Image::BackingImage* backing;
+        u32 subres_idx;
+    };
+    boost::container::static_vector<ImageDescriptorRef, MaxImageDescriptors> image_descriptor_refs;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     boost::container::static_vector<VideoCore::ImageId, MaxImageDescriptors> bound_images;
     struct BoundBuffer {

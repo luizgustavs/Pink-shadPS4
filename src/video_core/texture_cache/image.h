@@ -159,6 +159,13 @@ public:
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 num_samples;
+
+        /// Current layout of a subresource (mip * layers + layer). After a partial transition `state` holds
+        /// the layout of the last range transitioned, which need not be this one
+        [[nodiscard]] vk::ImageLayout Layout(u32 subres_idx) const {
+            return subres_idx < subresource_states.size() ? subresource_states[subres_idx].layout
+                                                          : state.layout;
+        }
     };
     std::deque<BackingImage> backing_images;
     BackingImage* backing{};

@@ -720,6 +720,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         runtime.FlushBarriers();
     }
 
+    RefreshImageDescriptorLayouts();
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -818,6 +819,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         runtime.FlushBarriers();
     }
 
+    RefreshImageDescriptorLayouts();
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -899,6 +901,7 @@ void Rasterizer::DispatchDirect() {
     }
 
     scheduler.EndRendering();
+    RefreshImageDescriptorLayouts();
     pipeline->BindResources(set_writes, push_data);
     if (GpuCheckpoints::DiagEnabled()) {
         CaptureBufferHeads();
@@ -954,6 +957,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     }
 
     scheduler.EndRendering();
+    RefreshImageDescriptorLayouts();
     pipeline->BindResources(set_writes, push_data);
     if (GpuCheckpoints::DiagEnabled()) {
         CaptureBufferHeads();
@@ -1089,6 +1093,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     set_writes.clear();
     buffer_infos.clear();
     image_infos.clear();
+    image_descriptor_refs.clear();
     if (GpuCheckpoints::DiagEnabled()) {
         diag_detail.Reset();
     }
@@ -1784,6 +1789,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
                                      image.backing->state.layout);
+            if (!is_storage) {
+                const auto& range = image_view.info.range;
+                image_descriptor_refs.push_back({
+                    .info_index = static_cast<u32>(image_infos.size() - 1),
+                    .backing = image.backing,
+                    .subres_idx = range.base.level * image.info.resources.layers + range.base.layer,
+                });
+            }
         }
     }
 
@@ -1818,6 +1831,37 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         set_write.descriptorCount = 1;
         set_write.descriptorType = vk::DescriptorType::eSampler;
         set_write.pImageInfo = &image_infos.back();
+    }
+}
+
+static bool IsSampledImageLayout(vk::ImageLayout layout) {
+    switch (layout) {
+    case vk::ImageLayout::eGeneral:
+    case vk::ImageLayout::eShaderReadOnlyOptimal:
+    case vk::ImageLayout::eDepthStencilReadOnlyOptimal:
+    case vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal:
+    case vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal:
+    case vk::ImageLayout::eDepthReadOnlyOptimal:
+    case vk::ImageLayout::eStencilReadOnlyOptimal:
+    case vk::ImageLayout::eReadOnlyOptimal:
+    case vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void Rasterizer::RefreshImageDescriptorLayouts() {
+    // A later transition of the same draw (a sampled depth image that is also the depth attachment, a
+    // sampled image also bound as storage) can move a subresource out of the layout its descriptor was
+    // written with. The layout is the one of the backing the view belongs to, even if the image switched
+    // backings since. A layout a sampled image cannot be in (the image is written as an attachment in the
+    // same draw) has no valid choice, so the descriptor keeps the one it had
+    for (const auto& ref : image_descriptor_refs) {
+        const auto layout = ref.backing->Layout(ref.subres_idx);
+        if (IsSampledImageLayout(layout)) {
+            image_infos[ref.info_index].imageLayout = layout;
+        }
     }
 }
 
