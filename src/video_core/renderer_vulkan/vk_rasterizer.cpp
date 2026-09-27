@@ -1549,9 +1549,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
-    // Checks shared by single images and descriptor array elements
-    const auto is_bindable = [&](const AmdGpu::Image& tsharp,
-                                 const Shader::ImageResource& image_desc) {
+    // Checks shared by single images and descriptor array elements. On success `bound_desc` holds the image
+    // description the checks built, which the binding reuses (building it costs ~1 ms per frame in SotC)
+    using ImageDesc = VideoCore::TextureCache::ImageDesc;
+    const auto is_bindable = [&](const AmdGpu::Image& tsharp, const Shader::ImageResource& image_desc,
+                                 std::optional<ImageDesc>& bound_desc) {
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
@@ -1599,7 +1601,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             return false;
         }
 
-        const VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+        const auto& desc = bound_desc.emplace(tsharp, image_desc);
         if (!IsPlausibleImage(desc.info)) {
             return false;
         }
@@ -1677,14 +1679,15 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     element && element.GetViewType(image_desc.is_array) == view_type &&
                     AmdGpu::IsInteger(element.GetNumberFmt()) == is_integer &&
                     element.GetNumberConversion() == tsharp.GetNumberConversion();
-                if (!compatible || !is_bindable(element, image_desc)) {
+                std::optional<ImageDesc> element_desc;
+                if (!compatible || !is_bindable(element, image_desc, element_desc)) {
                     null_elements += i < image_desc.array_size;
                     append_null_binding(image_desc);
                     continue;
                 }
                 count_lod_stats(element, image_desc.is_written);
                 auto& [image_id, desc] = image_bindings.emplace_back(
-                    std::piecewise_construct, std::tuple{}, std::tuple{element, image_desc});
+                    std::piecewise_construct, std::tuple{}, std::forward_as_tuple(*element_desc));
                 find_bound_image(image_id, desc, image_desc);
             }
             ReportTsharpArray(stage.pgm_hash, image_desc.array_size, null_elements);
@@ -1701,7 +1704,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
         }
 
-        if (!is_bindable(tsharp, image_desc)) {
+        std::optional<ImageDesc> bound_desc;
+        if (!is_bindable(tsharp, image_desc, bound_desc)) {
             append_null_bindings();
             continue;
         }
@@ -1711,7 +1715,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
         for (auto i = 0; i < num_bindings; i++) {
             auto& [image_id, desc] = image_bindings.emplace_back(
-                std::piecewise_construct, std::tuple{}, std::tuple{tsharp, image_desc});
+                std::piecewise_construct, std::tuple{}, std::forward_as_tuple(*bound_desc));
 
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
                 ASSERT(num_bindings == 1);
