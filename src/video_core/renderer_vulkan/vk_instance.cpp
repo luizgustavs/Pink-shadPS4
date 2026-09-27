@@ -441,6 +441,13 @@ bool Instance::CreateDevice() {
                                    "ahead copies to move, so the key has no effect");
     }
 
+    if (!features.drawIndirectFirstInstance) {
+        // The guest's indirect draw arguments live in GPU memory and may carry a non-zero first instance,
+        // which Vulkan only allows with this feature (VUID-VkDrawIndirectCommand-firstInstance-00501)
+        LOG_WARNING(Render_Vulkan, "drawIndirectFirstInstance unsupported; indirect draws with a "
+                                   "non-zero first instance are undefined");
+    }
+
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
@@ -462,6 +469,7 @@ bool Instance::CreateDevice() {
                 .dualSrcBlend = features.dualSrcBlend,
                 .logicOp = features.logicOp,
                 .multiDrawIndirect = features.multiDrawIndirect,
+                .drawIndirectFirstInstance = features.drawIndirectFirstInstance,
                 .depthClamp = features.depthClamp,
                 .depthBiasClamp = features.depthBiasClamp,
                 .fillModeNonSolid = features.fillModeNonSolid,
