@@ -23,8 +23,8 @@ set(BUFFER_CACHE_TEST_SOURCES
 )
 
 # SPIR-V and IR passes of the shader recompiler, checked without a GPU, plus the recursive locks and the stack
-# ranges of the memory manager. With SHADPS4_TEST_SPIRV_DIR set, the graphics workaround tests write their
-# modules there for spirv-val
+# ranges of the memory manager. With SHADPS4_TEST_SPIRV_DIR set, the graphics workaround and conformance tests
+# write their modules there for spirv-val
 set(GCN_TEST_SOURCES
     # Under test
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv.cpp
@@ -59,6 +59,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/resource_discover_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/resource_patching_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/shader_info_collection_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/shared_memory_barrier_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/patch.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/post_order.cpp
@@ -99,6 +100,7 @@ set(GCN_TEST_SOURCES
     gcn/test_dma_fault_bitmap.cpp
     gcn/test_graphics_workarounds.cpp
     gcn/test_sharp_fetch.cpp
+    gcn/test_spirv_conformance.cpp
 )
 
 add_executable(shadps4_buffer_cache_test ${BUFFER_CACHE_TEST_SOURCES})
