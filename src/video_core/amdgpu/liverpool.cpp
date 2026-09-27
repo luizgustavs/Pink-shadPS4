@@ -83,20 +83,21 @@ std::string QueueName(s16 queue) {
 }
 } // Anonymous namespace
 
-bool Enabled() {
-    static const bool enabled = std::getenv("SHADPS4_CBUF_PROBE") != nullptr;
-    return enabled;
-}
+const bool enabled = [] {
+    const char* value = std::getenv("SHADPS4_CBUF_PROBE");
+    return value && *value && std::string_view{value} != "0";
+}();
 
-void RecordPacket(s16 queue, const void* header) {
+void RecordPacket(s16 queue, std::span<const u32> packet) {
     // Packets come from the command processor thread only; submits race with it, which is fine for
     // a diagnostic (a torn entry shows up as garbage in the dump)
     auto& entry = entries[next_entry.fetch_add(1, std::memory_order_relaxed) % NumEntries];
-    const auto* pm4 = static_cast<const PM4Header*>(header);
-    const auto* body = static_cast<const u32*>(header) + 1;
-    const u32 count = std::min<u32>(pm4->type3.NumWords(), 4);
+    const auto* pm4 = reinterpret_cast<const PM4Header*>(packet.data());
+    const u32* body = packet.data() + 1;
+    // A truncated last packet must not read past the submission (the next page may be unmapped)
+    const u32 count = std::min<u32>({pm4->type3.NumWords(), static_cast<u32>(packet.size() - 1), 4});
     entry.ns = NowNs();
-    entry.header = header;
+    entry.header = packet.data();
     entry.words = {};
     std::memcpy(entry.words.data(), body, count * sizeof(u32));
     entry.size_dw = 0;
@@ -127,9 +128,11 @@ void Dump(u32 count) {
             continue;
         }
         const auto opcode = static_cast<PM4ItOpcode>(entry.opcode);
-        LOG_WARNING(Render, "CbufProbe hist -{:.3f}ms {} {} at {} [{:08x} {:08x} {:08x} {:08x}]",
-                    ago_ms, QueueName(entry.queue), magic_enum::enum_name(opcode), entry.header,
-                    entry.words[0], entry.words[1], entry.words[2], entry.words[3]);
+        // enum_name is empty above 127 (the CE opcodes), so the raw opcode goes along
+        LOG_WARNING(Render,
+                    "CbufProbe hist -{:.3f}ms {} {}({:#04x}) at {} [{:08x} {:08x} {:08x} {:08x}]",
+                    ago_ms, QueueName(entry.queue), magic_enum::enum_name(opcode), entry.opcode,
+                    entry.header, entry.words[0], entry.words[1], entry.words[2], entry.words[3]);
     }
 }
 
@@ -297,7 +300,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         const PM4ItOpcode opcode = header->type3.opcode;
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         if (CpHistory::Enabled()) {
-            CpHistory::RecordPacket(CpHistory::Queue::Ce, header);
+            CpHistory::RecordPacket(CpHistory::Queue::Ce, ccb);
         }
         switch (opcode) {
         case PM4ItOpcode::Nop: {
@@ -411,7 +414,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
             if (CpHistory::Enabled()) {
-                CpHistory::RecordPacket(CpHistory::Queue::De, header);
+                CpHistory::RecordPacket(CpHistory::Queue::De, dcb);
             }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
@@ -1147,7 +1150,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
         const PM4ItOpcode opcode = header->type3.opcode;
         if (CpHistory::Enabled()) {
-            CpHistory::RecordPacket(static_cast<s16>(vqid), header);
+            CpHistory::RecordPacket(static_cast<s16>(vqid), acb);
         }
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;

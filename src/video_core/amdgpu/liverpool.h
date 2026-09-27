@@ -253,8 +253,13 @@ private:
 /// guest submits, so a dispatch caught with a stale constant buffer shows what came before it
 namespace CpHistory {
 enum Queue : s16 { Ce = -2, De = -1 }; // >= 0: ASC vqid
-[[nodiscard]] bool Enabled();
-void RecordPacket(s16 queue, const void* header);
+/// Set once during static initialization, so a hook costs a load and a branch when the probe is off
+extern const bool enabled;
+[[nodiscard]] inline bool Enabled() {
+    return enabled;
+}
+/// `packet` runs from the packet header to the end of the submission
+void RecordPacket(s16 queue, std::span<const u32> packet);
 void RecordSubmit(s16 queue, std::span<const u32> commands);
 /// Logs the last `count` entries, oldest first
 void Dump(u32 count);

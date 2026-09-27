@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -344,7 +345,7 @@ void ProbeStaleCbuf(const Shader::Info& cs, Core::MemoryManager* memory,
             const std::string item{rest.substr(0, comma)};
             rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
             Target target{};
-            if (std::sscanf(item.c_str(), "%llx:%u:%u", &target.hash, &target.buffer,
+            if (std::sscanf(item.c_str(), "%" SCNx64 ":%u:%u", &target.hash, &target.buffer,
                             &target.dword) == 3) {
                 parsed.push_back(target);
                 LOG_WARNING(Render_Vulkan, "CbufProbe: watching cs {:#x} buffer {} dword {}",
@@ -1513,7 +1514,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             return false;
         }
 
+        // The warnings of these rejections are capped: a garbage T# left in a table is rebound every draw
+        static std::atomic<u32> layout_rejections{0};
+        static std::atomic<u32> low_address_rejections{0};
+        constexpr u32 MaxRejectionWarnings = 32;
         if (const char* reason = UnsupportedImageLayout(tsharp)) {
+            if (layout_rejections.fetch_add(1, std::memory_order_relaxed) >= MaxRejectionWarnings) {
+                return false;
+            }
             LOG_WARNING(Render_Vulkan,
                         "Rejecting T# with an unsupported layout ({}) address={:#x}, width={}, "
                         "tiling_index={}, data_format={}, samples={}",
@@ -1531,6 +1539,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         // the texture cache then tracks pages below the guest address space and Protect asserts ("out of
         // bounds"). No guest memory lies below the first region of the address space
         if (desc.info.guest_address < memory->SystemManagedVirtualBase()) {
+            if (low_address_rejections.fetch_add(1, std::memory_order_relaxed) >=
+                MaxRejectionWarnings) {
+                return false;
+            }
             LOG_WARNING(Render_Vulkan,
                         "Rejecting T# below the guest address space address={:#x}, size={:#x}, "
                         "width={}, data_format={}",
