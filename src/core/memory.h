@@ -10,14 +10,13 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <boost/container/small_vector.hpp>
-#include <boost/icl/interval_map.hpp>
 #include "common/enum.h"
 #include "common/shared_first_mutex.h"
 #include "common/singleton.h"
 #include "common/types.h"
 #include "core/address_space.h"
 #include "core/libraries/kernel/memory.h"
+#include "core/stack_ranges.h"
 
 namespace Vulkan {
 class Rasterizer;
@@ -349,7 +348,7 @@ public:
     const u8* GetBackingRun(VAddr virtual_addr, VAddr* run_start, u64* run_size,
                             bool try_lock = false);
 
-    using StackPieces = boost::container::small_vector<std::pair<VAddr, u64>, 4>;
+    using StackPieces = StackRangeSet::Pieces;
 
     /// Keep guest thread and fiber stacks writable when cpu_authoritative_stacks is enabled
     /// The host OS cannot dispatch faults raised while pushing to a protected stack page
@@ -362,7 +361,7 @@ public:
     StackPieces GetStackRangesIn(VAddr virtual_addr, u64 size);
     /// Changes whenever a stack range is registered or unregistered
     u64 StackRangesGeneration() const {
-        return stack_ranges_generation.load(std::memory_order_acquire);
+        return stack_ranges.Generation();
     }
 
 private:
@@ -417,12 +416,7 @@ private:
     u64 pool_budget{};
     s32 sdk_version{};
     Vulkan::Rasterizer* rasterizer{};
-    // Registration count per range: fiber contexts can live inside a thread stack
-    boost::icl::interval_map<VAddr, u32> stack_ranges;
-    std::shared_mutex stack_ranges_mutex;
-    // Lets every stack query return without locking while no stack is registered
-    std::atomic<bool> has_stack_ranges{false};
-    std::atomic<u64> stack_ranges_generation{0};
+    StackRangeSet stack_ranges;
 
     struct PrtArea {
         VAddr start;

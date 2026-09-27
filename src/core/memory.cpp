@@ -1749,12 +1749,7 @@ void MemoryManager::RegisterStackRange(VAddr virtual_addr, u64 size) {
     }
     const VAddr start = Common::AlignDown(virtual_addr, StackPageSize);
     const VAddr end = Common::AlignUp(virtual_addr + size, StackPageSize);
-    {
-        std::unique_lock lk{stack_ranges_mutex};
-        stack_ranges += std::make_pair(boost::icl::interval<VAddr>::right_open(start, end), 1u);
-        has_stack_ranges.store(true, std::memory_order_release);
-        stack_ranges_generation.fetch_add(1, std::memory_order_acq_rel);
-    }
+    stack_ranges.Add(start, end);
     Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::StackRegister, start,
                                       end - start, nullptr, virtual_addr);
     // The range may already be write-protected by GPU memory tracking (e.g. a fiber context carved out of a
@@ -1766,17 +1761,13 @@ void MemoryManager::RegisterStackRange(VAddr virtual_addr, u64 size) {
 }
 
 void MemoryManager::UnregisterStackRange(VAddr virtual_addr, u64 size) {
-    if (size == 0 || !has_stack_ranges.load(std::memory_order_acquire)) {
+    if (size == 0 || !stack_ranges.HasRanges()) {
         return;
     }
     // Same page rounding as RegisterStackRange: the counts keep pages shared with another live stack excluded
     const VAddr start = Common::AlignDown(virtual_addr, StackPageSize);
     const VAddr end = Common::AlignUp(virtual_addr + size, StackPageSize);
-    {
-        std::unique_lock lk{stack_ranges_mutex};
-        stack_ranges -= std::make_pair(boost::icl::interval<VAddr>::right_open(start, end), 1u);
-        stack_ranges_generation.fetch_add(1, std::memory_order_acq_rel);
-    }
+    stack_ranges.Remove(start, end);
     Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::StackUnregister, start,
                                       end - start, nullptr, virtual_addr);
     // The game reuses the memory (e.g. as allocator metadata of a fiber heap). Hand the parts that are no
@@ -1790,64 +1781,15 @@ void MemoryManager::UnregisterStackRange(VAddr virtual_addr, u64 size) {
 }
 
 bool MemoryManager::OverlapsStackRange(VAddr virtual_addr, u64 size) {
-    if (size == 0 || !has_stack_ranges.load(std::memory_order_acquire)) {
-        return false;
-    }
-    std::shared_lock lk{stack_ranges_mutex};
-    return boost::icl::intersects(
-        stack_ranges, boost::icl::interval<VAddr>::right_open(virtual_addr, virtual_addr + size));
+    return stack_ranges.Overlaps(virtual_addr, size);
 }
 
 MemoryManager::StackPieces MemoryManager::SubtractStackRanges(VAddr virtual_addr, u64 size) {
-    StackPieces result;
-    if (size == 0) {
-        return result;
-    }
-    if (!has_stack_ranges.load(std::memory_order_acquire)) {
-        result.emplace_back(virtual_addr, size);
-        return result;
-    }
-    // The gaps between the (disjoint, sorted) stack segments that overlap the range
-    const VAddr end = virtual_addr + size;
-    VAddr cursor = virtual_addr;
-    std::shared_lock lk{stack_ranges_mutex};
-    const auto [first, last] =
-        stack_ranges.equal_range(boost::icl::interval<VAddr>::right_open(virtual_addr, end));
-    for (auto it = first; it != last; ++it) {
-        const VAddr lo = std::max(it->first.lower(), virtual_addr);
-        if (lo > cursor) {
-            result.emplace_back(cursor, lo - cursor);
-        }
-        cursor = std::max(cursor, std::min(it->first.upper(), end));
-    }
-    if (cursor < end) {
-        result.emplace_back(cursor, end - cursor);
-    }
-    return result;
+    return stack_ranges.Subtract(virtual_addr, size);
 }
 
 MemoryManager::StackPieces MemoryManager::GetStackRangesIn(VAddr virtual_addr, u64 size) {
-    StackPieces result;
-    if (size == 0 || !has_stack_ranges.load(std::memory_order_acquire)) {
-        return result;
-    }
-    const VAddr end = virtual_addr + size;
-    std::shared_lock lk{stack_ranges_mutex};
-    const auto [first, last] =
-        stack_ranges.equal_range(boost::icl::interval<VAddr>::right_open(virtual_addr, end));
-    for (auto it = first; it != last; ++it) {
-        const VAddr lo = std::max(it->first.lower(), virtual_addr);
-        const VAddr hi = std::min(it->first.upper(), end);
-        if (hi > lo) {
-            if (!result.empty() && result.back().first + result.back().second == lo) {
-                // Adjacent ranges with different registration counts are one stack range here
-                result.back().second += hi - lo;
-            } else {
-                result.emplace_back(lo, hi - lo);
-            }
-        }
-    }
-    return result;
+    return stack_ranges.GetIn(virtual_addr, size);
 }
 
 } // namespace Core
