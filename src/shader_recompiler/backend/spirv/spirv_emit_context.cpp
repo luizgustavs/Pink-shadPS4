@@ -309,15 +309,22 @@ void EmitContext::DefineWorkgroupIndex() {
 }
 
 void EmitContext::DefineInputs() {
+    // Integer inputs need Flat in a fragment shader (VUID-StandaloneSpirv-Flat-04744) and must not have it
+    // in a vertex shader (VUID-StandaloneSpirv-Flat-06202); it means nothing in the other stages
+    const bool flat_subgroup_inputs = sw_stage == SwStage::Fragment;
     if (info.uses_lane_id) {
         subgroup_local_invocation_id = DefineVariable(
             U32[1], spv::BuiltIn::SubgroupLocalInvocationId, spv::StorageClass::Input);
-        Decorate(subgroup_local_invocation_id, spv::Decoration::Flat);
+        if (flat_subgroup_inputs) {
+            Decorate(subgroup_local_invocation_id, spv::Decoration::Flat);
+        }
     }
     if (info.loads.GetAny(IR::Attribute::SubgroupLtMask)) {
         subgroup_lt_mask =
             DefineVariable(U32[4], spv::BuiltIn::SubgroupLtMask, spv::StorageClass::Input);
-        Decorate(subgroup_lt_mask, spv::Decoration::Flat);
+        if (flat_subgroup_inputs) {
+            Decorate(subgroup_lt_mask, spv::Decoration::Flat);
+        }
     }
     switch (sw_stage) {
     case SwStage::Vertex: {

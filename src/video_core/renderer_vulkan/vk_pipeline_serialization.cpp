@@ -19,8 +19,9 @@ namespace Serialization {
 // early_fragment_tests, InfoPersistent gains sharp_tables and ImageResource the descriptor array fields (all
 // stored raw). ShaderMetaVersion 8: SharpFetch gains summary and FetchShaderData changes layout (#5112,
 // plus one_vgprs). ShaderMetaVersion 9: with srt_walker_clean_reads the SRT walker guest loads test the
-// clean-page bitmap first (the key is in the codegen settings key)
-static constexpr u32 ShaderBinaryVersion = 6u;
+// clean-page bitmap first (the key is in the codegen settings key). ShaderBinaryVersion 7: subgroup built-in
+// inputs are Flat only in fragment shaders (vertex shaders had an invalid Flat)
+static constexpr u32 ShaderBinaryVersion = 7u;
 static constexpr u32 ShaderMetaVersion = 9u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
