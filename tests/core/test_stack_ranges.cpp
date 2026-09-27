@@ -134,6 +134,18 @@ TEST(StackRangeSet, MoreGapsThanCacheEntries) {
     }
 }
 
+TEST(StackRangeSet, TopOfTheAddressSpace) {
+    // The last gap reaches ~0; a range that ends right below it is answered the same, cached or not
+    StackRangeSet set;
+    set.Add(ThreadStack, ThreadStack + ThreadStackSize);
+    const VAddr high = ~VAddr{0} - 0x1000;
+    for (int i = 0; i < 2; ++i) {
+        EXPECT_FALSE(set.Overlaps(high, 0x1000));
+        EXPECT_EQ(ToVector(set.Subtract(high, 0x1000)), (Pieces{{high, 0x1000}}));
+        EXPECT_TRUE(set.GetIn(high, 0x1000).empty());
+    }
+}
+
 TEST(StackRangeSet, SetsDoNotShareCachedGaps) {
     StackRangeSet empty_gap;
     empty_gap.Add(ThreadStack, ThreadStack + ThreadStackSize);

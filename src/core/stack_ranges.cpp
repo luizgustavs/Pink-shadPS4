@@ -54,8 +54,9 @@ bool StackRangeSet::InFreeGap(VAddr virtual_addr, u64 size) const {
     // Read before any lookup, so a change that races with this query can only make it miss
     const u64 current = generation.load(std::memory_order_acquire);
     for (const FreeGap& gap : free_gaps.entries) {
+        // Without `virtual_addr + size`, a range that wraps around misses and takes the locked lookup
         if (gap.set_id == id && gap.generation == current && virtual_addr >= gap.lo &&
-            virtual_addr + size <= gap.hi) {
+            virtual_addr < gap.hi && size <= gap.hi - virtual_addr) {
             return true;
         }
     }
@@ -66,13 +67,18 @@ void StackRangeSet::RememberFreeGap(RangeMap::const_iterator next) const {
     // Called under the shared lock after an empty query, with `next` the first segment after it.
     // Writers bump the generation under the unique lock, so the one read here matches the ranges
     // seen
+    // The entry is disowned while it is written: a guest signal handler that runs on this thread in
+    // the middle (and faults into a stack query) must not see new bounds with an old key or the
+    // reverse
     auto& cache = free_gaps;
-    cache.entries[cache.next] = {
-        id,
-        generation.load(std::memory_order_relaxed),
-        next == ranges.begin() ? VAddr{0} : std::prev(next)->first.upper(),
-        next == ranges.end() ? ~VAddr{0} : next->first.lower(),
-    };
+    FreeGap& gap = cache.entries[cache.next];
+    gap.set_id = 0;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    gap.generation = generation.load(std::memory_order_relaxed);
+    gap.lo = next == ranges.begin() ? VAddr{0} : std::prev(next)->first.upper();
+    gap.hi = next == ranges.end() ? ~VAddr{0} : next->first.lower();
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    gap.set_id = id;
     cache.next = (cache.next + 1) % cache.entries.size();
 }
 

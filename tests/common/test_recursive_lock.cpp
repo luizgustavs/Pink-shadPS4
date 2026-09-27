@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <atomic>
 #include <optional>
 #include <shared_mutex>
 #include <thread>
@@ -188,14 +189,28 @@ TEST(RecursiveLock, MoreThanInlineEntries) {
 }
 
 TEST(RecursiveLock, StateIsPerThread) {
+    // Another thread holding its own shared lock is not a nested lock of this one: each thread's
+    // outermost release unlocks its own hold. With shared state, the second thread would only count
+    // up and the mutex would stay held after both released
     std::shared_mutex mutex;
-    SharedLock outer{mutex};
-    // Another thread holding its own shared lock is not a nested lock of this one
-    std::thread([&] {
-        SharedLock other{mutex};
-        EXPECT_FALSE(FreeForOtherThread(mutex));
-    }).join();
+    std::optional<SharedLock> outer;
+    outer.emplace(mutex);
+    std::atomic<int> step{0};
+    std::thread other([&] {
+        SharedLock lock{mutex};
+        step = 1;
+        while (step.load() != 2) {
+            std::this_thread::yield();
+        }
+    });
+    while (step.load() != 1) {
+        std::this_thread::yield();
+    }
+    outer.reset();
     EXPECT_FALSE(FreeForOtherThread(mutex));
+    step = 2;
+    other.join();
+    EXPECT_TRUE(FreeForOtherThread(mutex));
 }
 
 } // namespace
