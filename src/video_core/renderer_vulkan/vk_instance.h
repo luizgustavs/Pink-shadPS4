@@ -75,6 +75,16 @@ public:
         return present_queue;
     }
 
+    /// readback_ahead_transfer_queue: a queue of a transfer-only family (the copy engine), null when off or
+    /// unavailable. Buffers are then shared concurrently between the two families
+    vk::Queue GetTransferQueue() const {
+        return transfer_queue;
+    }
+
+    u32 GetTransferQueueFamilyIndex() const {
+        return transfer_queue_family_index;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -520,6 +530,8 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue transfer_queue;
+    u32 transfer_queue_family_index{};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;

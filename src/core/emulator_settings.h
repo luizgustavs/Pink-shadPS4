@@ -523,6 +523,9 @@ struct GPUSettings {
     // Poll the GPU for up to this many microseconds before a blocking semaphore/fence wait (0 = off): the
     // thread wakes tens of microseconds after the GPU signals, and most readback waits are that short
     Setting<u32> wait_spin_us{0};
+    // readback_ahead copies go to a transfer-only queue (the copy engine) and wait on the GPU only for the
+    // newest writer of the copied bytes, instead of behind everything submitted to the graphics queue
+    Setting<bool> readback_ahead_transfer_queue{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -576,6 +579,8 @@ struct GPUSettings {
             make_override<GPUSettings>("dma_sweep_skip_stacks",
                                        &GPUSettings::dma_sweep_skip_stacks),
             make_override<GPUSettings>("wait_spin_us", &GPUSettings::wait_spin_us),
+            make_override<GPUSettings>("readback_ahead_transfer_queue",
+                                       &GPUSettings::readback_ahead_transfer_queue),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -594,7 +599,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    srt_walker_clean_reads, shader_code_clean_reads,
                                    readback_ahead, periodic_flush_commands,
                                    cp_recording_cuts, gpu_overhead_cuts, dma_sweep_skip_stacks,
-                                   wait_spin_us)
+                                   wait_spin_us, readback_ahead_transfer_queue)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -905,6 +910,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, GpuOverheadCuts, gpu_overhead_cuts)
     SETTING_FORWARD_BOOL(m_gpu, DmaSweepSkipStacks, dma_sweep_skip_stacks)
     SETTING_FORWARD(m_gpu, WaitSpinUs, wait_spin_us)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackAheadTransferQueue, readback_ahead_transfer_queue)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

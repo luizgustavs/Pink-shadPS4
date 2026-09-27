@@ -377,8 +377,10 @@ public:
     /// stay open. Only one can be in flight: the caller waits with WaitAhead() before the next
     [[nodiscard]] vk::CommandBuffer BeginAhead();
 
-    /// Submits the command buffer of BeginAhead() without touching the current one
-    void SubmitAhead();
+    /// Submits the command buffer of BeginAhead() without touching the current one. With
+    /// readback_ahead_transfer_queue it goes to the transfer queue and waits on the GPU only until the
+    /// timeline reaches `wait_tick` (the newest writer of the copied bytes), not behind everything submitted
+    void SubmitAhead(u64 wait_tick);
 
     /// Waits for the command buffer sent by SubmitAhead(). `writers_done`: the copied bytes had no writer
     /// still running, so the wait is only the copy and the submit latency (perf counters)
@@ -570,8 +572,14 @@ private:
     s32 gpu_timing_open{-1};
     double gpu_timestamp_period_ns{};
 
-    vk::UniqueCommandPool ahead_pool;
+    struct AheadSlot {
+        vk::UniqueCommandPool pool;
+        vk::CommandBuffer cmdbuf;
+    };
+    /// Graphics-family and transfer-family (readback_ahead_transfer_queue) ahead command buffers
+    std::array<AheadSlot, 2> ahead_slots;
     vk::CommandBuffer ahead_cmdbuf;
+    bool ahead_on_transfer{};
     vk::UniqueFence ahead_fence;
     u64 ahead_submits{}; // gpu_checkpoints: numbers the ahead submits in the submit ledger
     const u32 wait_spin_us;

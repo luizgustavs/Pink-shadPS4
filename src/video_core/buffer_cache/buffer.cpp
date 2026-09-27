@@ -125,10 +125,16 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_},
       buffer{instance.GetDevice(), instance.GetAllocator()} {
 
+    // readback_ahead_transfer_queue: the transfer queue copies out of the arena into staging buffers
+    const std::array<u32, 2> families = {instance.GetGraphicsQueueFamilyIndex(),
+                                         instance.GetTransferQueueFamilyIndex()};
+    const bool shared = static_cast<bool>(instance.GetTransferQueue());
     vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
         .usage = AllFlags,
-        .sharingMode = vk::SharingMode::eExclusive,
+        .sharingMode = shared ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
+        .queueFamilyIndexCount = shared ? static_cast<u32>(families.size()) : 0U,
+        .pQueueFamilyIndices = shared ? families.data() : nullptr,
     };
     VmaAllocationInfo alloc_info{};
     buffer.Create(buffer_ci, mem_type, &alloc_info);

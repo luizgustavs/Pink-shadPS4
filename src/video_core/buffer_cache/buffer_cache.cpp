@@ -291,8 +291,9 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     // copy goes into a command buffer submitted ahead of it. Its barrier orders it after every earlier
     // submission, so only the recorded commands are skipped, and they write none of these bytes. Pending
     // sparse binds are only submitted with the current command buffer
+    u64 wait_tick = 0;
     const WriterState writers =
-        track_writers ? ClassifyWriters(arena_base, copies) : WriterState::Current;
+        track_writers ? ClassifyWriters(arena_base, copies, &wait_tick) : WriterState::Current;
     if (guest_readback && writers == WriterState::Current) {
         Common::PerfStats::Add(Common::PerfStats::Id::GuestReadbackCurrent);
     }
@@ -319,7 +320,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             .memoryBarrierCount = 1,
             .pMemoryBarriers = &host_barrier,
         });
-        scheduler.SubmitAhead();
+        scheduler.SubmitAhead(wait_tick);
         scheduler.WaitAhead(writers == WriterState::Done);
         static const bool verify = std::getenv("SHADPS4_READBACK_AHEAD_VERIFY") != nullptr;
         if (verify) {
@@ -492,7 +493,8 @@ void BufferCache::CloseGpuWrites() {
 }
 
 BufferCache::WriterState BufferCache::ClassifyWriters(VAddr arena_base,
-                                                      std::span<const vk::BufferCopy> copies) {
+                                                      std::span<const vk::BufferCopy> copies,
+                                                      u64* wait_tick) {
     using Common::PerfStats::Id;
     const auto overlaps = [&](VAddr lo, u64 size) {
         return std::ranges::any_of(copies, [&](const vk::BufferCopy& copy) {
@@ -520,14 +522,17 @@ BufferCache::WriterState BufferCache::ClassifyWriters(VAddr arena_base,
             return WriterState::Current;
         }
         Common::PerfStats::Add(Id::ReadbackWriterOld);
+        *wait_tick = it->tick;
         if (!scheduler.IsFree(it->tick)) {
             Common::PerfStats::Add(Id::ReadbackWriterOldBusy);
             return WriterState::Busy;
         }
         return WriterState::Done;
     }
-    // Written before the tracked ticks
+    // Written before the tracked ticks. Only the last few ticks with writes are tracked, so the writer may be
+    // any tick before the oldest tracked one, and it may still be running
     Common::PerfStats::Add(Id::ReadbackWriterOld);
+    *wait_tick = writer_ticks.empty() ? current - 1 : writer_ticks.front().tick - 1;
     return WriterState::Done;
 }
 

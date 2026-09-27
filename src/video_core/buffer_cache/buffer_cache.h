@@ -181,7 +181,10 @@ private:
     /// binding whose command is not recorded yet, and may land in a later command buffer (CloseGpuWrites)
     void RecordGpuWrite(VAddr addr, u64 size, bool open = false);
     /// Newest writer of the bytes a readback copies (srcOffset relative to `arena_base`)
-    WriterState ClassifyWriters(VAddr arena_base, std::span<const vk::BufferCopy> copies);
+    /// `wait_tick` receives the tick an ahead copy on another queue must wait for (Busy/Done only): the
+    /// writer's when it is tracked, else the tick before the oldest tracked one
+    WriterState ClassifyWriters(VAddr arena_base, std::span<const vk::BufferCopy> copies,
+                                u64* wait_tick);
     /// SHADPS4_READBACK_AHEAD_VERIFY: copies the bytes again after a Finish and compares them with the
     /// ahead copy
     void VerifyAheadCopy(const Buffer* arena, std::span<const vk::BufferCopy> copies,

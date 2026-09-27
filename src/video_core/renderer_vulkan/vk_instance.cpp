@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -403,19 +404,43 @@ bool Instance::CreateDevice() {
     }
 
     static constexpr std::array queue_priorities = {1.0f};
-    const vk::DeviceQueueCreateInfo queue_info = {
+    std::array<vk::DeviceQueueCreateInfo, 2> queue_infos{};
+    queue_infos[0] = {
         .queueFamilyIndex = queue_family_index,
         .queueCount = static_cast<u32>(queue_priorities.size()),
         .pQueuePriorities = queue_priorities.data(),
     };
+    u32 queue_info_count = 1;
+    // readback_ahead_transfer_queue: a family with transfer but neither graphics nor compute is the copy
+    // engine, which runs beside the graphics queue instead of timeslicing with it
+    std::optional<u32> transfer_family;
+    if (EmulatorSettings.IsReadbackAhead() && EmulatorSettings.IsReadbackAheadTransferQueue()) {
+        for (std::size_t i = 0; i < family_properties.size(); i++) {
+            const auto flags = family_properties[i].queueFlags;
+            if ((flags & vk::QueueFlagBits::eTransfer) &&
+                !(flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute))) {
+                transfer_family = static_cast<u32>(i);
+                break;
+            }
+        }
+        if (transfer_family) {
+            queue_infos[queue_info_count++] = {
+                .queueFamilyIndex = *transfer_family,
+                .queueCount = 1,
+                .pQueuePriorities = queue_priorities.data(),
+            };
+        } else {
+            LOG_WARNING(Render_Vulkan, "readback_ahead_transfer_queue: no transfer-only queue family");
+        }
+    }
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
-            .queueCreateInfoCount = 1u,
-            .pQueueCreateInfos = &queue_info,
+            .queueCreateInfoCount = queue_info_count,
+            .pQueueCreateInfos = queue_infos.data(),
             .enabledExtensionCount = static_cast<u32>(enabled_extensions.size()),
             .ppEnabledExtensionNames = enabled_extensions.data(),
         },
@@ -632,6 +657,14 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    if (transfer_family) {
+        transfer_queue = device->getQueue(*transfer_family, 0);
+        transfer_queue_family_index = *transfer_family;
+        LOG_WARNING(Render_Vulkan,
+                    "Workaround readback_ahead_transfer_queue enabled: readback-ahead copies use "
+                    "queue family {}",
+                    *transfer_family);
+    }
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =

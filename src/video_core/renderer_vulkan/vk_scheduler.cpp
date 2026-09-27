@@ -136,25 +136,35 @@ void Scheduler::Finish() {
 
 vk::CommandBuffer Scheduler::BeginAhead() {
     const vk::Device device = instance.GetDevice();
-    if (!ahead_pool) {
+    // readback_ahead_transfer_queue honours SHADPS4_AB_TOGGLE: the off intervals use a graphics-family command
+    // buffer on the graphics queue, as without the key
+    static const bool follows_toggle =
+        Common::PerfStats::AbToggleFollows("readback_ahead_transfer_queue");
+    ahead_on_transfer =
+        instance.GetTransferQueue() && Common::PerfStats::AbToggleOn(follows_toggle);
+    auto& slot = ahead_slots[ahead_on_transfer ? 1 : 0];
+    if (!slot.pool) {
         const vk::CommandPoolCreateInfo pool_info = {
             .flags = vk::CommandPoolCreateFlagBits::eTransient |
                      vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
-            .queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex(),
+            .queueFamilyIndex = ahead_on_transfer ? instance.GetTransferQueueFamilyIndex()
+                                                  : instance.GetGraphicsQueueFamilyIndex(),
         };
         auto [pool_result, pool] = device.createCommandPoolUnique(pool_info);
         ASSERT_MSG(pool_result == vk::Result::eSuccess, "Failed to create the ahead pool: {}",
                    vk::to_string(pool_result));
-        ahead_pool = std::move(pool);
+        slot.pool = std::move(pool);
         const vk::CommandBufferAllocateInfo alloc_info = {
-            .commandPool = *ahead_pool,
+            .commandPool = *slot.pool,
             .level = vk::CommandBufferLevel::ePrimary,
             .commandBufferCount = 1,
         };
         auto [alloc_result, cmdbufs] = device.allocateCommandBuffers(alloc_info);
         ASSERT_MSG(alloc_result == vk::Result::eSuccess,
                    "Failed to allocate the ahead command buffer: {}", vk::to_string(alloc_result));
-        ahead_cmdbuf = cmdbufs[0];
+        slot.cmdbuf = cmdbufs[0];
+    }
+    if (!ahead_fence) {
         auto [fence_result, fence] = device.createFenceUnique({});
         ASSERT_MSG(fence_result == vk::Result::eSuccess, "Failed to create the ahead fence: {}",
                    vk::to_string(fence_result));
@@ -162,6 +172,7 @@ vk::CommandBuffer Scheduler::BeginAhead() {
     } else {
         Check(device.resetFences(*ahead_fence));
     }
+    ahead_cmdbuf = slot.cmdbuf;
     Check(ahead_cmdbuf.reset());
     Check(ahead_cmdbuf.begin(vk::CommandBufferBeginInfo{
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
@@ -169,22 +180,37 @@ vk::CommandBuffer Scheduler::BeginAhead() {
     return ahead_cmdbuf;
 }
 
-void Scheduler::SubmitAhead() {
+void Scheduler::SubmitAhead(u64 wait_tick) {
     Check(ahead_cmdbuf.end());
+    // On the transfer queue, the timeline wait orders the copy after its writer and makes the writes visible;
+    // on the graphics queue, submission order and the copy's barrier do
+    const vk::Queue transfer_queue = ahead_on_transfer ? instance.GetTransferQueue() : vk::Queue{};
+    const vk::Semaphore timeline = work_semaphore.Handle();
+    static constexpr vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eTransfer;
+    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+        .waitSemaphoreValueCount = 1U,
+        .pWaitSemaphoreValues = &wait_tick,
+    };
     const vk::SubmitInfo submit_info = {
+        .pNext = transfer_queue ? &timeline_si : nullptr,
+        .waitSemaphoreCount = transfer_queue ? 1U : 0U,
+        .pWaitSemaphores = &timeline,
+        .pWaitDstStageMask = &wait_stage,
         .commandBufferCount = 1U,
         .pCommandBuffers = &ahead_cmdbuf,
     };
     std::scoped_lock lk{submit_mutex};
     if (tracks_gpu_commands) {
-        // gpu_checkpoints: the ahead copy carries no guest command and runs after the submitted ones. The
-        // previous one was waited for, so it is the last known completed
+        // gpu_checkpoints: the ahead copy carries no guest command and is queued after the submitted ones (on
+        // the transfer queue it only waits for tick wait_tick of them). The previous one was waited for, so it
+        // is the last known completed
         GpuCheckpoints::RecordSubmit(std::bit_cast<u64>(static_cast<VkFence>(*ahead_fence)),
                                      ahead_submits + 1, submitted_seq + 1, submitted_seq,
                                      ahead_submits, true);
     }
     ++ahead_submits;
-    const auto submit_result = instance.GetGraphicsQueue().submit(submit_info, *ahead_fence);
+    const auto submit_result = (transfer_queue ? transfer_queue : instance.GetGraphicsQueue())
+                                   .submit(submit_info, *ahead_fence);
     if (submit_result == vk::Result::eErrorDeviceLost) {
         instance.ReportDeviceFault("SubmitAhead");
     }
