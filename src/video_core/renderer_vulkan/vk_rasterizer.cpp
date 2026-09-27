@@ -2119,9 +2119,29 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
 }
 
 bool Rasterizer::ReadCleanMemory(VAddr addr, void* out, u64 size) {
-    if (!IsMapped(addr, size) || buffer_cache.IsRangeGpuWritten(addr, size) ||
-        !memory->TryReadBacking(addr, out, size)) {
-        return false;
+    // Page by page through the clean page cache of the buffer cache: SotC serves tens of thousands of these
+    // per frame, too many for the mapped-range and backing lookups with their locks
+    using CleanRead = VideoCore::BufferCache::CleanRead;
+    constexpr u64 PageSize = 4_KB;
+    auto* dst = static_cast<u8*>(out);
+    for (VAddr current = addr, end = addr + size; current < end;) {
+        const VAddr page_addr = Common::AlignDown(current, PageSize);
+        const u32 chunk = static_cast<u32>(std::min(end, page_addr + PageSize) - current);
+        auto result = buffer_cache.ReadCleanPage(current, dst, chunk);
+        if (result == CleanRead::Miss) {
+            // The generation is read first: an unmap racing with the checks leaves a stale entry
+            const u64 generation = buffer_cache.MappingGeneration();
+            if (!IsMapped(page_addr, PageSize) ||
+                !buffer_cache.FillCleanPage(page_addr, generation)) {
+                return false;
+            }
+            result = buffer_cache.ReadCleanPage(current, dst, chunk);
+        }
+        if (result != CleanRead::Served) {
+            return false;
+        }
+        current += chunk;
+        dst += chunk;
     }
     static const bool verify = std::getenv("SHADPS4_CLEAN_READ_VERIFY") != nullptr;
     if (verify) {
@@ -2215,6 +2235,7 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
     }
+    buffer_cache.OnMappingChanged();
 }
 
 void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
@@ -2229,6 +2250,7 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
     }
+    buffer_cache.OnMappingChanged();
 }
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {

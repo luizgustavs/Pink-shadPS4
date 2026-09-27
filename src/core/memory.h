@@ -264,6 +264,10 @@ public:
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
 
+    /// Lock free, from the table CopySparseMemory reads: host pointer to the physical backing of virtual_addr,
+    /// valid up to the end of its 16 KiB page while the mapping lasts, or nullptr without a physical backing
+    const u8* GetBackingPointer(VAddr virtual_addr) const;
+
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);

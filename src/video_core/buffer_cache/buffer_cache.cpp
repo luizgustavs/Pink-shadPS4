@@ -186,6 +186,7 @@ void BufferCache::ReleaseCpuAuthoritativeRange(VAddr device_addr, u64 size) {
     liverpool->SendCommand([this, device_addr, size] {
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, true);
         gpu_modified_ranges.Subtract(device_addr, size);
+        InvalidateCleanPages(device_addr, size);
     });
 }
 
@@ -242,6 +243,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             }
         });
         gpu_modified_ranges.Subtract(address, size);
+        InvalidateCleanPages(address, size);
     });
     if (total_size_bytes == 0) {
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
@@ -309,9 +311,67 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (is_written) {
         for (const auto& [lo, len] : memory->SubtractStackRanges(device_addr, size)) {
             gpu_modified_ranges.Add(lo, len);
+            InvalidateCleanPages(lo, len);
         }
     }
     return {arena, arena->Offset(device_addr)};
+}
+
+BufferCache::CleanRead BufferCache::ReadCleanPage(VAddr addr, void* out, u32 size) {
+    const VAddr page_addr = addr & ~(CleanPageSize - 1);
+    const auto& page = clean_pages[(addr >> CleanPageBits) % NumCleanPages];
+    if (page.page_addr != page_addr ||
+        page.map_generation != clean_map_generation.load(std::memory_order_acquire)) {
+        return CleanRead::Miss;
+    }
+    const u32 offset = static_cast<u32>(addr - page_addr);
+    if (offset < page.dirty_hi && offset + size > page.dirty_lo &&
+        gpu_modified_ranges.Intersects(addr, size)) {
+        return CleanRead::GpuWritten;
+    }
+    std::memcpy(out, page.backing + offset, size);
+    return CleanRead::Served;
+}
+
+bool BufferCache::FillCleanPage(VAddr page_addr, u64 generation) {
+    const u8* backing = memory->GetBackingPointer(page_addr);
+    if (!backing) {
+        return false;
+    }
+    u32 dirty_lo = CleanPageSize;
+    u32 dirty_hi = 0;
+    gpu_modified_ranges.ForEachInRange(page_addr, CleanPageSize, [&](VAddr start, VAddr end) {
+        dirty_lo = std::min<u32>(dirty_lo, static_cast<u32>(start - page_addr));
+        dirty_hi = std::max<u32>(dirty_hi, static_cast<u32>(end - page_addr));
+    });
+    clean_pages[(page_addr >> CleanPageBits) % NumCleanPages] = {
+        .page_addr = page_addr,
+        .map_generation = generation,
+        .backing = backing,
+        .dirty_lo = dirty_lo,
+        .dirty_hi = dirty_hi,
+    };
+    return true;
+}
+
+void BufferCache::InvalidateCleanPages(VAddr addr, u64 size) {
+    const u64 first = addr >> CleanPageBits;
+    const u64 last = (addr + size - 1) >> CleanPageBits;
+    if (last - first >= NumCleanPages) {
+        for (auto& page : clean_pages) {
+            const u64 index = page.page_addr >> CleanPageBits;
+            if (index >= first && index <= last) {
+                page.page_addr = ~0ULL;
+            }
+        }
+        return;
+    }
+    for (u64 index = first; index <= last; ++index) {
+        auto& page = clean_pages[index % NumCleanPages];
+        if (page.page_addr == index << CleanPageBits) {
+            page.page_addr = ~0ULL;
+        }
+    }
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {

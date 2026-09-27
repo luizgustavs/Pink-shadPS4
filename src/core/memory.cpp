@@ -162,6 +162,17 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     }
 }
 
+const u8* MemoryManager::GetBackingPointer(VAddr virtual_addr) const {
+    if (virtual_addr >> AddressSpace::Traits::ADDRESS_SPACE_BITS) {
+        return nullptr;
+    }
+    const auto* entry = impl.BackingPages().find(virtual_addr >> AddressSpace::Traits::PAGE_BITS);
+    if (!entry || !*entry) {
+        return nullptr;
+    }
+    return *entry + (virtual_addr & ((1ULL << AddressSpace::Traits::PAGE_BITS) - 1));
+}
+
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
     std::shared_lock lk{mutex};

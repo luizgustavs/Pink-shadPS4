@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <boost/container/small_vector.hpp>
@@ -116,6 +118,22 @@ public:
         return gpu_modified_ranges.Intersects(addr, size);
     }
 
+    enum class CleanRead { Served, GpuWritten, Miss };
+    /// Clean reads (Rasterizer::ReadCleanMemory) of [addr, addr + size), within one 4 KiB page, from a cache
+    /// of pages that holds their backing pointer and the hull of their GPU-written bytes. On Miss the caller
+    /// checks that the page is GPU mapped and calls FillCleanPage. Command processor thread only
+    CleanRead ReadCleanPage(VAddr addr, void* out, u32 size);
+    /// `generation` is MappingGeneration() read before checking that the page is GPU mapped
+    bool FillCleanPage(VAddr page_addr, u64 generation);
+    [[nodiscard]] u64 MappingGeneration() const {
+        return clean_map_generation.load(std::memory_order_acquire);
+    }
+    /// A GPU mapping was removed or added: cached backing pointers may be stale. Any thread, after the mapped
+    /// ranges changed
+    void OnMappingChanged() {
+        clean_map_generation.fetch_add(1, std::memory_order_release);
+    }
+
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 
@@ -150,6 +168,9 @@ private:
     /// Logs compute_loop_cap hits: the first one, then a count per minute
     void ReportLoopCapHits();
 
+    /// gpu_modified_ranges changed in [addr, addr + size): drop the clean pages there
+    void InvalidateCleanPages(VAddr addr, u64 size);
+
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     Vulkan::Runtime& runtime;
@@ -163,6 +184,19 @@ private:
     Buffer gds_buffer;
     Buffer loop_cap_buffer;
     RangeSet gpu_modified_ranges;
+    struct CleanPage {
+        VAddr page_addr = ~0ULL;
+        u64 map_generation;
+        const u8* backing;
+        // Hull of the GPU-written bytes of the page, as offsets; dirty_lo >= dirty_hi when there are none
+        u32 dirty_lo;
+        u32 dirty_hi;
+    };
+    static constexpr u64 CleanPageBits = 12;
+    static constexpr u64 CleanPageSize = 1ULL << CleanPageBits;
+    static constexpr size_t NumCleanPages = 1024;
+    std::array<CleanPage, NumCleanPages> clean_pages{};
+    std::atomic<u64> clean_map_generation{};
     u32 loop_cap_hits_reported{};
     u32 loop_cap_hits_minute{};
     std::chrono::steady_clock::time_point loop_cap_last_check{};
