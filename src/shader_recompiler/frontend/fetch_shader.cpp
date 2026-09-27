@@ -46,6 +46,7 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
     }
 
     out_fetch_data.attributes.clear();
+    out_fetch_data.one_vgprs.clear();
 
     struct VsharpLoad {
         u32 dword_offset{};
@@ -125,7 +126,8 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
             const u32 src0 = word0 & 0x1ff;
             const u32 vdst = (word0 >> 17) & 0xff;
             ASSERT(opcode == OpcodeVOP1::V_MOV_B32 && src0 == 242);
-            LOG_WARNING(Render_Recompiler, "Fetch shader has V{} = 1.0 which is ignored", vdst);
+            // Loads write only their own components, so the constant has to be set too
+            out_fetch_data.one_vgprs.push_back(u8(vdst));
         } else {
             UNREACHABLE_MSG("Unexpected instruction encoding in fetch shader {}", u32(encoding));
         }

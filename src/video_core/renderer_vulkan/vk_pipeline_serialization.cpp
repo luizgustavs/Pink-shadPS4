@@ -17,7 +17,8 @@ namespace Serialization {
 // descriptors, DMA fault bitmap uses bounds checks and atomics. ShaderMetaVersion 6: meta records the codegen
 // settings key; Info gains uses_loop_cap. ShaderMetaVersion 7: HwFragmentRuntimeInfo gains
 // early_fragment_tests, InfoPersistent gains sharp_tables and ImageResource the descriptor array fields (all
-// stored raw). ShaderMetaVersion 8: SharpFetch gains summary and FetchShaderData changes layout (#5112)
+// stored raw). ShaderMetaVersion 8: SharpFetch gains summary and FetchShaderData changes layout (#5112,
+// plus one_vgprs)
 static constexpr u32 ShaderBinaryVersion = 6u;
 static constexpr u32 ShaderMetaVersion = 8u;
 static constexpr u32 PipelineKeyVersion = 3u;
@@ -242,6 +243,11 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 }
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+    // A preload that failed halfway leaves its stages here; they must not reach this pipeline
+    infos.fill(nullptr);
+    modules.fill(nullptr);
+    fetch_shader = nullptr;
+
     graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
@@ -448,6 +454,7 @@ void Gcn::FetchShaderData::Serialize(Serialization::Archive& ar) const {
     fetch.Write(vertex_offset_sgpr);
     fetch.Write(instance_offset_sgpr);
     fetch.Write(attributes);
+    fetch.Write(one_vgprs);
 }
 
 bool Gcn::FetchShaderData::Deserialize(Serialization::Archive& ar) {
@@ -457,6 +464,7 @@ bool Gcn::FetchShaderData::Deserialize(Serialization::Archive& ar) {
     fetch.Read(vertex_offset_sgpr);
     fetch.Read(instance_offset_sgpr);
     fetch.Read(attributes);
+    fetch.Read(one_vgprs);
 
     return true;
 }

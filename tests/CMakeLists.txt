@@ -56,6 +56,8 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/opcodes.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/lower_buffer_format_to_raw.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/resource_discover_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/resource_patching_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/shared_memory_barrier_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/patch.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/post_order.cpp
@@ -83,12 +85,14 @@ set(GCN_TEST_SOURCES
     stubs/file_sys_stub.cpp
     stubs/scm_rev_stub.cpp
     stubs/sdl_stub.cpp
+    stubs/shader_info_stub.cpp
     stubs/signals_stub.cpp
 
     # Tests
     gcn/test_buffer_format_lowering.cpp
     gcn/test_dma_fault_bitmap.cpp
     gcn/test_graphics_workarounds.cpp
+    gcn/test_sharp_fetch.cpp
 )
 
 add_executable(shadps4_buffer_cache_test ${BUFFER_CACHE_TEST_SOURCES})

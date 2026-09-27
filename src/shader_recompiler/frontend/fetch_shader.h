@@ -50,11 +50,13 @@ struct VertexAttribute {
 struct FetchShaderData {
     u32 size = 0;
     SmallVector<VertexAttribute, 8> attributes;
+    SmallVector<u8, 4> one_vgprs; ///< VGPRs the fetch shader sets to 1.0 (v_mov_b32 vN, 1.0)
     s8 vertex_offset_sgpr = -1;   ///< SGPR of vertex offset from VADDR
     s8 instance_offset_sgpr = -1; ///< SGPR of instance offset from VADDR
 
     bool operator==(const FetchShaderData& other) const {
-        return attributes == other.attributes && vertex_offset_sgpr == other.vertex_offset_sgpr &&
+        return attributes == other.attributes && one_vgprs == other.one_vgprs &&
+               vertex_offset_sgpr == other.vertex_offset_sgpr &&
                instance_offset_sgpr == other.instance_offset_sgpr;
     }
 

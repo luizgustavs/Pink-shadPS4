@@ -113,7 +113,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
         // v0: vertex ID, always present
         IR::U32 vertex_id = ir.GetAttributeU32(IR::Attribute::VertexId);
         if (base_vertex_sgpr != -1) {
-            if (!fetch_data.Empty() || fetch_data.vertex_offset_sgpr == -1) {
+            if (fetch_data.Empty() || fetch_data.vertex_offset_sgpr == -1) {
                 vertex_id = ir.ISub(vertex_id, ir.GetAttributeU32(IR::Attribute::BaseVertex));
             } else {
                 ASSERT_MSG(fetch_data.vertex_offset_sgpr == base_vertex_sgpr,
@@ -158,7 +158,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
         if (runtime_info.props.num_input_vgprs > 2) {
             IR::U32 instance_id = ir.GetAttributeU32(IR::Attribute::InstanceId);
             if (base_instance_sgpr != -1) {
-                if (!fetch_data.Empty() || fetch_data.instance_offset_sgpr == -1) {
+                if (fetch_data.Empty() || fetch_data.instance_offset_sgpr == -1) {
                     instance_id =
                         ir.ISub(instance_id, ir.GetAttributeU32(IR::Attribute::BaseInstance));
                 } else {
@@ -1185,6 +1185,9 @@ void Translator::EmitFetch(const GcnInst& inst) {
         for (u32 i = 0; i < attrib.num_elements; i++) {
             ir.SetVectorReg(dst_reg++, IR::F32{ir.CompositeExtract(swizzled, i)});
         }
+    }
+    for (const u8 vgpr : fetch_data.one_vgprs) {
+        ir.SetVectorReg(IR::VectorReg(vgpr), ir.Imm32(1.f));
     }
 }
 

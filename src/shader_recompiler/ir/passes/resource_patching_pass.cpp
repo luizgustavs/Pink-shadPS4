@@ -196,7 +196,9 @@ SharpFetch<T> ConstructSharpFetch(const SharpReference& sharp) {
             }
         }
     }
-    if (sharp_fetch.summary != Summary::Invalid) {
+    // An immediate dword has no flat buffer location (its offset stays 0), so it needs the per-dword fetch
+    const u32 all_loaded = (1u << sharp.num_dwords) - 1;
+    if (sharp_fetch.summary != Summary::Invalid && sharp_fetch.load_mask == all_loaded) {
         const u32 base = sharp_fetch.offsets[0];
         for (u32 i = 1; i < sharp.num_dwords; ++i) {
             if (sharp_fetch.offsets[i] - base != i) {
