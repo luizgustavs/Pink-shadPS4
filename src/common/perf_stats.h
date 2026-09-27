@@ -101,6 +101,19 @@ enum class Id : u32 {
     // periodic_flush_commands: submits after N guest commands, and those that cut a render pass
     FlushPeriodic,
     FlushPeriodicInPass,
+    // Frente J probe (J0): readbacks a guest thread's fault asks the command processor for (SendCommand), the
+    // command processor time they take and the guest wait from request to return. write = asked by a write
+    // fault; empty = no GPU-written byte in the window; finish = drained the command buffer being recorded;
+    // current = newest writer in it; page_dirty = the faulting 4 KiB page itself holds GPU-written bytes
+    // (otherwise only the 512 KiB window around it does)
+    GuestReadbacks,
+    GuestReadbackNs,
+    GuestReadbackWaitNs,
+    GuestReadbackWrite,
+    GuestReadbackEmpty,
+    GuestReadbackFinish,
+    GuestReadbackCurrent,
+    GuestReadbackPageDirty,
     // EOP/EOS/RELEASE_MEM writes, their submit-to-write lag and the longest graphics submit queue
     LabelWrites,
     LabelLagNs,

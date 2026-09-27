@@ -228,6 +228,8 @@ private:
     boost::container::small_vector<std::pair<VAddr, u64>, 16> open_writes;
     const bool readback_ahead;
     const bool track_writers;
+    // Frente J probe: the readback being downloaded was asked for by a guest thread's fault
+    bool guest_readback{};
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;

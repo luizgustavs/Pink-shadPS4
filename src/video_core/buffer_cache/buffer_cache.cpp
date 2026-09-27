@@ -196,9 +196,23 @@ void BufferCache::ReleaseCpuAuthoritativeRange(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
-    const auto flush_request = [this, device_addr, size, is_write] {
+    const auto flush_request = [this, device_addr, size, is_write, assume_locks] {
         const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Readbacks,
                                                         Common::PerfStats::Id::ReadbackNs};
+        // J0 probe: requests from guest threads come through SendCommand, the command processor's own
+        // faults run inline
+        guest_readback = !assume_locks && Common::PerfStats::Enabled();
+        std::optional<Common::PerfStats::ScopedTimer> guest_timer;
+        if (guest_readback) {
+            using Common::PerfStats::Id;
+            guest_timer.emplace(Id::GuestReadbacks, Id::GuestReadbackNs);
+            if (is_write) {
+                Common::PerfStats::Add(Id::GuestReadbackWrite);
+            }
+            if (gpu_modified_ranges.Intersects(Common::AlignDown(device_addr, 4_KB), 4_KB)) {
+                Common::PerfStats::Add(Id::GuestReadbackPageDirty);
+            }
+        }
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
@@ -212,6 +226,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         const VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
         DownloadMemory(arena, window_start, window_end - window_start);
+        guest_readback = false;
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
@@ -219,6 +234,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     if (assume_locks) {
         flush_request();
     } else {
+        const Common::PerfStats::ScopedNs wait_timer{Common::PerfStats::Id::GuestReadbackWaitNs};
         liverpool->SendCommand<true>(std::move(flush_request));
     }
 }
@@ -251,6 +267,9 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         InvalidateCleanPages(address, size);
     });
     if (total_size_bytes == 0) {
+        if (guest_readback) {
+            Common::PerfStats::Add(Common::PerfStats::Id::GuestReadbackEmpty);
+        }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
         return;
     }
@@ -265,6 +284,9 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     // sparse binds are only submitted with the current command buffer
     const WriterState writers =
         track_writers ? ClassifyWriters(arena_base, copies) : WriterState::Current;
+    if (guest_readback && writers == WriterState::Current) {
+        Common::PerfStats::Add(Common::PerfStats::Id::GuestReadbackCurrent);
+    }
     if (readback_ahead && writers != WriterState::Current && pending_binds.empty()) {
         const auto cmdbuf = scheduler.BeginAhead();
         const vk::MemoryBarrier2 pre_barrier = {
@@ -296,6 +318,9 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             VerifyAheadCopy(arena, copies, download.mapped, download.offset);
         }
     } else {
+        if (guest_readback) {
+            Common::PerfStats::Add(Common::PerfStats::Id::GuestReadbackFinish);
+        }
         runtime.CopyBuffer(arena, download.buffer, copies);
         scheduler.Finish();
     }

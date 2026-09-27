@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/cp_profiler.h"
 #include "common/thread.h"
 #ifdef _WIN32
 #include "common/ntapi.h"
@@ -257,6 +258,7 @@ static void* RunThread(void* arg) {
     auto* curthread = static_cast<Pthread*>(arg);
     g_curthread = curthread;
     Common::SetCurrentThreadName(curthread->name.c_str());
+    Common::CpProfiler::RegisterGuestThread(curthread->name.c_str());
     DebugState.AddCurrentThreadToGuestList();
     Core::InitializeTLS();
 

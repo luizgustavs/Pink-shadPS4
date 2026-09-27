@@ -8,9 +8,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -280,7 +283,148 @@ void RegisterTarget(const char* variable, const char* filename, const char* name
     std::thread{Sample, target, start_s, duration_s, hz, filename, name}.detach();
 }
 
+// M3b (Frente J): every guest thread, sampled by one shared sampler so that the rate does not scale with the
+// number of threads. The window starts when the first guest thread registers
+struct GuestThread {
+    Target target;
+    std::string name;
+    std::unordered_map<std::vector<u64>, u32, StackHash> stacks;
+    u64 samples = 0;
+    u64 failed = 0;
+};
+
+struct GuestSampler {
+    std::mutex mutex;
+    std::vector<std::unique_ptr<GuestThread>> threads;
+    double start_s = 0.0;
+    double duration_s = 0.0;
+    u32 hz = 250;
+};
+
+void SampleGuests(GuestSampler* sampler) {
+    SetCurrentThreadName("shadPS4:GuestProfiler");
+    std::this_thread::sleep_for(std::chrono::duration<double>(sampler->start_s));
+    const auto modules = LoadModules();
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                          TIMER_ALL_ACCESS);
+    if (!timer) {
+        timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+    }
+    std::array<u64, MaxFrames> frames{};
+    u64 ticks = 0;
+    const auto begin = std::chrono::steady_clock::now();
+    const auto end = begin + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                 std::chrono::duration<double>(sampler->duration_s));
+    LARGE_INTEGER due{};
+    due.QuadPart = -static_cast<LONGLONG>(10'000'000 / sampler->hz);
+    while (std::chrono::steady_clock::now() < end) {
+        SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+        WaitForSingleObject(timer, INFINITE);
+        ++ticks;
+        std::scoped_lock lk{sampler->mutex};
+        for (auto& thread : sampler->threads) {
+            if (SuspendThread(thread->target.thread) == static_cast<DWORD>(-1)) {
+                ++thread->failed;
+                continue;
+            }
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_FULL;
+            u32 count = 0;
+            if (GetThreadContext(thread->target.thread, &ctx)) {
+                Target sample_target = thread->target;
+                if (ctx.Rsp < sample_target.stack_low || ctx.Rsp >= sample_target.stack_high) {
+                    // Guest code runs on the guest stack, not the host one seen at registration
+                    MEMORY_BASIC_INFORMATION region{};
+                    if (VirtualQuery(reinterpret_cast<void*>(ctx.Rsp), &region, sizeof(region)) &&
+                        region.State == MEM_COMMIT) {
+                        sample_target.stack_low = reinterpret_cast<u64>(region.BaseAddress);
+                        sample_target.stack_high = sample_target.stack_low + region.RegionSize;
+                    }
+                }
+                count = Unwind(modules, sample_target, &ctx, frames.data());
+            }
+            ResumeThread(thread->target.thread);
+            if (count == 0) {
+                // An exited thread fails SuspendThread or GetThreadContext; count it as no sample
+                ++thread->failed;
+                continue;
+            }
+            ++thread->samples;
+            ++thread->stacks[std::vector<u64>(frames.begin(), frames.begin() + count)];
+        }
+    }
+    const double elapsed_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    CloseHandle(timer);
+    std::scoped_lock lk{sampler->mutex};
+    std::string index;
+    for (size_t i = 0; i < sampler->threads.size(); ++i) {
+        const auto& thread = *sampler->threads[i];
+        if (thread.samples == 0) {
+            continue;
+        }
+        std::string safe_name = thread.name;
+        for (char& c : safe_name) {
+            if (!std::isalnum(static_cast<unsigned char>(c))) {
+                c = '_';
+            }
+        }
+        const std::string filename = fmt::format("guest_profile_{:03}_{}.txt", i, safe_name);
+        const std::string header = fmt::format(
+            "guest_profile thread={} hz={} start_s={} duration_s={:.3f} ticks={} samples={} "
+            "failed={}",
+            thread.name, sampler->hz, sampler->start_s, elapsed_s, ticks, thread.samples,
+            thread.failed);
+        WriteReport(modules, thread.stacks, header, filename.c_str());
+        index += fmt::format("{} {} {} {}\n", filename, thread.samples, ticks, thread.name);
+    }
+    const auto path = GetUserPath(FS::PathType::LogDir) / "guest_profile_index.txt";
+    if (std::FILE* file = _wfopen(path.c_str(), L"w")) {
+        fmt::print(file, "{}", index);
+        std::fclose(file);
+    }
+}
+
 } // Anonymous namespace
+
+void RegisterGuestThread(const char* name) {
+    static const char* value = std::getenv("SHADPS4_GUEST_PROFILE");
+    if (!value || !*value) {
+        return;
+    }
+    static GuestSampler* sampler = [] {
+        auto* new_sampler = new GuestSampler{};
+        if (std::sscanf(value, "%lf:%lf:%u", &new_sampler->start_s, &new_sampler->duration_s,
+                        &new_sampler->hz) < 2 ||
+            new_sampler->duration_s <= 0.0 || new_sampler->hz == 0 || new_sampler->hz > 2000) {
+            LOG_ERROR(Render_Vulkan, "Harness guest_profile: bad SHADPS4_GUEST_PROFILE '{}'",
+                      value);
+            return static_cast<GuestSampler*>(nullptr);
+        }
+        LOG_WARNING(Render_Vulkan, "Harness guest_profile: all guest threads at {} Hz from {} s for {} s",
+                    new_sampler->hz, new_sampler->start_s, new_sampler->duration_s);
+        std::thread{SampleGuests, new_sampler}.detach();
+        return new_sampler;
+    }();
+    if (!sampler) {
+        return;
+    }
+    auto thread = std::make_unique<GuestThread>();
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                         &thread->target.thread,
+                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                         FALSE, 0)) {
+        return;
+    }
+    ULONG_PTR low = 0;
+    ULONG_PTR high = 0;
+    GetCurrentThreadStackLimits(&low, &high);
+    thread->target.stack_low = low;
+    thread->target.stack_high = high;
+    thread->name = name;
+    std::scoped_lock lk{sampler->mutex};
+    sampler->threads.push_back(std::move(thread));
+}
 
 void RegisterCurrentThread() {
     RegisterTarget("SHADPS4_CP_PROFILE", "cp_profile.txt", "cp_profile");
@@ -309,6 +453,7 @@ void RegisterGameMainThread() {
 namespace Common::CpProfiler {
 
 void RegisterCurrentThread() {}
+void RegisterGuestThread(const char*) {}
 void RegisterGameRenderThread() {}
 void RegisterGameMainThread() {}
 
