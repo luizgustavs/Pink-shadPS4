@@ -223,11 +223,14 @@ void Scheduler::WaitAhead(bool writers_done) {
     const bool perf = Enabled();
     const auto start = perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const vk::Device device = instance.GetDevice();
+    // The status the spin saw is kept: after a device loss a second query may not report it again
+    vk::Result spin_status = vk::Result::eNotReady;
     const bool spun = SpinUntil(wait_spin_us, [&] {
-        return device.getFenceStatus(*ahead_fence) != vk::Result::eNotReady;
+        spin_status = device.getFenceStatus(*ahead_fence);
+        return spin_status != vk::Result::eNotReady;
     });
     const auto wait_result =
-        spun ? device.getFenceStatus(*ahead_fence)
+        spun ? spin_status
              : device.waitForFences(*ahead_fence, true, std::numeric_limits<u64>::max());
     if (wait_result == vk::Result::eErrorDeviceLost) {
         instance.ReportDeviceFault("WaitAhead");

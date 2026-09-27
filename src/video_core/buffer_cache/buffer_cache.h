@@ -242,6 +242,11 @@ private:
     std::deque<Buffer> arenas;
     std::vector<ArenaBinds> pending_binds;
     Vulkan::Semaphore memory_semaphore;
+    /// readback_ahead_transfer_queue: a migration binds already-written bytes into the new arena, and only the
+    /// graphics batch submitted with the binds waits for them. A transfer-queue copy through that arena waits
+    /// for this tick too, since the bytes' writer may be older
+    bool migration_binds_pending{};
+    u64 migration_bind_tick{};
 
     struct Backing : public Interval {
         vk::DeviceMemory memory;

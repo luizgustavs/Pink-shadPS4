@@ -294,6 +294,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     u64 wait_tick = 0;
     const WriterState writers =
         track_writers ? ClassifyWriters(arena_base, copies, &wait_tick) : WriterState::Current;
+    wait_tick = std::max(wait_tick, migration_bind_tick);
     if (guest_readback && writers == WriterState::Current) {
         Common::PerfStats::Add(Common::PerfStats::Id::GuestReadbackCurrent);
     }
@@ -690,6 +691,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     const u64 end_block = (first_addr + total_size) >> block_shift;
     auto* new_arena = &arenas.emplace_back(instance, first_addr, total_size, MemoryType::Sparse);
     auto* bind = BindsForArena(new_arena);
+    migration_binds_pending = true;
     resident_ranges.ForEachInRange(base_block, end_block, [&](const Backing& backing) {
         const u64 start = std::max(base_block, backing.start);
         const u64 end = std::min(end_block, backing.end);
@@ -856,6 +858,11 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     };
 
     info.AddWait(signal_sema, signal_tick);
+    if (migration_binds_pending) {
+        // Called from the submit callback: the tick being submitted is the one before the current
+        migration_bind_tick = scheduler.CurrentTick() - 1;
+        migration_binds_pending = false;
+    }
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
     if (submit_result == vk::Result::eErrorDeviceLost) {
         instance.ReportDeviceFault("SubmitPendingArenaBinds");

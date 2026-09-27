@@ -99,7 +99,8 @@ void Semaphore::Wait(u64 tick) {
     if (IsFree(tick)) {
         return;
     }
-    if (SpinUntil(spin_us, [&] {
+    // A tick not submitted yet cannot signal while polling (pending ops wait on the recording tick)
+    if (tick < CurrentTick() && SpinUntil(spin_us, [&] {
             Refresh();
             return IsFree(tick);
         })) {

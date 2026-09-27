@@ -411,14 +411,17 @@ bool Instance::CreateDevice() {
         .pQueuePriorities = queue_priorities.data(),
     };
     u32 queue_info_count = 1;
-    // readback_ahead_transfer_queue: a family with transfer but neither graphics nor compute is the copy
-    // engine, which runs beside the graphics queue instead of timeslicing with it
+    // readback_ahead_transfer_queue: a family with transfer and nothing else (sparse binding and protected
+    // aside) is the copy engine, which runs beside the graphics queue instead of timeslicing with it. Video
+    // and optical-flow families may also expose transfer, on a slower engine
     std::optional<u32> transfer_family;
     if (EmulatorSettings.IsReadbackAhead() && EmulatorSettings.IsReadbackAheadTransferQueue()) {
+        constexpr vk::QueueFlags allowed = vk::QueueFlagBits::eTransfer |
+                                           vk::QueueFlagBits::eSparseBinding |
+                                           vk::QueueFlagBits::eProtected;
         for (std::size_t i = 0; i < family_properties.size(); i++) {
             const auto flags = family_properties[i].queueFlags;
-            if ((flags & vk::QueueFlagBits::eTransfer) &&
-                !(flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute))) {
+            if ((flags & vk::QueueFlagBits::eTransfer) && !(flags & ~allowed)) {
                 transfer_family = static_cast<u32>(i);
                 break;
             }

@@ -178,7 +178,14 @@ bool AbToggleFollows(std::string_view key) {
     std::string_view list{env};
     while (!list.empty()) {
         const size_t comma = list.find(',');
-        if (list.substr(0, comma) == key) {
+        std::string_view item = list.substr(0, comma);
+        while (!item.empty() && item.front() == ' ') {
+            item.remove_prefix(1);
+        }
+        while (!item.empty() && item.back() == ' ') {
+            item.remove_suffix(1);
+        }
+        if (item == key) {
             return true;
         }
         list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
