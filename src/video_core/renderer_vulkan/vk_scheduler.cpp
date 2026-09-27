@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <bit>
+#include <chrono>
+#include <limits>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -128,6 +130,80 @@ void Scheduler::Finish() {
     // The tick was just submitted, so Wait() would never flush; waiting on the semaphore directly keeps
     // Finish out of the vk_wait counters
     work_semaphore.Wait(presubmit_tick);
+}
+
+vk::CommandBuffer Scheduler::BeginAhead() {
+    const vk::Device device = instance.GetDevice();
+    if (!ahead_pool) {
+        const vk::CommandPoolCreateInfo pool_info = {
+            .flags = vk::CommandPoolCreateFlagBits::eTransient |
+                     vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+            .queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex(),
+        };
+        auto [pool_result, pool] = device.createCommandPoolUnique(pool_info);
+        ASSERT_MSG(pool_result == vk::Result::eSuccess, "Failed to create the ahead pool: {}",
+                   vk::to_string(pool_result));
+        ahead_pool = std::move(pool);
+        const vk::CommandBufferAllocateInfo alloc_info = {
+            .commandPool = *ahead_pool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = 1,
+        };
+        auto [alloc_result, cmdbufs] = device.allocateCommandBuffers(alloc_info);
+        ASSERT_MSG(alloc_result == vk::Result::eSuccess,
+                   "Failed to allocate the ahead command buffer: {}", vk::to_string(alloc_result));
+        ahead_cmdbuf = cmdbufs[0];
+        auto [fence_result, fence] = device.createFenceUnique({});
+        ASSERT_MSG(fence_result == vk::Result::eSuccess, "Failed to create the ahead fence: {}",
+                   vk::to_string(fence_result));
+        ahead_fence = std::move(fence);
+    } else {
+        Check(device.resetFences(*ahead_fence));
+    }
+    Check(ahead_cmdbuf.reset());
+    Check(ahead_cmdbuf.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    }));
+    return ahead_cmdbuf;
+}
+
+void Scheduler::SubmitAhead() {
+    Check(ahead_cmdbuf.end());
+    const vk::SubmitInfo submit_info = {
+        .commandBufferCount = 1U,
+        .pCommandBuffers = &ahead_cmdbuf,
+    };
+    std::scoped_lock lk{submit_mutex};
+    const auto submit_result = instance.GetGraphicsQueue().submit(submit_info, *ahead_fence);
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceFault("SubmitAhead");
+    }
+    ASSERT_MSG(submit_result == vk::Result::eSuccess, "Ahead submit failed: {}",
+               vk::to_string(submit_result));
+}
+
+void Scheduler::WaitAhead(bool writers_done) {
+    using namespace Common::PerfStats;
+    const bool perf = Enabled();
+    const auto start = perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto wait_result =
+        instance.GetDevice().waitForFences(*ahead_fence, true, std::numeric_limits<u64>::max());
+    if (wait_result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceFault("WaitAhead");
+    }
+    ASSERT_MSG(wait_result == vk::Result::eSuccess, "Ahead wait failed: {}",
+               vk::to_string(wait_result));
+    if (perf) {
+        const u64 ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+        Add(Id::ReadbackAhead);
+        Add(Id::ReadbackAheadNs, ns);
+        if (writers_done) {
+            Add(Id::ReadbackAheadIdle);
+            Add(Id::ReadbackAheadIdleNs, ns);
+        }
+    }
 }
 
 void Scheduler::Wait(u64 tick) {

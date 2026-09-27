@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <span>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -134,6 +135,10 @@ public:
         clean_map_generation.fetch_add(1, std::memory_order_release);
     }
 
+    /// Idea B: the command that uses the written bindings obtained since the last call has been recorded,
+    /// so their writes belong to the current command buffer from now on
+    void CloseGpuWrites();
+
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 
@@ -171,6 +176,17 @@ private:
     /// gpu_modified_ranges changed in [addr, addr + size): drop the clean pages there
     void InvalidateCleanPages(VAddr addr, u64 size);
 
+    enum class WriterState { Current, Busy, Done };
+    /// Idea B: stores [addr, addr + size) as written by the command buffer being recorded. `open`: a
+    /// binding whose command is not recorded yet, and may land in a later command buffer (CloseGpuWrites)
+    void RecordGpuWrite(VAddr addr, u64 size, bool open = false);
+    /// Newest writer of the bytes a readback copies (srcOffset relative to `arena_base`)
+    WriterState ClassifyWriters(VAddr arena_base, std::span<const vk::BufferCopy> copies);
+    /// SHADPS4_READBACK_AHEAD_VERIFY: copies the bytes again after a Finish and compares them with the
+    /// ahead copy
+    void VerifyAheadCopy(const Buffer* arena, std::span<const vk::BufferCopy> copies,
+                         const u8* ahead_data, u64 ahead_offset);
+
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     Vulkan::Runtime& runtime;
@@ -202,6 +218,16 @@ private:
     u32 loop_cap_hits_minute{};
     std::chrono::steady_clock::time_point loop_cap_last_check{};
     std::chrono::steady_clock::time_point loop_cap_last_report{};
+
+    // Idea B: GPU writes to arena memory per command buffer tick, newest last; only the last few ticks
+    struct TickWrites {
+        u64 tick;
+        RangeSet ranges;
+    };
+    std::deque<TickWrites> writer_ticks;
+    boost::container::small_vector<std::pair<VAddr, u64>, 16> open_writes;
+    const bool readback_ahead;
+    const bool track_writers;
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;

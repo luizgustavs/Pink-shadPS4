@@ -86,6 +86,18 @@ enum class Id : u32 {
     // bpe_heap_guard: guards built for readbacks and the build time
     HeapGuardBuilds,
     HeapGuardBuildNs,
+    // Idea B probe (B0): newest GPU writer of the bytes a readback copies, in the command buffer being
+    // recorded (or a binding not yet closed by its command), or in one already submitted (busy = still
+    // running when the readback starts)
+    ReadbackWriterCurrent,
+    ReadbackWriterOld,
+    ReadbackWriterOldBusy,
+    // Idea B (readback_ahead): readbacks copied by a command buffer submitted ahead of the current one, and
+    // the wait for it; idle = every writer had already completed
+    ReadbackAhead,
+    ReadbackAheadNs,
+    ReadbackAheadIdle,
+    ReadbackAheadIdleNs,
     // EOP/EOS/RELEASE_MEM writes, their submit-to-write lag and the longest graphics submit queue
     LabelWrites,
     LabelLagNs,

@@ -371,6 +371,18 @@ public:
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
 
+    /// Idea B (readback_ahead): begins a command buffer that SubmitAhead() sends ahead of the current one, on
+    /// the same queue. It runs after every earlier submission but before the commands recorded so far, which
+    /// stay open. Only one can be in flight: the caller waits with WaitAhead() before the next
+    [[nodiscard]] vk::CommandBuffer BeginAhead();
+
+    /// Submits the command buffer of BeginAhead() without touching the current one
+    void SubmitAhead();
+
+    /// Waits for the command buffer sent by SubmitAhead(). `writers_done`: the copied bytes had no writer
+    /// still running, so the wait is only the copy and the submit latency (perf counters)
+    void WaitAhead(bool writers_done);
+
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
 
@@ -513,6 +525,10 @@ private:
     u32 gpu_timing_next{};
     s32 gpu_timing_open{-1};
     double gpu_timestamp_period_ns{};
+
+    vk::UniqueCommandPool ahead_pool;
+    vk::CommandBuffer ahead_cmdbuf;
+    vk::UniqueFence ahead_fence;
 };
 
 } // namespace Vulkan

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <magic_enum/magic_enum.hpp>
@@ -62,7 +63,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       loop_cap_buffer{instance, 0, 256, MemoryType::HostCached, "Loop Cap Buffer"},
-      memory_semaphore{instance} {
+      readback_ahead{EmulatorSettings.IsReadbackAhead()},
+      track_writers{readback_ahead || Common::PerfStats::Enabled()}, memory_semaphore{instance} {
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -102,6 +104,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     loop_cap_buffer.Flush(0, loop_cap_buffer.SizeBytes());
     if (const u32 cap = EmulatorSettings.GetComputeLoopCap()) {
         LOG_WARNING(Render_Vulkan, "Workaround compute_loop_cap enabled: {} back edges", cap);
+    }
+    if (readback_ahead) {
+        LOG_WARNING(Render_Vulkan, "Workaround readback_ahead enabled");
     }
 }
 
@@ -254,8 +259,46 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
     }
-    runtime.CopyBuffer(arena, download.buffer, copies);
-    scheduler.Finish();
+    // Idea B (readback_ahead): when no copied byte has a writer in the command buffer being recorded, the
+    // copy goes into a command buffer submitted ahead of it. Its barrier orders it after every earlier
+    // submission, so only the recorded commands are skipped, and they write none of these bytes. Pending
+    // sparse binds are only submitted with the current command buffer
+    const WriterState writers =
+        track_writers ? ClassifyWriters(arena_base, copies) : WriterState::Current;
+    if (readback_ahead && writers != WriterState::Current && pending_binds.empty()) {
+        const auto cmdbuf = scheduler.BeginAhead();
+        const vk::MemoryBarrier2 pre_barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &pre_barrier,
+        });
+        cmdbuf.copyBuffer(arena->Handle(), download.buffer->Handle(), copies);
+        const vk::MemoryBarrier2 host_barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &host_barrier,
+        });
+        scheduler.SubmitAhead();
+        scheduler.WaitAhead(writers == WriterState::Done);
+        static const bool verify = std::getenv("SHADPS4_READBACK_AHEAD_VERIFY") != nullptr;
+        if (verify) {
+            download.buffer->Invalidate(download.offset, download.size);
+            VerifyAheadCopy(arena, copies, download.mapped, download.offset);
+        }
+    } else {
+        runtime.CopyBuffer(arena, download.buffer, copies);
+        scheduler.Finish();
+    }
 
     download.buffer->Invalidate(download.offset, download.size);
     // Per-game bpe_heap_guard: GPU output of dispatches running on stale descriptors must not overwrite the
@@ -313,6 +356,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             gpu_modified_ranges.Add(lo, len);
             InvalidateCleanPages(lo, len);
         }
+        RecordGpuWrite(device_addr, size, true);
     }
     return {arena, arena->Offset(device_addr)};
 }
@@ -376,6 +420,119 @@ void BufferCache::InvalidateCleanPages(VAddr addr, u64 size) {
         if (page.page_addr == index << CleanPageBits) {
             page.page_addr = ~0ULL;
         }
+    }
+}
+
+void BufferCache::RecordGpuWrite(VAddr addr, u64 size, bool open) {
+    if (!track_writers || size == 0) {
+        return;
+    }
+    if (open) {
+        open_writes.emplace_back(addr, size);
+        return;
+    }
+    // A readback only needs to know whether the writer is in the current tick; older ticks are kept for
+    // the busy/done split of the probe
+    constexpr size_t TrackedTicks = 8;
+    const u64 tick = scheduler.CurrentTick();
+    if (writer_ticks.empty() || writer_ticks.back().tick != tick) {
+        if (writer_ticks.size() == TrackedTicks) {
+            auto recycled = std::move(writer_ticks.front());
+            writer_ticks.pop_front();
+            recycled.ranges.Clear();
+            recycled.tick = tick;
+            writer_ticks.push_back(std::move(recycled));
+        } else {
+            writer_ticks.emplace_back().tick = tick;
+        }
+    }
+    writer_ticks.back().ranges.Add(addr, size);
+}
+
+void BufferCache::CloseGpuWrites() {
+    // The tick is taken after the command is recorded, so a stored tick is never older than the real one
+    for (const auto& [addr, size] : open_writes) {
+        RecordGpuWrite(addr, size);
+    }
+    open_writes.clear();
+}
+
+BufferCache::WriterState BufferCache::ClassifyWriters(VAddr arena_base,
+                                                      std::span<const vk::BufferCopy> copies) {
+    using Common::PerfStats::Id;
+    const auto overlaps = [&](VAddr lo, u64 size) {
+        return std::ranges::any_of(copies, [&](const vk::BufferCopy& copy) {
+            const VAddr copy_lo = arena_base + copy.srcOffset;
+            return lo < copy_lo + copy.size && copy_lo < lo + size;
+        });
+    };
+    const auto intersects = [&](const RangeSet& ranges) {
+        return std::ranges::any_of(copies, [&](const vk::BufferCopy& copy) {
+            return ranges.Intersects(arena_base + copy.srcOffset, copy.size);
+        });
+    };
+    if (std::ranges::any_of(open_writes,
+                            [&](const auto& write) { return overlaps(write.first, write.second); })) {
+        Common::PerfStats::Add(Id::ReadbackWriterCurrent);
+        return WriterState::Current;
+    }
+    const u64 current = scheduler.CurrentTick();
+    for (auto it = writer_ticks.rbegin(); it != writer_ticks.rend(); ++it) {
+        if (!intersects(it->ranges)) {
+            continue;
+        }
+        if (it->tick == current) {
+            Common::PerfStats::Add(Id::ReadbackWriterCurrent);
+            return WriterState::Current;
+        }
+        Common::PerfStats::Add(Id::ReadbackWriterOld);
+        if (!scheduler.IsFree(it->tick)) {
+            Common::PerfStats::Add(Id::ReadbackWriterOldBusy);
+            return WriterState::Busy;
+        }
+        return WriterState::Done;
+    }
+    // Written before the tracked ticks
+    Common::PerfStats::Add(Id::ReadbackWriterOld);
+    return WriterState::Done;
+}
+
+void BufferCache::VerifyAheadCopy(const Buffer* arena, std::span<const vk::BufferCopy> copies,
+                                  const u8* ahead_data, u64 ahead_offset) {
+    // Gate only: every ahead copy also pays the Finish it was meant to avoid. Nothing was recorded since
+    // the ahead copy, so a byte that differs after the Finish had a writer the tracking missed
+    static u64 checks = 0;
+    static u64 mismatches = 0;
+    static auto last_report = std::chrono::steady_clock::now();
+    u64 total = 0;
+    for (const auto& copy : copies) {
+        total = std::max<u64>(total, copy.dstOffset - ahead_offset + copy.size);
+    }
+    const auto check = staging_pool.Request(total, VideoCore::MemoryType::HostCached);
+    boost::container::small_vector<vk::BufferCopy, 1> check_copies(copies.begin(), copies.end());
+    for (auto& copy : check_copies) {
+        copy.dstOffset = copy.dstOffset - ahead_offset + check.offset;
+    }
+    runtime.CopyBuffer(arena, check.buffer, check_copies);
+    scheduler.Finish();
+    check.buffer->Invalidate(check.offset, check.size);
+    ++checks;
+    for (const auto& copy : copies) {
+        const u64 offset = copy.dstOffset - ahead_offset;
+        if (std::memcmp(ahead_data + offset, check.mapped + offset, copy.size) == 0) {
+            continue;
+        }
+        ++mismatches;
+        if (mismatches <= 16) {
+            LOG_ERROR(Render_Vulkan, "Readback ahead verify: mismatch at {:#x} ({:#x} bytes), tick {}",
+                      arena->cpu_addr + copy.srcOffset, copy.size, scheduler.CurrentTick());
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_report >= std::chrono::minutes{1}) {
+        LOG_WARNING(Render_Vulkan, "Readback ahead verify: {} ahead copies checked, {} mismatches",
+                    checks, mismatches);
+        last_report = now;
     }
 }
 
@@ -534,6 +691,7 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
         if (*type == TextureCache::MetaType::HTile) {
             static constexpr u32 ZmaskUncompressed = 0xf;
             runtime.FillBuffer(arena, arena->Offset(device_addr), size, ZmaskUncompressed);
+            RecordGpuWrite(device_addr, size);
             return true;
         } else {
             LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));
@@ -576,6 +734,7 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
     }
     auto& tile_manager = texture_cache.GetTileManager();
     tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
+    RecordGpuWrite(device_addr, std::max<u64>(size, image.info.guest_size));
     return true;
 }
 
@@ -639,6 +798,7 @@ void BufferCache::FlushSyncBatch(bool from_scheduler) {
     Common::PerfStats::Add(Common::PerfStats::Id::BufferUploadBytes, total_size_bytes);
     const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
     for (auto& copy : copies) {
+        RecordGpuWrite(copy.dstOffset, copy.size);
         memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
         Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Upload,
                                           copy.dstOffset, copy.size,

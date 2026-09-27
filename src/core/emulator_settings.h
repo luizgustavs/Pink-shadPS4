@@ -465,6 +465,9 @@ struct GPUSettings {
     // Compare cached shader code bytes the GPU never wrote through the backing, keeping their page protected,
     // instead of reading back a page shared with a GPU-written buffer and draining the GPU
     Setting<bool> shader_code_clean_reads{false};
+    // Copy a readback in a command buffer submitted ahead of the one being recorded when none of its
+    // bytes has a writer there, instead of submitting and draining the whole batch recorded so far
+    Setting<bool> readback_ahead{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -510,6 +513,7 @@ struct GPUSettings {
                                        &GPUSettings::srt_walker_clean_reads),
             make_override<GPUSettings>("shader_code_clean_reads",
                                        &GPUSettings::shader_code_clean_reads),
+            make_override<GPUSettings>("readback_ahead", &GPUSettings::readback_ahead),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -525,7 +529,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    lds_barrier_uniform_readlane, early_fragment_tests_from_z_order,
                                    lod_stats_from_bindings, dynamic_tsharp_array_size,
                                    wave64_uniform_branches, gpu_checkpoints,
-                                   srt_walker_clean_reads, shader_code_clean_reads)
+                                   srt_walker_clean_reads, shader_code_clean_reads,
+                                   readback_ahead)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -823,6 +828,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, GpuCheckpoints, gpu_checkpoints)
     SETTING_FORWARD_BOOL(m_gpu, SrtWalkerCleanReads, srt_walker_clean_reads)
     SETTING_FORWARD_BOOL(m_gpu, ShaderCodeCleanReads, shader_code_clean_reads)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackAhead, readback_ahead)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {
