@@ -220,6 +220,7 @@ private:
     const u32 periodic_flush_commands;
     // cp_recording_cuts: IsMapped answers from a per-thread cache of mapped runs
     const bool recording_cuts;
+    const bool recording_cuts_toggle; ///< cp_recording_cuts follows SHADPS4_AB_TOGGLE
     std::array<u32, 256> lod_stats_uses{};
     u64 lod_stats_packets_minute{};
     u64 lod_stats_banks_minute{};

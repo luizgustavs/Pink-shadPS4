@@ -506,7 +506,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
       lod_stats_enabled{EmulatorSettings.IsLodStatsFromBindings()},
       periodic_flush_commands{EmulatorSettings.GetPeriodicFlushCommands()},
-      recording_cuts{EmulatorSettings.IsCpRecordingCuts()} {
+      recording_cuts{EmulatorSettings.IsCpRecordingCuts()},
+      recording_cuts_toggle{Common::PerfStats::AbToggleFollows("cp_recording_cuts")} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -2284,7 +2285,7 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
         // Memory range wrapped the address space, cannot be mapped.
         return false;
     }
-    if (recording_cuts) {
+    if (recording_cuts && Common::PerfStats::AbToggleOn(recording_cuts_toggle)) {
         return IsMappedCached(addr, addr + size);
     }
     const auto range = decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);

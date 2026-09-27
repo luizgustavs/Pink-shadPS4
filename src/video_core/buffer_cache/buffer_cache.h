@@ -269,6 +269,7 @@ private:
     /// lists, so this stays true until the batch is flushed or a range becomes resident
     bool dma_sync_covered{};
     const bool recording_cuts;
+    const bool recording_cuts_toggle; ///< cp_recording_cuts follows SHADPS4_AB_TOGGLE
     /// dma_sweep_skip_stacks: the sweep leaves stack ranges out, so it no longer covers a range that stops
     /// being a stack; dma_sync_covered holds only while the stack ranges are those of the last sweep
     const bool sweep_skip_stacks;

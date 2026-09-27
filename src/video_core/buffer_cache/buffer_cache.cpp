@@ -67,6 +67,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       readback_ahead{EmulatorSettings.IsReadbackAhead()},
       track_writers{readback_ahead || Common::PerfStats::Enabled()}, memory_semaphore{instance},
       recording_cuts{EmulatorSettings.IsCpRecordingCuts()},
+      recording_cuts_toggle{Common::PerfStats::AbToggleFollows("cp_recording_cuts")},
       sweep_skip_stacks{EmulatorSettings.IsDmaSweepSkipStacks()},
       sweep_skip_toggle{Common::PerfStats::AbToggleFollows("dma_sweep_skip_stacks")} {
     const vk::BufferCreateInfo probe_ci = {
@@ -608,7 +609,8 @@ void BufferCache::SynchronizeDmaBuffers() {
     const u64 stack_generation = skip_stacks ? memory->StackRangesGeneration() : 0;
     // Every compute dispatch that uses DMA lands here, and re-adding all resident ranges to a batch that
     // already covers them changes nothing: SyncRange::Dominant keeps written ranges written
-    if (recording_cuts && dma_sync_covered && stack_generation == dma_sync_stack_generation) {
+    if (recording_cuts && Common::PerfStats::AbToggleOn(recording_cuts_toggle) && dma_sync_covered &&
+        stack_generation == dma_sync_stack_generation) {
         return;
     }
     dma_sync_covered = true;
