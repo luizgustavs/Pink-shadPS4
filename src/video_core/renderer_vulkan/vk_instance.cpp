@@ -430,8 +430,12 @@ bool Instance::CreateDevice() {
                 .pQueuePriorities = queue_priorities.data(),
             };
         } else {
-            LOG_WARNING(Render_Vulkan, "readback_ahead_transfer_queue: no transfer-only queue family");
+            LOG_WARNING(Render_Vulkan, "readback_ahead_transfer_queue: the device has no transfer-only "
+                                       "queue family, so the key has no effect");
         }
+    } else if (EmulatorSettings.IsReadbackAheadTransferQueue()) {
+        LOG_WARNING(Render_Vulkan, "readback_ahead_transfer_queue without readback_ahead: there are no "
+                                   "ahead copies to move, so the key has no effect");
     }
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();

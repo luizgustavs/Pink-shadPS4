@@ -541,6 +541,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
                                        "loss (WriteInvalid) was seen in this combination");
         }
     }
+    if (const u32 spin_us = EmulatorSettings.GetWaitSpinUs(); spin_us != 0) {
+        LOG_WARNING(Render_Vulkan, "Workaround wait_spin_us enabled: poll up to {} us before waits",
+                    spin_us);
+    }
     scheduler.SkipRedundantPipelineBinds(EmulatorSettings.IsGpuOverheadCuts());
 }
 

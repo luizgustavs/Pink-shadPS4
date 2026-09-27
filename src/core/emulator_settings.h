@@ -521,10 +521,13 @@ struct GPUSettings {
     // sense with cpu_authoritative_stacks: without it no stack is registered and the sweep is the same
     Setting<bool> dma_sweep_skip_stacks{false};
     // Poll the GPU for up to this many microseconds before a blocking semaphore/fence wait (0 = off): the
-    // thread wakes tens of microseconds after the GPU signals, and most readback waits are that short
+    // thread wakes tens of microseconds after the GPU signals, and most readback waits are that short. Each
+    // wait that polls burns a CPU core for up to this long
     Setting<u32> wait_spin_us{0};
     // readback_ahead copies go to a transfer-only queue (the copy engine) and wait on the GPU only for the
-    // newest writer of the copied bytes, instead of behind everything submitted to the graphics queue
+    // newest writer of the copied bytes, instead of behind everything submitted to the graphics queue.
+    // Needs readback_ahead and a transfer-only queue family (no effect otherwise); buffers are then created
+    // shared (CONCURRENT) between the graphics and transfer families
     Setting<bool> readback_ahead_transfer_queue{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
