@@ -111,6 +111,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     if (readback_ahead) {
         LOG_WARNING(Render_Vulkan, "Workaround readback_ahead enabled");
     }
+    if (sweep_skip_stacks && !EmulatorSettings.IsCpuAuthoritativeStacks()) {
+        LOG_WARNING(Render_Vulkan, "dma_sweep_skip_stacks without cpu_authoritative_stacks: no "
+                                   "stack is registered, so the DMA sweep is unchanged");
+    }
 }
 
 BufferCache::~BufferCache() = default;

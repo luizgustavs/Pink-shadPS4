@@ -517,7 +517,8 @@ struct GPUSettings {
     // pipeline the command buffer already has bound
     Setting<bool> gpu_overhead_cuts{false};
     // Leave guest stacks out of the DMA sync sweep: stack pages are never write-watched, so every sweep
-    // re-uploaded all resident stack bytes. Explicit bindings that cover a stack still upload it
+    // re-uploaded all resident stack bytes. Explicit bindings that cover a stack still upload it. Only makes
+    // sense with cpu_authoritative_stacks: without it no stack is registered and the sweep is the same
     Setting<bool> dma_sweep_skip_stacks{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
