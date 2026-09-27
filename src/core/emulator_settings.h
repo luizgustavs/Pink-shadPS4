@@ -220,6 +220,9 @@ struct GeneralSettings {
     // Per-game workaround: mount user/game_logs/<serial> writable at /app0/logs so games that
     // write their own engine log next to the executable can do so.
     Setting<bool> redirect_app0_logs{false};
+    // Processor affinity mask applied to the whole process at startup (0 = leave it alone). On a two-CCD
+    // Ryzen, the CCD with the faster cores (0xFFFF on a 9950X) is ~10 % faster than landing on the other one
+    Setting<u64> cpu_affinity_mask{0};
 
     // return a vector of override descriptors (runtime, but tiny)
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -248,7 +251,9 @@ struct GeneralSettings {
             make_override<GeneralSettings>("signaling_info", &GeneralSettings::signaling_info),
             make_override<GeneralSettings>("enable_upnp", &GeneralSettings::enable_upnp),
             make_override<GeneralSettings>("redirect_app0_logs",
-                                           &GeneralSettings::redirect_app0_logs)};
+                                           &GeneralSettings::redirect_app0_logs),
+            make_override<GeneralSettings>("cpu_affinity_mask",
+                                           &GeneralSettings::cpu_affinity_mask)};
     }
 };
 
@@ -259,7 +264,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_
                                    trophy_notification_side, connected_to_network,
                                    discord_rpc_enabled, show_fps_counter, console_language,
                                    big_picture_scale, shadnet_server, shadnet_webapi_server,
-                                   signaling_info, enable_upnp, redirect_app0_logs)
+                                   signaling_info, enable_upnp, redirect_app0_logs,
+                                   cpu_affinity_mask)
 
 // -------------------------------
 // Log settings
@@ -794,6 +800,7 @@ public:
     SETTING_FORWARD(m_general, SignalingInfo, signaling_info)
     SETTING_FORWARD_BOOL(m_general, UPnPEnabled, enable_upnp)
     SETTING_FORWARD_BOOL(m_general, RedirectApp0Logs, redirect_app0_logs)
+    SETTING_FORWARD(m_general, CpuAffinityMask, cpu_affinity_mask)
 
     // Log settings
     SETTING_FORWARD_BOOL(m_log, LogAppend, append)
