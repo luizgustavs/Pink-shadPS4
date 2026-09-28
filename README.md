@@ -5,9 +5,9 @@ The focus is Windows with NVIDIA graphics cards. I do not have the means to test
 
 # DOWNLOAD
 
-[![Download latest release](https://img.shields.io/badge/Download-Latest%20Release-pink?style=for-the-badge)](https://github.com/luizgustavs/Pink-shadPS4/releases/download/release/Pink-shadPS4.0.1.0.zip)
+[![Download latest release](https://img.shields.io/badge/Download-Latest%20Release-pink?style=for-the-badge)](https://github.com/luizgustavs/Pink-shadPS4/releases/download/0.2.0/Pink-shardPS4.0.2.0.zip)
 
-[Download Pink-shadPS4 0.1.0 ZIP](https://github.com/luizgustavs/Pink-shadPS4/releases/download/release/Pink-shadPS4.0.1.0.zip)
+[Download Pink-shardPS4 0.2.0 ZIP](https://github.com/luizgustavs/Pink-shadPS4/releases/download/0.2.0/Pink-shardPS4.0.2.0.zip)
 
 The ZIP already includes the launcher and emulator with specific settings for the game. Use the launcher included in this version; other launchers won't enable the required workarounds.
 
