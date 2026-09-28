@@ -377,9 +377,7 @@ public:
     /// stay open. Only one can be in flight: the caller waits with WaitAhead() before the next
     [[nodiscard]] vk::CommandBuffer BeginAhead();
 
-    /// Submits the command buffer of BeginAhead() without touching the current one. With
-    /// readback_ahead_transfer_queue it goes to the transfer queue and waits on the GPU only until the
-    /// timeline reaches `wait_tick` (the newest writer of the copied bytes), not behind everything submitted
+    /// Submits the ahead command buffer after its latest writer
     void SubmitAhead(u64 wait_tick);
 
     /// Waits for the command buffer sent by SubmitAhead(). `writers_done`: the copied bytes had no writer
@@ -416,7 +414,7 @@ public:
         return is_rendering;
     }
 
-    /// Idea B (periodic_flush_commands): counts a guest draw or dispatch recorded since the last submit
+    /// Counts guest commands recorded since the last submit
     void CountRecordedCommand() noexcept {
         ++commands_since_submit;
     }
@@ -439,10 +437,7 @@ public:
         return sessions.back().primary;
     }
 
-    /// Binds a pipeline to the current command buffer. With SkipRedundantPipelineBinds() on (Idea G), a bind of
-    /// the pipeline the command buffer already has at that bind point is dropped: ~70 % of the rasterizer's
-    /// ~7 k binds per frame in the SotC sanctuary. Every bind on this scheduler's command buffer must come
-    /// through here or be followed by InvalidatePipelineBinds()
+    /// Binds a pipeline and skips duplicates when enabled
     void BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline) {
         auto& bound = bound_pipelines[point == vk::PipelineBindPoint::eCompute ? 1 : 0];
         if (skip_redundant_binds && bound == pipeline &&
@@ -454,7 +449,7 @@ public:
         CommandBuffer().bindPipeline(point, pipeline);
     }
 
-    /// Forgets the tracked binds after a pipeline bound directly on the current command buffer
+    /// Clears tracked binds after a direct pipeline bind
     void InvalidatePipelineBinds() noexcept {
         bound_pipelines = {};
     }
@@ -576,7 +571,7 @@ private:
         vk::UniqueCommandPool pool;
         vk::CommandBuffer cmdbuf;
     };
-    /// Graphics-family and transfer-family (readback_ahead_transfer_queue) ahead command buffers
+    /// Ahead command buffers for graphics and transfer queues
     std::array<AheadSlot, 2> ahead_slots;
     vk::CommandBuffer ahead_cmdbuf;
     bool ahead_on_transfer{};

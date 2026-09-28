@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <optional>
 #include <queue>
 #include <unordered_set>
 #include "common/logging/classes.h"
@@ -131,15 +132,104 @@ static IR::Inst* FindBallotForMaskedBitCount(const IR::Inst& mbcnt) {
     return inst->GetOpcode() == IR::Opcode::Ballot ? inst : nullptr;
 }
 
+static const IR::Inst* SkipBitCasts(const IR::Value& value) {
+    if (value.IsImmediate()) {
+        return nullptr;
+    }
+    const IR::Inst* inst = value.Inst();
+    while (inst->GetOpcode() == IR::Opcode::BitCastU32F32 ||
+           inst->GetOpcode() == IR::Opcode::BitCastF32U32) {
+        if (inst->Arg(0).IsImmediate()) {
+            return nullptr;
+        }
+        inst = inst->Arg(0).Inst();
+    }
+    return inst;
+}
+
+/// Identity of the reduction step that produced value, when value = op(x, ShuffleXor(x, k))
+static std::optional<u32> ReductionIdentity(const IR::Value& value) {
+    const IR::Inst* op = SkipBitCasts(value);
+    if (!op || op->NumArgs() != 2) {
+        return std::nullopt;
+    }
+    bool is_step = false;
+    for (u32 arg = 0; arg < 2; ++arg) {
+        const IR::Inst* shuffle = SkipBitCasts(op->Arg(arg));
+        const IR::Inst* other = SkipBitCasts(op->Arg(1 - arg));
+        is_step |= shuffle && other && shuffle->GetOpcode() == IR::Opcode::ShuffleXor &&
+                   SkipBitCasts(shuffle->Arg(0)) == other;
+    }
+    if (!is_step) {
+        return std::nullopt;
+    }
+    switch (op->GetOpcode()) {
+    case IR::Opcode::FPMin32:
+        return 0x7f800000u; // +inf
+    case IR::Opcode::FPMax32:
+        return 0xff800000u; // -inf
+    case IR::Opcode::FPMul32:
+        return 0x3f800000u; // 1.0
+    case IR::Opcode::UMin32:
+    case IR::Opcode::BitwiseAnd32:
+        return 0xffffffffu;
+    case IR::Opcode::SMin32:
+        return 0x7fffffffu;
+    case IR::Opcode::SMax32:
+        return 0x80000000u;
+    case IR::Opcode::IMul32:
+        return 1u;
+    case IR::Opcode::FPAdd32:
+    case IR::Opcode::IAdd32:
+    case IR::Opcode::UMax32:
+    case IR::Opcode::BitwiseOr32:
+    case IR::Opcode::BitwiseXor32:
+        return 0u;
+    default:
+        return std::nullopt;
+    }
+}
+
+// Replace missing upper lanes with the reduction identities used by GCN
+static void ReplaceMissingLaneReads(IR::Program& program, u32 num_threads) {
+    for (IR::Block* block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() != IR::Opcode::ReadLane || !inst.Arg(1).IsImmediate() ||
+                inst.Arg(1).U32() < 32) {
+                continue;
+            }
+            const auto identity = ReductionIdentity(inst.Arg(0));
+            if (!identity) {
+                LOG_WARNING(Render_Recompiler,
+                            "Workaround wave64_missing_lane_identity: shader {:#x} reads lane {} of a "
+                            "{}-thread workgroup outside a known reduction, left as is",
+                            program.info.pgm_hash, inst.Arg(1).U32(), num_threads);
+                continue;
+            }
+            // Report once while compiling the shader
+            LOG_WARNING(Render_Recompiler,
+                        "Workaround wave64_missing_lane_identity: shader {:#x} ReadLane of lane {} "
+                        "replaced with the reduction identity {:#x}",
+                        program.info.pgm_hash, inst.Arg(1).U32(), *identity);
+            inst.ReplaceUsesWithAndRemove(IR::Value{*identity});
+        }
+    }
+}
+
 void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info,
                            const Profile& profile) {
-    if (program.info.hw_stage != HwStage::Compute || profile.subgroup_size == 64) {
+    if (program.info.hw_stage != HwStage::Compute) {
         return;
     }
 
     const auto [size_x, size_y, size_z] = runtime_info.hw.cs.workgroup_size;
     const u32 num_threads = size_x * size_y * size_z;
-    if (num_threads <= 32) {
+    // Read the setting like wave64_uniform_branches: Profile is cached with the pipeline. Also with a 64-wide
+    // host subgroup: lanes 32-63 of a 32-thread workgroup are inactive there
+    if (num_threads <= 32 && EmulatorSettings.IsWave64MissingLaneIdentity()) {
+        ReplaceMissingLaneReads(program, num_threads);
+    }
+    if (profile.subgroup_size == 64 || num_threads <= 32) {
         return;
     }
 

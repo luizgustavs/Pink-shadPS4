@@ -287,10 +287,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
     }
-    // Idea B (readback_ahead): when no copied byte has a writer in the command buffer being recorded, the
-    // copy goes into a command buffer submitted ahead of it. Its barrier orders it after every earlier
-    // submission, so only the recorded commands are skipped, and they write none of these bytes. Pending
-    // sparse binds are only submitted with the current command buffer
+    // Submit the copy ahead when the current command buffer cannot write these bytes
     u64 wait_tick = 0;
     const WriterState writers =
         track_writers ? ClassifyWriters(arena_base, copies, &wait_tick) : WriterState::Current;

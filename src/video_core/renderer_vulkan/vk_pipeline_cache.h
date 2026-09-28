@@ -103,20 +103,19 @@ public:
         return profile;
     }
 
-    /// shader_code_clean_reads: Rasterizer::ReadCleanMemory, set by the rasterizer
+    /// Clean guest memory reader provided by the rasterizer
     std::function<bool(VAddr, void*, u64)> read_clean_memory;
 
 private:
-    /// AmdGpu::SearchBinaryInfo result for one code address, with the guest bytes the search depended on.
-    /// While they are unchanged the search would find the same block, even if the guest replaced the shader
+    /// Cached shader metadata and the guest bytes used to find it
     struct CachedBinaryInfo {
-        // (offset from the code address, size) of each range the search read, and their bytes in order
+        // Search ranges and their bytes in order
         boost::container::small_vector<std::pair<u64, u32>, 2> ranges;
         std::vector<u8> bytes;
         AmdGpu::BinaryInfo info;
     };
 
-    /// shader_code_clean_reads: AmdGpu::GetParams without scanning the shader code on every draw and dispatch
+    /// Gets shader parameters without rescanning unchanged code
     template <typename Program>
     Shader::ShaderParams GetParamsCached(const Program& pgm);
     bool CachedBytesMatch(const u32* code, const CachedBinaryInfo& cached);

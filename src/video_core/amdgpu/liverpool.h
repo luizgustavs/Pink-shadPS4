@@ -249,8 +249,7 @@ private:
     s32 curr_qid{-1};
 };
 
-/// SHADPS4_CBUF_PROBE: the last PM4 packets the command processor ran on every queue, plus the
-/// guest submits, so a dispatch caught with a stale constant buffer shows what came before it
+/// Recent PM4 packets and guest submits used by SHADPS4_CBUF_PROBE
 namespace CpHistory {
 enum Queue : s16 { Ce = -2, De = -1 }; // >= 0: ASC vqid
 /// Set once during static initialization, so a hook costs a load and a branch when the probe is off

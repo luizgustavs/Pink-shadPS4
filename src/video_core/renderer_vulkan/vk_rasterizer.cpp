@@ -447,10 +447,7 @@ void ProbeStaleCbuf(const Shader::Info& cs, Core::MemoryManager* memory,
     }
 }
 
-/// ImageInfo sizes a T# with asserts and table lookups that only hold for layouts real images use. A
-/// garbage T# (SotC: a block-compressed format on a macro-tiled mode, image_info.cpp:184) must be rejected
-/// before ImageInfo is built, or the check itself aborts the process. Returns why, or nullptr if it can be
-/// built
+/// Returns why a texture layout cannot be sized, or null when it is safe
 const char* UnsupportedImageLayout(const AmdGpu::Image& tsharp) {
     const auto tile_mode = tsharp.GetTileMode();
     if (!magic_enum::enum_contains(tile_mode)) {
@@ -1554,8 +1551,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
-    // Checks shared by single images and descriptor array elements. On success `bound_desc` holds the image
-    // description the checks built, which the binding reuses (building it costs ~1 ms per frame in SotC)
+    // Reuse the description built by the shared validation path
     using ImageDesc = VideoCore::TextureCache::ImageDesc;
     const auto is_bindable = [&](const AmdGpu::Image& tsharp, const Shader::ImageResource& image_desc,
                                  std::optional<ImageDesc>& bound_desc) {
@@ -1852,11 +1848,7 @@ static bool IsSampledImageLayout(vk::ImageLayout layout) {
 }
 
 void Rasterizer::RefreshImageDescriptorLayouts() {
-    // A later transition of the same draw (a sampled depth image that is also the depth attachment, a
-    // sampled image also bound as storage) can move a subresource out of the layout its descriptor was
-    // written with. The layout is the one of the backing the view belongs to, even if the image switched
-    // backings since. A layout a sampled image cannot be in (the image is written as an attachment in the
-    // same draw) has no valid choice, so the descriptor keeps the one it had
+    // Refresh sampled descriptors after all transitions in the draw
     for (const auto& ref : image_descriptor_refs) {
         const auto layout = ref.backing->Layout(ref.subres_idx);
         if (IsSampledImageLayout(layout)) {

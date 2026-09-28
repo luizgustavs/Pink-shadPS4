@@ -309,8 +309,7 @@ void EmitContext::DefineWorkgroupIndex() {
 }
 
 void EmitContext::DefineInputs() {
-    // Integer inputs need Flat in a fragment shader (VUID-StandaloneSpirv-Flat-04744) and must not have it
-    // in a vertex shader (VUID-StandaloneSpirv-Flat-06202); it means nothing in the other stages
+    // Subgroup integer inputs are Flat only in fragment shaders
     const bool flat_subgroup_inputs = sw_stage == SwStage::Fragment;
     if (info.uses_lane_id) {
         subgroup_local_invocation_id = DefineVariable(

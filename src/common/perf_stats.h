@@ -96,14 +96,11 @@ enum class Id : u32 {
     // bpe_heap_guard: guards built for readbacks and the build time
     HeapGuardBuilds,
     HeapGuardBuildNs,
-    // Idea B probe (B0): newest GPU writer of the bytes a readback copies, in the command buffer being
-    // recorded (or a binding not yet closed by its command), or in one already submitted (busy = still
-    // running when the readback starts)
+    // Newest writer state for bytes copied by a readback
     ReadbackWriterCurrent,
     ReadbackWriterOld,
     ReadbackWriterOldBusy,
-    // Idea B (readback_ahead): readbacks copied by a command buffer submitted ahead of the current one, and
-    // the wait for it; idle = every writer had already completed
+    // Ahead readbacks and their wait time
     ReadbackAhead,
     ReadbackAheadNs,
     ReadbackAheadIdle,
@@ -111,11 +108,7 @@ enum class Id : u32 {
     // periodic_flush_commands: submits after N guest commands, and those that cut a render pass
     FlushPeriodic,
     FlushPeriodicInPass,
-    // Frente J probe (J0): readbacks a guest thread's fault asks the command processor for (SendCommand), the
-    // command processor time they take and the guest wait from request to return. write = asked by a write
-    // fault; empty = no GPU-written byte in the window; finish = drained the command buffer being recorded;
-    // current = newest writer in it; page_dirty = the faulting 4 KiB page itself holds GPU-written bytes
-    // (otherwise only the 512 KiB window around it does)
+    // Guest fault readbacks, waits and writer state
     GuestReadbacks,
     GuestReadbackNs,
     GuestReadbackWaitNs,
@@ -129,19 +122,16 @@ enum class Id : u32 {
     LabelLagNs,
     LabelLagMaxNs,
     GfxQueueMax,
-    // Frametime audit (2026-09-27): sync-batch upload bytes that lie in guest stacks (CPU-authoritative) and
-    // that belong to ranges bound as GPU-written
+    // Stack and GPU-written bytes in sync uploads
     BufferUploadStackBytes,
     BufferUploadWrittenBytes,
-    // Pipeline binds recorded by the rasterizer, and those binding the pipeline already bound last in the same
-    // command buffer
+    // Pipeline binds and repeated binds in the same command buffer
     PipelineBinds,
     PipelineBindsSame,
-    // DMA syncs that re-add every resident range to the sync batch, and the guest-stack bytes those ranges hold
+    // DMA sweeps and their guest stack bytes
     DmaSweeps,
     DmaSweepStackBytes,
-    // wait_spin_us (K3): blocking waits that polled first, those the GPU finished while polling, the polls, and
-    // the time spent polling (included in the wait timers)
+    // Short GPU wait polling stats
     WaitSpins,
     WaitSpinHits,
     WaitSpinPolls,
@@ -156,10 +146,7 @@ std::atomic<u64>& Slot(Id id);
 extern std::atomic<bool> ab_toggle_on;
 }
 
-/// SHADPS4_AB_TOGGLE=<start_s> (with SHADPS4_PERF_STATS): keys that honour it (gpu_overhead_cuts,
-/// dma_sweep_skip_stacks) run only on every other perf report interval from <start_s> seconds of reports on, so
-/// one run compares both sides without the run-to-run variance; ab_on=1 marks the on intervals. Always true
-/// without the variables
+/// Returns the active side of the in-run A/B toggle
 inline bool AbToggleActive() {
     return Detail::ab_toggle_on.load(std::memory_order_relaxed);
 }

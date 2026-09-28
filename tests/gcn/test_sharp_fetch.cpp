@@ -1,11 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// ConstructSharpFetch (#5112/#5129): a sharp whose dwords sit contiguously in the flat buffer is fetched with a
-// single copy (SingleLoad). A dword that is an immediate has no flat buffer location, so the sharp must keep
-// the per-dword fetch, or SingleLoad copies whatever sits at offset 0 in place of the immediate.
-// ParseFetchShader (#5112): the loads write only their own components, so a v_mov_b32 vN, 1.0 in the fetch
-// shader has to be kept
+// Sharp fetch coverage for contiguous, immediate and constant VGPR cases
 
 #include <array>
 #include <cstring>

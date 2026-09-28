@@ -172,6 +172,39 @@ TEST(Wave64UniformBranches, KeepsDefaultWithSeveralWaves) {
     EmulatorSettings.SetWave64UniformBranches(false);
 }
 
+// wave64_missing_lane_identity: in a 32-thread workgroup, ReadLane(x, 32) of a reduction step x = op(y,
+// ShuffleXor(y, k)) becomes the identity of op (the value lanes 32-63 hold on GCN); any other lane-32 read is
+// left as is (SotC cs 0x87cf9b8a)
+TEST(Wave64MissingLaneIdentity, ReplacesUpperLaneOfReduction) {
+    for (const bool enabled : {false, true}) {
+        EmulatorSettings.SetWave64MissingLaneIdentity(enabled);
+        Info info = MakeComputeInfo();
+        UniformBranchProgram p{info};
+        IR::Inst* sum_read;
+        IR::Inst* plain_read;
+        {
+            IR::IREmitter ir{*p.body};
+            const IR::U32 x = ir.GetAttributeU32(IR::Attribute::LocalInvocationId, 0);
+            const IR::U32 sum{ir.IAdd(x, ir.ShuffleXor(x, ir.Imm32(1u)))};
+            sum_read = ir.ReadLane(sum, ir.Imm32(32u)).Inst();
+            plain_read = ir.ReadLane(x, ir.Imm32(32u)).Inst();
+            (void)ir.IAdd(IR::U32{sum_read}, IR::U32{plain_read});
+        }
+        RuntimeInfo runtime_info = MakeComputeRuntime();
+        runtime_info.hw.cs.workgroup_size = {32, 1, 1};
+        Optimization::LowerWave64BallotPass(p.program, runtime_info, MakeProfile());
+        EXPECT_EQ(sum_read->GetOpcode() == IR::Opcode::ReadLane, !enabled);
+        EXPECT_EQ(plain_read->GetOpcode(), IR::Opcode::ReadLane);
+        const IR::Inst& add = p.body->Instructions().back();
+        ASSERT_EQ(add.GetOpcode(), IR::Opcode::IAdd32);
+        EXPECT_EQ(add.Arg(0).IsImmediate(), enabled);
+        if (enabled) {
+            EXPECT_EQ(add.Arg(0).U32(), 0u);
+        }
+    }
+    EmulatorSettings.SetWave64MissingLaneIdentity(true);
+}
+
 std::vector<u32> EmitEmptyFragment(bool early_tests, bool has_storage, bool has_discard) {
     Info info{};
     info.hw_stage = HwStage::Fragment;

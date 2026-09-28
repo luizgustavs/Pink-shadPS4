@@ -560,11 +560,7 @@ struct SignalImpl : public PageManager::Impl {
         return handled;
     }
 
-    /// Per-game srt_walker_clean_reads: an SRT walker load on the command processor thread faulted on a
-    /// page the tracker protects because it shares a GPU-written buffer. When the loaded bytes themselves
-    /// were never written by the GPU, the load is completed from the physical backing and the page stays
-    /// protected, instead of reading the page back and draining the GPU. SotC's walkers hit this on every
-    /// draw and dispatch
+    /// Completes clean SRT loads from guest backing memory without a GPU readback
     static bool TryCleanWalkerRead(void* context, VAddr addr) {
         const auto load = Shader::DecodeSrtLoad(context);
         if (!load || addr < load->address || addr >= load->address + load->size) {
@@ -575,15 +571,13 @@ struct SignalImpl : public PageManager::Impl {
             return false;
         }
         Shader::CompleteSrtLoad(context, *load, value);
-        // Later walker loads from these pages call SrtWalkerCleanLoad instead of faulting
+        // Let later walker loads try the clean path first
         Shader::MarkSrtCleanPages(load->address, load->size);
         ReportCleanRead(load->address);
         return true;
     }
 
-    /// The exception-free TryCleanWalkerRead, called by generated walker code for loads from pages that
-    /// served a clean read before. On false the walker runs the plain load, which faults into the handlers
-    /// above when it must
+    /// Clean-load callback used by generated walkers before the normal fault path
     static bool PS4_SYSV_ABI SrtWalkerCleanLoad(u64 address, u32 size, u64* out) {
         if (!EmulatorSettings.IsSrtWalkerCleanReads() || !Common::PerfStats::IsGpuThread()) {
             return false;

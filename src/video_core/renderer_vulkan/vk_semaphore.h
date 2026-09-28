@@ -16,8 +16,7 @@ namespace Vulkan {
 class Instance;
 class Scheduler;
 
-/// wait_spin_us: polls `done` for up to `spin_us` microseconds (0 = not at all) before a blocking wait,
-/// returning whether it came true. The thread wakes tens of microseconds after the GPU signals a sleeping wait
+/// Polls briefly before a blocking GPU wait
 bool SpinUntil(u32 spin_us, const std::function<bool()>& done);
 
 class Semaphore {

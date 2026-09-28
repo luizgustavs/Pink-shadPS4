@@ -13,9 +13,7 @@ struct RecursiveLockState {
     int count;
 };
 
-// A thread rarely holds more than a few recursive locks at once, and the command processor takes one on
-// every IsMapped: a small inline table avoids the map node allocation of each outermost lock. The map only
-// holds locks beyond the table
+// Keep common recursive locks inline and spill the rest to the map
 struct RecursiveLockEntry {
     void* mutex;
     RecursiveLockState state;

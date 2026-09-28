@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// LowerBufferFormatToRaw with garbage V#s (FIXES_IMPLEMENTATIONS_TRACKING.md, "LoadBufferFormat: Unsupported
-// buffer data format: FormatUnknown"): formats the lowering has no case for become a null buffer instead of
-// aborting the shader compile
+// Unsupported buffer formats lower as null buffers
 
 #include <algorithm>
 #include <cstring>
@@ -30,7 +28,7 @@ AmdGpu::Buffer MakeVsharp(u32 data_format, u32 num_format) {
     return vsharp;
 }
 
-/// One block with a formatted load (its result stored back) through buffer 0, whose V# comes from immediates
+/// One formatted load and store using an immediate buffer descriptor
 struct FormatProgram {
     Pools pools{};
     Info info{};

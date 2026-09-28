@@ -242,9 +242,7 @@ private:
     std::deque<Buffer> arenas;
     std::vector<ArenaBinds> pending_binds;
     Vulkan::Semaphore memory_semaphore;
-    /// readback_ahead_transfer_queue: a migration binds already-written bytes into the new arena, and only the
-    /// graphics batch submitted with the binds waits for them. A transfer-queue copy through that arena waits
-    /// for this tick too, since the bytes' writer may be older
+    /// Graphics tick that makes migrated arena bindings visible to transfer copies
     bool migration_binds_pending{};
     u64 migration_bind_tick{};
 
@@ -273,18 +271,15 @@ private:
         }
     };
     DomIntervalList<SyncRange> sync_batch{};
-    /// cp_recording_cuts: sync_batch already holds every resident range. Ranges are only ever added to both
-    /// lists, so this stays true until the batch is flushed or a range becomes resident
+    /// Whether the current sync batch already covers every resident range
     bool dma_sync_covered{};
     const bool recording_cuts;
     const bool recording_cuts_toggle; ///< cp_recording_cuts follows SHADPS4_AB_TOGGLE
-    /// dma_sweep_skip_stacks: the sweep leaves stack ranges out, so it no longer covers a range that stops
-    /// being a stack; dma_sync_covered holds only while the stack ranges are those of the last sweep
+    /// Stack generation used by the last covered DMA sweep
     const bool sweep_skip_stacks;
     const bool sweep_skip_toggle;
     u64 dma_sync_stack_generation{};
-    /// dma_sweep_skip_stacks: the resident ranges minus the stacks, rebuilt when a range becomes resident or the
-    /// stack ranges change
+    /// Cached resident ranges with guest stacks removed
     std::vector<std::pair<VAddr, u64>> dma_sweep_pieces;
     u64 dma_sweep_pieces_generation{};
     bool dma_sweep_pieces_valid{};

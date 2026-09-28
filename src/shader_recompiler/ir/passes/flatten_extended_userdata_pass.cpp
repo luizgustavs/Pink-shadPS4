@@ -90,9 +90,7 @@ bool PS4_SYSV_ABI NoCleanLoad(u64, u32, u64*) {
 }
 
 u64* AllocateCleanPages() {
-    // One bit per page of the guest address space (32 MiB), only with srt_walker_clean_reads (the per-game
-    // settings are loaded before the rasterizer first asks for the context); calloc leaves the untouched
-    // pages of such a large block without physical memory
+    // Allocate the clean-page bitmap only when the feature is enabled
     if (!EmulatorSettings.IsSrtWalkerCleanReads()) {
         return nullptr;
     }
@@ -336,10 +334,9 @@ struct PassInfo {
     // Bumped during codegen to assign offsets to readconsts
     u16 dst_off_dw;
 
-    // Per-game srt_walker_clean_reads: guest loads test the clean-page bitmap. Without the key the walker is
-    // the plain loads of before (the key is part of the codegen settings key of the pipeline cache)
+    // Make walker loads test the clean-page bitmap when enabled
     bool clean_loads = false;
-    // Clean-load stub shared by the guest loads of the walker being generated (EmitGuestLoad)
+    // Shared clean-load stub for the current walker
     Xbyak::Label clean_load_stub;
     bool uses_clean_load_stub = false;
 

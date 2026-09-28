@@ -442,8 +442,7 @@ bool Instance::CreateDevice() {
     }
 
     if (!features.drawIndirectFirstInstance) {
-        // The guest's indirect draw arguments live in GPU memory and may carry a non-zero first instance,
-        // which Vulkan only allows with this feature (VUID-VkDrawIndirectCommand-firstInstance-00501)
+        // Guest draw arguments may use a non-zero first instance
         LOG_WARNING(Render_Vulkan, "drawIndirectFirstInstance unsupported; indirect draws with a "
                                    "non-zero first instance are undefined");
     }

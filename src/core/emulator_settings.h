@@ -217,14 +217,11 @@ struct GeneralSettings {
     Setting<std::string> shadnet_webapi_server{"http://srv.shadps4.net:31315"};
     Setting<std::string> signaling_info{};
     Setting<bool> enable_upnp{true};
-    // Per-game workaround: mount user/game_logs/<serial> writable at /app0/logs so games that
-    // write their own engine log next to the executable can do so.
+    // Redirect /app0/logs to writable per-game storage
     Setting<bool> redirect_app0_logs{false};
-    // Processor affinity mask applied to the whole process at startup (0 = leave it alone). On a two-CCD
-    // Ryzen, the CCD with the faster cores (0xFFFF on a 9950X) is ~10 % faster than landing on the other one
+    // Process affinity mask, or 0 to leave it unchanged
     Setting<u64> cpu_affinity_mask{0};
-    // One 125 Hz input timer instead of four 250 Hz ones (one per pad slot), pushing the state of the first slot
-    // (keyboard and main pad) and of slots with a pad connected. The SDL timer thread's cost follows its wake rate
+    // Poll the keyboard slot and connected pads from one 125 Hz timer
     Setting<bool> poll_connected_pads_only{false};
 
     // return a vector of override descriptors (runtime, but tiny)
@@ -396,12 +393,11 @@ struct AudioSettings {
     Setting<std::string> openal_padSpk_output_device{"Default Device"};
     Setting<u32> openal_hrtf{OpenALHrtfMode::HrtfAuto};
     Setting<u32> openal_output_mode{OpenALOutputMode::OutputAuto};
-    // Plays audio at the game's speed: measured guest flips/s over the target frame rate, so a
-    // 30 fps game running at 7.5 fps plays audio at 0.25x (lower pitch). Off by default.
+    // Match audio speed and pitch to the measured guest frame rate
     Setting<bool> audio_follow_game_speed{false};
-    // Lowest playback speed in percent (clamped to 5-100).
+    // Lowest playback speed in percent, clamped to 5-100
     Setting<u32> audio_min_game_speed{10};
-    // Target frame rate; 0 = derive it from sceVideoOutSetFlipRate (60 / (rate + 1)).
+    // Target frame rate, or 0 to use sceVideoOutSetFlipRate
     Setting<u32> audio_game_target_fps{0};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -493,41 +489,28 @@ struct GPUSettings {
     Setting<u32> dynamic_tsharp_array_size{0};
     // Treat branches on LDS-exchanged values as uniform when lowering ReadLane and Ballot
     Setting<bool> wave64_uniform_branches{false};
+    // Use GCN reduction identities for lanes missing from small host workgroups
+    Setting<bool> wave64_missing_lane_identity{true};
     // Record GPU commands and submits to identify the first unfinished submit after device loss
     // Add NVIDIA checkpoints when available; recording adds a small cost per command
     Setting<bool> gpu_checkpoints{false};
-    // Serve SRT walker reads of bytes the GPU never wrote from guest memory, keeping the page protected,
-    // instead of reading back a page shared with a GPU-written buffer and draining the GPU
+    // Read clean SRT data from guest memory without draining the GPU
     Setting<bool> srt_walker_clean_reads{false};
-    // Compare cached shader code bytes the GPU never wrote through the backing, keeping their page protected,
-    // instead of reading back a page shared with a GPU-written buffer and draining the GPU
+    // Compare clean shader code through guest backing memory
     Setting<bool> shader_code_clean_reads{false};
-    // Copy a readback in a command buffer submitted ahead of the one being recorded when none of its
-    // bytes has a writer there, instead of submitting and draining the whole batch recorded so far
+    // Submit safe readbacks ahead of the command buffer being recorded
     Setting<bool> readback_ahead{false};
-    // Submit without waiting after this many guest draws/dispatches (0 = off), so the GPU runs the frame
-    // while it is recorded instead of at the readback drains. Use it only with readback_ahead: the fork lost
-    // the device once (WriteInvalid) with 128 and readback_ahead off; with readback_ahead and 64 it held
+    // Submit after this many guest commands without waiting, or keep it off with 0
     Setting<u32> periodic_flush_commands{0};
-    // Command processor recording cuts (Idea E): lock-free cache of GPU-mapped runs for IsMapped, and
-    // skip re-adding every resident range to the sync batch when a DMA sync since the last flush covered it
+    // Cache mapped runs and skip DMA ranges already in the sync batch
     Setting<bool> cp_recording_cuts{false};
-    // GPU overhead cuts (Idea G): detile textures uploaded from guest memory out of VRAM instead of reading
-    // the host staging buffer across PCIe with the detiler's scattered loads, and drop pipeline binds of the
-    // pipeline the command buffer already has bound
+    // Detile host textures from VRAM and skip duplicate pipeline binds
     Setting<bool> gpu_overhead_cuts{false};
-    // Leave guest stacks out of the DMA sync sweep: stack pages are never write-watched, so every sweep
-    // re-uploaded all resident stack bytes. Explicit bindings that cover a stack still upload it. Only makes
-    // sense with cpu_authoritative_stacks: without it no stack is registered and the sweep is the same
+    // Leave registered guest stacks out of bulk DMA sweeps
     Setting<bool> dma_sweep_skip_stacks{false};
-    // Poll the GPU for up to this many microseconds before a blocking semaphore/fence wait (0 = off): the
-    // thread wakes tens of microseconds after the GPU signals, and most readback waits are that short. Each
-    // wait that polls burns a CPU core for up to this long
+    // Poll before blocking GPU waits for this many microseconds, or keep it off with 0
     Setting<u32> wait_spin_us{0};
-    // readback_ahead copies go to a transfer-only queue (the copy engine) and wait on the GPU only for the
-    // newest writer of the copied bytes, instead of behind everything submitted to the graphics queue.
-    // Needs readback_ahead and a transfer-only queue family (no effect otherwise); buffers are then created
-    // shared (CONCURRENT) between the graphics and transfer families
+    // Run ahead readbacks on a transfer-only queue when one is available
     Setting<bool> readback_ahead_transfer_queue{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
@@ -569,6 +552,8 @@ struct GPUSettings {
                                        &GPUSettings::dynamic_tsharp_array_size),
             make_override<GPUSettings>("wave64_uniform_branches",
                                        &GPUSettings::wave64_uniform_branches),
+            make_override<GPUSettings>("wave64_missing_lane_identity",
+                                       &GPUSettings::wave64_missing_lane_identity),
             make_override<GPUSettings>("gpu_checkpoints", &GPUSettings::gpu_checkpoints),
             make_override<GPUSettings>("srt_walker_clean_reads",
                                        &GPUSettings::srt_walker_clean_reads),
@@ -598,7 +583,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    cpu_authoritative_stacks, bpe_heap_guard_address,
                                    lds_barrier_uniform_readlane, early_fragment_tests_from_z_order,
                                    lod_stats_from_bindings, dynamic_tsharp_array_size,
-                                   wave64_uniform_branches, gpu_checkpoints,
+                                   wave64_uniform_branches, wave64_missing_lane_identity,
+                                   gpu_checkpoints,
                                    srt_walker_clean_reads, shader_code_clean_reads,
                                    readback_ahead, periodic_flush_commands,
                                    cp_recording_cuts, gpu_overhead_cuts, dma_sweep_skip_stacks,
@@ -904,6 +890,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, LodStatsFromBindings, lod_stats_from_bindings)
     SETTING_FORWARD(m_gpu, DynamicTsharpArraySize, dynamic_tsharp_array_size)
     SETTING_FORWARD_BOOL(m_gpu, Wave64UniformBranches, wave64_uniform_branches)
+    SETTING_FORWARD_BOOL(m_gpu, Wave64MissingLaneIdentity, wave64_missing_lane_identity)
     SETTING_FORWARD_BOOL(m_gpu, GpuCheckpoints, gpu_checkpoints)
     SETTING_FORWARD_BOOL(m_gpu, SrtWalkerCleanReads, srt_walker_clean_reads)
     SETTING_FORWARD_BOOL(m_gpu, ShaderCodeCleanReads, shader_code_clean_reads)

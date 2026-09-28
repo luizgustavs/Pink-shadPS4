@@ -12,10 +12,7 @@
 
 namespace Core {
 
-/// Guest stack ranges with a registration count per range (fiber contexts can live inside a thread
-/// stack). Almost every query asks about memory with no stack at all: an empty query remembers, per
-/// thread, the gap between the neighbouring stack segments, validated by the generation that every
-/// change bumps
+/// Guest stack ranges with a small per-thread cache for stack-free gaps
 class StackRangeSet {
 public:
     using Pieces = boost::container::small_vector<std::pair<VAddr, u64>, 4>;
@@ -48,10 +45,10 @@ private:
 
     RangeMap ranges;
     mutable std::shared_mutex mutex;
-    // Lets every query return without locking while no range was ever added
+    // Skip locking until the first range is added
     std::atomic<bool> has_ranges{false};
     std::atomic<u64> generation{0};
-    // Keys the per-thread gap cache: unlike the address, never reused by another set
+    // Stable key for the per-thread gap cache
     const u64 id;
 };
 

@@ -95,7 +95,7 @@ void RecordPacket(s16 queue, std::span<const u32> packet) {
     auto& entry = entries[next_entry.fetch_add(1, std::memory_order_relaxed) % NumEntries];
     const auto* pm4 = reinterpret_cast<const PM4Header*>(packet.data());
     const u32* body = packet.data() + 1;
-    // A truncated last packet must not read past the submission (the next page may be unmapped)
+    // Keep truncated packets inside the submission
     const u32 count = std::min<u32>({pm4->type3.NumWords(), static_cast<u32>(packet.size() - 1), 4});
     entry.ns = NowNs();
     entry.header = packet.data();

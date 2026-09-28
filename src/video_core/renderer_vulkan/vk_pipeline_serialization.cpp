@@ -39,7 +39,8 @@ u64 CodegenSettingsKey() {
            (u64{Shader::DynamicTsharpArraySize()} << 35) | // 7 bits, at most 64
            (u64{EmulatorSettings.IsWave64UniformBranches()} << 42) |
            (u64{EmulatorSettings.IsInlineFetchShader()} << 43) |
-           (u64{EmulatorSettings.IsSrtWalkerCleanReads()} << 44); // SRT walker code
+           (u64{EmulatorSettings.IsSrtWalkerCleanReads()} << 44) | // SRT walker code
+           (u64{EmulatorSettings.IsWave64MissingLaneIdentity()} << 45);
 }
 } // namespace
 

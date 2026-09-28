@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// Helpers of the tests that emit SPIR-V: a flat instruction walk and, with SHADPS4_TEST_SPIRV_DIR set, a dump
-// of the module for spirv-val
+// SPIR-V test helpers with optional module dumps for spirv-val
 
 #pragma once
 

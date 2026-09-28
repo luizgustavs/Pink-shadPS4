@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// Vulkan / SPIR-V conformance of the recompiler output (§9 of the SotC port guide), checked on hand-built IR
-// without a GPU. With SHADPS4_TEST_SPIRV_DIR set, the emitted modules are written there so
-// spirv-val --target-env vulkan1.3 can check them
+// Vulkan SPIR-V checks built from small IR programs without a GPU
 
 #include <algorithm>
 #include <functional>

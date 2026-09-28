@@ -31,7 +31,7 @@ std::mutex port_allocation_mutex;
 static std::unique_ptr<AudioOutBackend> audio;
 static std::atomic<int> lazy_init{0};
 
-// Audio follows game speed: flips/s measured over a window, divided by the target frame rate.
+// Measure game speed from guest flips over a short window
 static constexpr u64 GAME_SPEED_WINDOW_US = 500'000;
 // A window stretched this long by a gap between flips (loading, a hitch) restarts instead of
 // counting as speed
@@ -196,7 +196,7 @@ void NotifyGuestFlip(s32 flip_rate) {
                    1.0f);
     const double fps = game_speed_window_flips * 1'000'000.0 / static_cast<double>(elapsed);
     const float measured = std::clamp(static_cast<float>(fps / target_fps), min_speed, 1.0f);
-    // Halfway per window: follows real changes within ~1 s without wobbling the pitch every frame.
+    // Smooth changes without making the pitch wobble each frame
     const float previous = game_speed.load(std::memory_order_relaxed);
     const float speed = previous + (measured - previous) * 0.5f;
     game_speed.store(speed, std::memory_order_relaxed);
