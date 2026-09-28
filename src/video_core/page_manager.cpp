@@ -537,8 +537,10 @@ struct SignalImpl : public PageManager::Impl {
             }
             return true;
         }
-        bool handled = is_write ? rasterizer->InvalidateMemory(addr, 8, is_gpu_thread)
-                                : rasterizer->ReadMemory(addr, 8, is_gpu_thread);
+        // The probe stays within the faulting page: the next one may not be mapped for the GPU (#5150)
+        const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
+        bool handled = is_write ? rasterizer->InvalidateMemory(addr, size, is_gpu_thread)
+                                : rasterizer->ReadMemory(addr, size, is_gpu_thread);
         if (handled && EmulatorSettings.IsPreserveSplitProtection()) {
             const Common::PerfStats::ScopedTimer repair_timer{
                 Common::PerfStats::Id::FaultRepairCalls, Common::PerfStats::Id::FaultRepairNs};
