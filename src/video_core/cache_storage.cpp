@@ -203,22 +203,22 @@ void DataBase::Close() {
 template <typename T>
 bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v) {
     {
-        auto request = std::packaged_task<void()>{[=]() {
-            auto path{path_};
-            path.replace_extension(GetBlobFileExtension(type));
-            if (EmulatorSettings.IsPipelineCacheArchived()) {
-                ASSERT_MSG(!ar_is_read_only,
-                           "The archive is read-only. Did you forget to call `FinishPreload`?");
-                if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), v.data(),
-                                           v.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
-                    LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
+        auto request =
+            std::packaged_task<void()>{[type, path = std::move(path_), v = std::move(v)]() mutable {
+                path.replace_extension(GetBlobFileExtension(type));
+                if (EmulatorSettings.IsPipelineCacheArchived()) {
+                    ASSERT_MSG(!ar_is_read_only,
+                               "The archive is read-only. Did you forget to call `FinishPreload`?");
+                    if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), v.data(),
+                                               v.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
+                        LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
+                    }
+                } else {
+                    using namespace Common::FS;
+                    const auto file = IOFile{path, FileAccessMode::Create};
+                    file.Write(v);
                 }
-            } else {
-                using namespace Common::FS;
-                const auto file = IOFile{path, FileAccessMode::Create};
-                file.Write(v);
-            }
-        }};
+            }};
         std::scoped_lock lock{m_request};
         req_queue.emplace(std::move(request));
     }
