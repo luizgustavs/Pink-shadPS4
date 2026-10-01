@@ -502,7 +502,8 @@ struct GPUSettings {
     Setting<bool> readback_ahead{false};
     // Submit after this many guest commands without waiting, or keep it off with 0
     Setting<u32> periodic_flush_commands{0};
-    // Cache mapped runs and skip DMA ranges already in the sync batch
+    // Cache mapped runs used by IsMapped while dma_sync_once_per_batch handles skipping repeated
+    // DMA range sweeps separately
     Setting<bool> cp_recording_cuts{false};
     // Detile host textures from VRAM and skip duplicate pipeline binds
     Setting<bool> gpu_overhead_cuts{false};
@@ -515,6 +516,9 @@ struct GPUSettings {
     // Answer IsMapped from a table of mapped 16 KB pages so common buffer checks can avoid taking
     // the shared lock
     Setting<bool> mapped_page_table{false};
+    // Add resident DMA ranges once per sync batch because later DMA syncs in the same batch would
+    // add the same ranges again
+    Setting<bool> dma_sync_once_per_batch{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -573,6 +577,8 @@ struct GPUSettings {
             make_override<GPUSettings>("readback_ahead_transfer_queue",
                                        &GPUSettings::readback_ahead_transfer_queue),
             make_override<GPUSettings>("mapped_page_table", &GPUSettings::mapped_page_table),
+            make_override<GPUSettings>("dma_sync_once_per_batch",
+                                       &GPUSettings::dma_sync_once_per_batch),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -592,7 +598,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    srt_walker_clean_reads, shader_code_clean_reads,
                                    readback_ahead, periodic_flush_commands,
                                    cp_recording_cuts, gpu_overhead_cuts, dma_sweep_skip_stacks,
-                                   wait_spin_us, readback_ahead_transfer_queue, mapped_page_table)
+                                   wait_spin_us, readback_ahead_transfer_queue, mapped_page_table,
+                                   dma_sync_once_per_batch)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -906,6 +913,7 @@ public:
     SETTING_FORWARD(m_gpu, WaitSpinUs, wait_spin_us)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackAheadTransferQueue, readback_ahead_transfer_queue)
     SETTING_FORWARD_BOOL(m_gpu, MappedPageTable, mapped_page_table)
+    SETTING_FORWARD_BOOL(m_gpu, DmaSyncOncePerBatch, dma_sync_once_per_batch)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

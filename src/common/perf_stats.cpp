@@ -114,6 +114,7 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::PipelineBindsSame, "pipeline_binds_same", Unit::Count},
     {Id::DmaSweeps, "dma_sweeps", Unit::Count},
     {Id::DmaSweepStackBytes, "dma_sweep_stack_kb", Unit::Kb},
+    {Id::DmaSweepsSkipped, "dma_sweeps_skipped", Unit::Count},
     {Id::WaitSpins, "wait_spins", Unit::Count},
     {Id::WaitSpinHits, "wait_spin_hits", Unit::Count},
     {Id::WaitSpinPolls, "wait_spin_polls", Unit::Count},

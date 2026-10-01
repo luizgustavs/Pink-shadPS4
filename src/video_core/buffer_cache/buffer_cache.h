@@ -141,6 +141,9 @@ public:
 
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
+    /// Check that the current sync batch already contains every range a DMA sync would add before
+    /// we skip that sync
+    void VerifyDmaSyncCovered(bool skip_stacks);
 
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
@@ -273,8 +276,11 @@ private:
     DomIntervalList<SyncRange> sync_batch{};
     /// Whether the current sync batch already covers every resident range
     bool dma_sync_covered{};
-    const bool recording_cuts;
-    const bool recording_cuts_toggle; ///< cp_recording_cuts follows SHADPS4_AB_TOGGLE
+    const bool dma_sync_once;
+    const bool dma_sync_once_toggle; ///< Whether dma_sync_once_per_batch is active for this interval of SHADPS4_AB_TOGGLE
+    /// With SHADPS4_DMA_SYNC_ONCE_VERIFY, check every skipped sync against the ranges it would have
+    /// added to the current batch
+    const bool dma_sync_once_verify;
     /// Stack generation used by the last covered DMA sweep
     const bool sweep_skip_stacks;
     const bool sweep_skip_toggle;

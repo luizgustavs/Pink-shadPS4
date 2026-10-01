@@ -66,8 +66,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       loop_cap_buffer{instance, 0, 256, MemoryType::HostCached, "Loop Cap Buffer"},
       readback_ahead{EmulatorSettings.IsReadbackAhead()},
       track_writers{readback_ahead || Common::PerfStats::Enabled()}, memory_semaphore{instance},
-      recording_cuts{EmulatorSettings.IsCpRecordingCuts()},
-      recording_cuts_toggle{Common::PerfStats::AbToggleFollows("cp_recording_cuts")},
+      dma_sync_once{EmulatorSettings.IsDmaSyncOncePerBatch()},
+      dma_sync_once_toggle{Common::PerfStats::AbToggleFollows("dma_sync_once_per_batch")},
+      dma_sync_once_verify{dma_sync_once &&
+                           std::getenv("SHADPS4_DMA_SYNC_ONCE_VERIFY") != nullptr},
       sweep_skip_stacks{EmulatorSettings.IsDmaSweepSkipStacks()},
       sweep_skip_toggle{Common::PerfStats::AbToggleFollows("dma_sweep_skip_stacks")} {
     const vk::BufferCreateInfo probe_ci = {
@@ -116,6 +118,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     if (sweep_skip_stacks && !EmulatorSettings.IsCpuAuthoritativeStacks()) {
         LOG_WARNING(Render_Vulkan, "dma_sweep_skip_stacks without cpu_authoritative_stacks: no "
                                    "stack is registered, so the DMA sweep is unchanged");
+    }
+    if (dma_sync_once) {
+        LOG_WARNING(Render_Vulkan, "Workaround dma_sync_once_per_batch enabled{}",
+                    dma_sync_once_verify ? " (SHADPS4_DMA_SYNC_ONCE_VERIFY)" : "");
     }
 }
 
@@ -612,8 +618,14 @@ void BufferCache::SynchronizeDmaBuffers() {
     const u64 stack_generation = skip_stacks ? memory->StackRangesGeneration() : 0;
     // Every compute dispatch that uses DMA lands here, and re-adding all resident ranges to a batch that
     // already covers them changes nothing: SyncRange::Dominant keeps written ranges written
-    if (recording_cuts && Common::PerfStats::AbToggleOn(recording_cuts_toggle) && dma_sync_covered &&
+    if (dma_sync_once && Common::PerfStats::AbToggleOn(dma_sync_once_toggle) && dma_sync_covered &&
         stack_generation == dma_sync_stack_generation) {
+        if (dma_sync_once_verify) [[unlikely]] {
+            VerifyDmaSyncCovered(skip_stacks);
+        }
+        if (Common::PerfStats::Enabled()) {
+            Common::PerfStats::Add(Common::PerfStats::Id::DmaSweepsSkipped);
+        }
         return;
     }
     dma_sync_covered = true;
@@ -653,6 +665,37 @@ void BufferCache::SynchronizeDmaBuffers() {
                 Common::PerfStats::Add(Common::PerfStats::Id::DmaSweepStackBytes, len);
             }
         }
+    }
+}
+
+void BufferCache::VerifyDmaSyncCovered(bool skip_stacks) {
+    // Only the GPU command processor thread synchronizes DMA buffers here, so the batch tracking
+    // stays on that thread
+    static u64 checks = 0;
+    static u64 mismatches = 0;
+    static auto last_report = std::chrono::steady_clock::now();
+    ++checks;
+    const auto check = [&](VAddr lo, VAddr hi) {
+        if (!sync_batch.Contains(lo, hi) && ++mismatches <= 16) {
+            LOG_ERROR(Render_Vulkan,
+                      "dma_sync_once_per_batch: skipped sync, but the batch does not cover {:#x}-{:#x}",
+                      lo, hi);
+        }
+    };
+    if (skip_stacks) {
+        for (const auto& [lo, len] : dma_sweep_pieces) {
+            check(lo, lo + len);
+        }
+    } else {
+        for (const auto& range : resident_ranges) {
+            check(range.start << block_shift, range.end << block_shift);
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_report >= std::chrono::seconds{60}) {
+        last_report = now;
+        LOG_WARNING(Render_Vulkan, "dma_sync_once_per_batch verify: {} skipped syncs, {} mismatches",
+                    checks, mismatches);
     }
 }
 

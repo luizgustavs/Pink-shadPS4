@@ -131,6 +131,9 @@ enum class Id : u32 {
     // DMA sweeps and their guest stack bytes
     DmaSweeps,
     DmaSweepStackBytes,
+    // Count the DMA range sweeps avoided by dma_sync_once_per_batch after the current sync batch
+    // has already been filled
+    DmaSweepsSkipped,
     // Short GPU wait polling stats
     WaitSpins,
     WaitSpinHits,
