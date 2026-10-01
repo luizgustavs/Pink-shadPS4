@@ -60,6 +60,7 @@ Workarounds can improve specific games but may reduce performance or cause regre
 | `dynamic_tsharp_array_size` | Sets the descriptor-array size for dynamically indexed texture tables; `0` disables it. |
 | `wave64_uniform_branches` | Correctly lowers wave64 lane operations inside workgroup-uniform branches. |
 | `wave64_missing_lane_identity` | Supplies PS4 reduction identity values for wave64 lanes missing on the host GPU. |
+| `lds_barriers_large_groups` | Adds shared-memory barriers to large compute workgroups (fixes the blown-out sun on NVIDIA); on by default. |
 | `gpu_checkpoints` | Records GPU commands and submits to help diagnose device loss, at a performance cost. |
 | `srt_walker_clean_reads` | Reads clean shader-resource-table data from guest memory without draining the GPU. |
 | `shader_code_clean_reads` | Checks clean shader code through guest memory to avoid unnecessary GPU readbacks. |
@@ -69,7 +70,15 @@ Workarounds can improve specific games but may reduce performance or cause regre
 | `wait_spin_us` | Polls GPU waits for this many microseconds before sleeping; `0` disables spinning. |
 | `dma_sweep_skip_stacks` | Excludes guest stacks from bulk DMA synchronization; requires `cpu_authoritative_stacks`. |
 | `gpu_overhead_cuts` | Detiles uploaded textures in VRAM and skips redundant pipeline bindings. |
-| `cp_recording_cuts` | Caches memory lookups and skips repeated DMA syncs, but may cause visual glitches. |
+| `cp_recording_cuts` | Caches memory lookups, but may cause visual glitches. The DMA sync skip moved to `dma_sync_once_per_batch`. |
+| `mapped_page_table` | Answers GPU memory lookups from a lock-free page table instead of a locked search. |
+| `dma_sync_once_per_batch` | Adds the resident buffer ranges to a sync batch only once instead of on every DMA dispatch. |
+| `incremental_bind` | Reuses the previous bindings of a pipeline for unchanged buffers and textures. |
+| `tsharp_cache` | Reuses how a texture descriptor was resolved by any pipeline; changes what the GPU samples, check visually. |
+| `wait_marker` | With `wait_spin_us`, polls a GPU-written value before asking the driver (`1`); `2` also lets readbacks return on it. |
+| `image_memory_pool` | Sub-allocates images up to 16 MB from a memory pool instead of a dedicated allocation each. |
+| `cp_record_thread` | Records Vulkan commands on a separate thread; pairs with `readback_ahead_transfer_queue`. |
+| `eop_label_delay_us` | Crude stopgap for SotC's flickering rocks: delays GPU fence labels by a fixed time (`2000`); `0` disables it. Brings the flicker back with `readback_ahead`. |
 
 ### Other settings used by the SotC presets
 
@@ -83,6 +92,18 @@ These are regular emulator settings stored alongside the workarounds in the ship
 | `readbacks_mode` | Selects the GPU readback accuracy mode; the SotC preset uses precise mode (`2`). |
 | `pipeline_cache_enabled` | Reuses cached Vulkan pipelines to reduce shader compilation stutter. |
 | `windows_guest_red_zone_protection_mode` | Selects the Windows guest red-zone protection strategy. |
+
+### Shader cache
+
+If a game shows a burst of rejected textures, thousands of new shader permutations or a device loss right
+after boot, the shader cache may have been corrupted by an older build (a new permutation could overwrite
+another one on disk). Delete the whole `user/cache/<serial>` folder (or `<serial>.zip`) and let it rebuild.
+
+### Shadow of the Colossus engine settings
+
+Not an emulator setting: adding both `+doIndexBufferCulling=0` and `+doSunShadowIndexBufferCulling=0` to
+`games/<serial>/CommandLineArgs.txt` raised the sanctuary from ~22 to ~28 fps in testing, with the same image.
+Always use the two together; one without the other gives wrong geometry or a device loss.
 
 ### Audio
 
