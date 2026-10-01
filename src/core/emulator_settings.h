@@ -525,6 +525,9 @@ struct GPUSettings {
     // Reuse the last T# resolution from any pipeline while the pages it uses still contain the same
     // registered images
     Setting<bool> tsharp_cache{false};
+    // Check a GPU-written tick in host memory before querying the driver in mode 1, and also allow
+    // readbacks to finish on that marker in mode 2
+    Setting<u32> wait_marker{0};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -587,6 +590,7 @@ struct GPUSettings {
                                        &GPUSettings::dma_sync_once_per_batch),
             make_override<GPUSettings>("incremental_bind", &GPUSettings::incremental_bind),
             make_override<GPUSettings>("tsharp_cache", &GPUSettings::tsharp_cache),
+            make_override<GPUSettings>("wait_marker", &GPUSettings::wait_marker),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -607,7 +611,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    readback_ahead, periodic_flush_commands,
                                    cp_recording_cuts, gpu_overhead_cuts, dma_sweep_skip_stacks,
                                    wait_spin_us, readback_ahead_transfer_queue, mapped_page_table,
-                                   dma_sync_once_per_batch, incremental_bind, tsharp_cache)
+                                   dma_sync_once_per_batch, incremental_bind, tsharp_cache,
+                                   wait_marker)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -924,6 +929,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, DmaSyncOncePerBatch, dma_sync_once_per_batch)
     SETTING_FORWARD_BOOL(m_gpu, IncrementalBind, incremental_bind)
     SETTING_FORWARD_BOOL(m_gpu, TsharpCache, tsharp_cache)
+    SETTING_FORWARD(m_gpu, WaitMarker, wait_marker)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

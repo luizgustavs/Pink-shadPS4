@@ -127,6 +127,9 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::WaitSpinHits, "wait_spin_hits", Unit::Count},
     {Id::WaitSpinPolls, "wait_spin_polls", Unit::Count},
     {Id::WaitSpinNs, "wait_spin_ms", Unit::Ms},
+    {Id::WaitKernelPolls, "wait_kernel_polls", Unit::Count},
+    {Id::WaitMarkerLate, "wait_marker_late", Unit::Count},
+    {Id::WaitMarkerEarly, "wait_marker_early", Unit::Count},
 }};
 
 constexpr bool FieldsMatchIds() {

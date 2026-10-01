@@ -369,6 +369,12 @@ public:
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish();
 
+    /// Finish a readback once its GPU marker arrives in wait_marker mode 2, even if the driver has
+    /// not reported the submit yet
+    /// Keep the known GPU tick unchanged until the driver confirms it so resource reuse still
+    /// follows the timeline
+    void FinishHostRead();
+
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
 
@@ -576,6 +582,9 @@ private:
     vk::CommandBuffer ahead_cmdbuf;
     bool ahead_on_transfer{};
     vk::UniqueFence ahead_fence;
+    u32 ahead_seq{}; ///< Number of ahead submits so far, written into the Ahead marker slot by each copy submission
+    bool ahead_unconfirmed{}; ///< Whether WaitAhead returned on the mode 2 marker while its fence may still need a driver
+///< confirmation
     u64 ahead_submits{}; // gpu_checkpoints: numbers the ahead submits in the submit ledger
     const u32 wait_spin_us;
 };

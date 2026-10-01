@@ -134,6 +134,15 @@ void Scheduler::Finish() {
     work_semaphore.Wait(presubmit_tick);
 }
 
+void Scheduler::FinishHostRead() {
+    const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::VkFinish,
+                                                    Common::PerfStats::Id::VkFinishNs};
+    const u64 presubmit_tick = CurrentTick();
+    SubmitInfo info{};
+    SubmitExecution(info);
+    work_semaphore.WaitHostRead(presubmit_tick);
+}
+
 vk::CommandBuffer Scheduler::BeginAhead() {
     const vk::Device device = instance.GetDevice();
     // readback_ahead_transfer_queue honours SHADPS4_AB_TOGGLE: the off intervals use a graphics-family command
@@ -164,6 +173,17 @@ vk::CommandBuffer Scheduler::BeginAhead() {
                    "Failed to allocate the ahead command buffer: {}", vk::to_string(alloc_result));
         slot.cmdbuf = cmdbufs[0];
     }
+    if (ahead_unconfirmed) {
+        // In wait_marker mode 2, the last copy may be readable before the driver reports its fence
+        // Wait for that fence before resetting it or reusing the command buffer
+        ahead_unconfirmed = false;
+        const auto wait_result =
+            device.waitForFences(*ahead_fence, true, std::numeric_limits<u64>::max());
+        if (wait_result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceFault("BeginAhead");
+        }
+        Check(wait_result);
+    }
     if (!ahead_fence) {
         auto [fence_result, fence] = device.createFenceUnique({});
         ASSERT_MSG(fence_result == vk::Result::eSuccess, "Failed to create the ahead fence: {}",
@@ -181,6 +201,10 @@ vk::CommandBuffer Scheduler::BeginAhead() {
 }
 
 void Scheduler::SubmitAhead(u64 wait_tick) {
+    ++ahead_seq;
+    if (work_semaphore.HasMarker()) {
+        work_semaphore.RecordMarker(ahead_cmdbuf, Semaphore::MarkerSlot::Ahead, ahead_seq);
+    }
     Check(ahead_cmdbuf.end());
     // On the transfer queue, the timeline wait orders the copy after its writer and makes the writes visible;
     // on the graphics queue, submission order and the copy's barrier do
@@ -223,15 +247,44 @@ void Scheduler::WaitAhead(bool writers_done) {
     const bool perf = Enabled();
     const auto start = perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const vk::Device device = instance.GetDevice();
+    // Query the ahead fence only after the command buffer writes its sequence marker
+    // Mode 2 can read the completed copy at that point, but BeginAhead still waits for the fence
+    // before reusing its resources
+    const bool marker = work_semaphore.UseMarker();
+    const bool trust = marker && work_semaphore.TrustMarker();
+    bool late = false;
+    bool early = false;
     // The status the spin saw is kept: after a device loss a second query may not report it again
     vk::Result spin_status = vk::Result::eNotReady;
     const bool spun = SpinUntil(wait_spin_us, [&] {
+        if (marker && !work_semaphore.MarkerReached(Semaphore::MarkerSlot::Ahead, ahead_seq)) {
+            return false;
+        }
+        if (trust) {
+            early = true;
+            return true;
+        }
+        if (perf) {
+            Add(Id::WaitKernelPolls);
+        }
         spin_status = device.getFenceStatus(*ahead_fence);
-        return spin_status != vk::Result::eNotReady;
+        if (spin_status != vk::Result::eNotReady) {
+            return true;
+        }
+        late = marker;
+        return false;
     });
+    if (late && perf) {
+        Add(Id::WaitMarkerLate);
+    }
+    if (early && perf) {
+        Add(Id::WaitMarkerEarly);
+    }
+    ahead_unconfirmed = early;
     const auto wait_result =
-        spun ? spin_status
-             : device.waitForFences(*ahead_fence, true, std::numeric_limits<u64>::max());
+        early  ? vk::Result::eSuccess
+        : spun ? spin_status
+               : device.waitForFences(*ahead_fence, true, std::numeric_limits<u64>::max());
     if (wait_result == vk::Result::eErrorDeviceLost) {
         instance.ReportDeviceFault("WaitAhead");
     }
@@ -319,6 +372,10 @@ void Scheduler::EndSession(u64 submit_tick) {
     EndRendering();
     if (submit_tick != 0) {
         EndGpuTiming(submit_tick);
+        if (work_semaphore.HasMarker()) {
+            work_semaphore.RecordMarker(session.primary, Semaphore::MarkerSlot::Timeline,
+                                        static_cast<u32>(submit_tick));
+        }
     }
     Check(session.primary.end());
 }

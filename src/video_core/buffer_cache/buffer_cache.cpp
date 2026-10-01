@@ -336,7 +336,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             Common::PerfStats::Add(Common::PerfStats::Id::GuestReadbackFinish);
         }
         runtime.CopyBuffer(arena, download.buffer, copies);
-        scheduler.Finish();
+        scheduler.FinishHostRead();
     }
 
     download.buffer->Invalidate(download.offset, download.size);

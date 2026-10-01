@@ -152,6 +152,12 @@ enum class Id : u32 {
     WaitSpinHits,
     WaitSpinPolls,
     WaitSpinNs,
+    // Count driver queries during marker polling and waits where the GPU marker arrived before the
+    // driver reported the tick or fence
+    // For mode 2, also count readback waits that returned as soon as their marker arrived
+    WaitKernelPolls,
+    WaitMarkerLate,
+    WaitMarkerEarly,
     Count,
 };
 
