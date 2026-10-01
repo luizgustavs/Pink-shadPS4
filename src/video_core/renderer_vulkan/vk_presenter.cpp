@@ -468,7 +468,9 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
                EmulatorSettings.IsVkCrashDiagnosticEnabled()},
-      draw_scheduler{instance}, present_scheduler{instance}, flip_scheduler{instance},
+      draw_scheduler{instance, EmulatorSettings.IsCpRecordThread() ||
+                                    Common::PerfStats::AbToggleLists("cp_record_thread")}, present_scheduler{instance},
+      flip_scheduler{instance},
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
@@ -506,6 +508,9 @@ Presenter::~Presenter() {
     ImGui::Friends::Unregister();
     ImGui::Layer::RemoveLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
 
+    // This thread records the last commands for the rasterizer scheduler, so it must take over as
+    // the producer when cp_record_thread is active
+    draw_scheduler.ClaimRecorder();
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
@@ -1072,6 +1077,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         });
     }
 
+    if (frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
+        // The recording thread may still be preparing this frame's submit, so wait until it reaches
+        // the queue before presenting
+        draw_scheduler.WaitSubmitted(frame->ready_tick);
+    }
     SubmitInfo info{};
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddWait(frame->ready_semaphore, frame->ready_tick);

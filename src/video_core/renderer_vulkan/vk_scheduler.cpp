@@ -4,6 +4,9 @@
 #include <bit>
 #include <chrono>
 #include <limits>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -12,16 +15,43 @@
 #include "core/emulator_settings.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
+#include <boost/container/small_vector.hpp>
+
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_recorder.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 
-Scheduler::Scheduler(const Instance& instance)
+namespace {
+/// Tracy GPU zones write commands on the scheduler's calling thread and cannot use fake handles
+/// Keep cp_record_thread disabled when those zones are active so Tracy still records into a real
+/// command buffer
+bool RecorderAllowed(bool record_thread) {
+#if TRACY_GPU_ENABLED
+    if (record_thread) {
+        LOG_ERROR(Render_Vulkan, "cp_record_thread does not work with Tracy GPU zones; it stays off");
+    }
+    return false;
+#else
+    return record_thread;
+#endif
+}
+} // Anonymous namespace
+
+Scheduler::Scheduler(const Instance& instance, bool record_thread)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore},
-      wait_spin_us{EmulatorSettings.GetWaitSpinUs()} {
+      wait_spin_us{EmulatorSettings.GetWaitSpinUs()},
+      recorder{RecorderAllowed(record_thread) ? std::make_unique<CommandRecorder>() : nullptr} {
+    if (recorder) {
+        // During off intervals of SHADPS4_AB_TOGGLE, record commands on this thread with real
+        // handles instead of queuing them for the recorder
+        record_toggle = Common::PerfStats::AbToggleFollows("cp_record_thread");
+        LOG_WARNING(Render_Vulkan, "Workaround cp_record_thread enabled: Vulkan commands are recorded "
+                                   "on their own thread");
+    }
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
@@ -107,6 +137,11 @@ vk::CommandBuffer Scheduler::UploadCommandBuffer() {
     const vk::CommandBufferBeginInfo begin_info = {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     };
+    if (recording) {
+        upload_cmdbuf = recorder->NewFakeHandle();
+        recorder->Run([this, fake = upload_cmdbuf] { BeginRecorded(fake); });
+        return upload_cmdbuf;
+    }
     upload_cmdbuf = command_pool.Commit();
     Check(upload_cmdbuf.begin(begin_info));
     return upload_cmdbuf;
@@ -129,6 +164,9 @@ void Scheduler::Finish() {
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
+    // Wait until the recording thread submits this tick before a host timeline wait, since waiting
+    // on an unsubmitted value may use a slower driver path
+    WaitSubmitted(presubmit_tick);
     // The tick was just submitted, so Wait() would never flush; waiting on the semaphore directly keeps
     // Finish out of the vk_wait counters
     work_semaphore.Wait(presubmit_tick);
@@ -140,6 +178,10 @@ void Scheduler::FinishHostRead() {
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
+    // The marker write ends this tick's submit, but cp_record_thread may still be holding that
+    // submit
+    // Make sure it is queued before wait_marker starts polling for its completion
+    WaitSubmitted(presubmit_tick);
     work_semaphore.WaitHostRead(presubmit_tick);
 }
 
@@ -201,6 +243,14 @@ vk::CommandBuffer Scheduler::BeginAhead() {
 }
 
 void Scheduler::SubmitAhead(u64 wait_tick) {
+    // Make sure the writer's submit reaches the queue before this dependent ahead copy
+    // The graphics queue depends on submission order, and the transfer queue needs the writer's
+    // timeline signal to be submitted first
+    // ClassifyWriters may also return Done for an untracked writer whose tick is still waiting on
+    // the recording thread
+    // That result does not remove the need to ensure its work is queued before the copy starts
+    // depending on it
+    WaitSubmitted(wait_tick);
     ++ahead_seq;
     if (work_semaphore.HasMarker()) {
         work_semaphore.RecordMarker(ahead_cmdbuf, Semaphore::MarkerSlot::Ahead, ahead_seq);
@@ -223,7 +273,15 @@ void Scheduler::SubmitAhead(u64 wait_tick) {
         .commandBufferCount = 1U,
         .pCommandBuffers = &ahead_cmdbuf,
     };
-    std::scoped_lock lk{submit_mutex};
+    // Only this thread submits transfer queue copies, so they do not need the recording thread's
+    // submit mutex
+    // Taking that mutex would delay copies behind unrelated recording submits
+    // Keep the lock when gpu_checkpoints needs it to protect the submission ledger and record the
+    // copy alongside the other queue operations
+    std::unique_lock lk{submit_mutex, std::defer_lock};
+    if (!transfer_queue || !recording || tracks_gpu_commands) {
+        lk.lock();
+    }
     if (tracks_gpu_commands) {
         // gpu_checkpoints: the ahead copy carries no guest command and is queued after the submitted ones (on
         // the transfer queue it only waits for tick wait_tick of them). The previous one was waited for, so it
@@ -243,6 +301,11 @@ void Scheduler::SubmitAhead(u64 wait_tick) {
 }
 
 void Scheduler::WaitAhead(bool writers_done) {
+    if (recording) {
+        // Publish the remaining batch so the recording thread can keep working while this thread
+        // waits for the GPU result
+        recorder->Kick();
+    }
     using namespace Common::PerfStats;
     const bool perf = Enabled();
     const auto start = perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -314,7 +377,94 @@ void Scheduler::Wait(u64 tick) {
         SubmitInfo info{};
         Flush(info);
     }
+    WaitSubmitted(tick);
     work_semaphore.Wait(tick);
+}
+
+void Scheduler::RunOnQueue(Common::UniqueFunction<void>&& func) {
+    // Choose where to run a sparse bind from this submit's mode rather than whether a recorder
+    // exists
+    // When recording is toggled off, queuing the bind on the recorder could put it after the same-
+    // queue submit that waits on it
+    // Run it directly in that mode so the bind reaches the queue before its dependent work
+    if (!recording) {
+        func();
+        return;
+    }
+    recorder->Run([func = std::move(func)]() mutable {
+        std::scoped_lock lk{submit_mutex};
+        func();
+    });
+}
+
+void Scheduler::WaitSubmitted(u64 tick) {
+    if (!recorder) {
+        return;
+    }
+    u64 submitted = recorded_submit_tick.load(std::memory_order_acquire);
+    if (submitted >= tick) [[likely]] {
+        return;
+    }
+    using namespace Common::PerfStats;
+    const bool perf = Enabled();
+    const auto start = perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // The recording thread may still be processing commands before this submit
+    // Spin for a bounded number of checks without reading the clock, then sleep on the atomic if it
+    // has not caught up
+    constexpr u32 SpinCount = 4096;
+    for (u32 spins = 0;
+         spins < SpinCount && (submitted = recorded_submit_tick.load(std::memory_order_acquire)) < tick;
+         ++spins) {
+#if defined(_M_X64) || defined(__x86_64__)
+        _mm_pause();
+#endif
+    }
+    while (submitted < tick) {
+        recorded_submit_tick.wait(submitted, std::memory_order_acquire);
+        submitted = recorded_submit_tick.load(std::memory_order_acquire);
+    }
+    if (perf) {
+        Add(Id::RecorderSubmitWaits);
+        Add(Id::RecorderSubmitWaitNs, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - start)
+                                          .count());
+    }
+}
+
+void Scheduler::SyncRecorder() {
+    if (recorder) {
+        recorder->Sync();
+    }
+}
+
+void Scheduler::ClaimRecorder() {
+    if (recorder) {
+        recorder->ClaimProducer();
+    }
+}
+
+void Scheduler::SelectRecordingMode() {
+    if (!recorder) {
+        return;
+    }
+    const bool on = Common::PerfStats::AbToggleOn(record_toggle);
+    if (on == recording) {
+        return;
+    }
+    if (!on) {
+        // Before switching back, let the recording thread submit all pending work and return
+        // command pool ownership to this thread
+        recorder->Sync();
+    }
+    recording = on;
+}
+
+void Scheduler::BeginRecorded(vk::CommandBuffer fake) {
+    const vk::CommandBuffer real = command_pool.Commit();
+    Check(real.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    }));
+    recorder->Bind(fake, real);
 }
 
 void Scheduler::PopPendingOperations() {
@@ -329,13 +479,23 @@ void Scheduler::PopPendingOperations() {
 void Scheduler::BeginSession() {
     EndSession();
 
+    if (sessions.empty()) {
+        // Choose the recording mode when the first session of a submit begins and keep it fixed
+        // until that submit is complete
+        SelectRecordingMode();
+    }
     auto& session = sessions.emplace_back();
 
-    const vk::CommandBufferBeginInfo begin_info = {
-        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
-    };
-    session.primary = command_pool.Commit();
-    Check(session.primary.begin(begin_info));
+    if (recording) {
+        session.primary = recorder->NewFakeHandle();
+        recorder->Run([this, fake = session.primary] { BeginRecorded(fake); });
+    } else {
+        const vk::CommandBufferBeginInfo begin_info = {
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+        };
+        session.primary = command_pool.Commit();
+        Check(session.primary.begin(begin_info));
+    }
     if (sessions.size() == 1) {
         // First session of a submit
         BeginGpuTiming();
@@ -381,6 +541,10 @@ void Scheduler::EndSession(u64 submit_tick) {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    if (recording) {
+        SubmitRecorded(info);
+        return;
+    }
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
 
@@ -450,12 +614,103 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         instance.ReportDeviceFault("SubmitExecution");
     }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    if (recorder) {
+        // Even while cp_record_thread is toggled off, timeline waits still call WaitSubmitted so
+        // earlier recorded submits cannot be missed
+        recorded_submit_tick.store(signal_value, std::memory_order_release);
+        recorded_submit_tick.notify_all();
+    }
 
     work_semaphore.Refresh();
     CollectGpuTiming();
     BeginSession();
 
-    // Apply pending operations
+    // Apply the pending scheduler operations before queuing this submission so it follows the same
+    // preparation as the immediate path
+    PopPendingOperations();
+}
+
+void Scheduler::SubmitRecorded(SubmitInfo& info) {
+    // Use the same preparation as SubmitExecution on this thread, then place the queue submit in
+    // the recording stream after its commands
+    const u64 signal_value = work_semaphore.NextTick();
+    if (on_submit) {
+        on_submit(info);
+    }
+    EndSession(signal_value);
+
+    boost::container::small_vector<vk::CommandBuffer, 8> fakes;
+    for (const auto& session : sessions) {
+        if (session.upload) {
+            fakes.push_back(session.upload);
+        }
+        fakes.push_back(session.primary);
+    }
+    sessions.clear();
+    commands_since_submit = 0;
+
+    const vk::Semaphore timeline = work_semaphore.Handle();
+    info.AddSignal(timeline, signal_value);
+
+    if (tracks_gpu_commands) {
+        const u64 last_seq = GpuCheckpoints::g_seq.load(std::memory_order_relaxed);
+        GpuCheckpoints::RecordSubmit(std::bit_cast<u64>(static_cast<VkSemaphore>(timeline)),
+                                     signal_value, submitted_seq + 1, last_seq,
+                                     work_semaphore.KnownGpuTick());
+        submitted_seq = last_seq;
+    }
+
+    recorder->Run([this, info, fakes = std::move(fakes), signal_value] {
+        boost::container::small_vector<vk::CommandBuffer, 8> cmd_buffers;
+        for (const vk::CommandBuffer fake : fakes) {
+            cmd_buffers.push_back(recorder->Real(fake));
+        }
+        static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        };
+        const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+            .waitSemaphoreValueCount = info.num_wait_semas,
+            .pWaitSemaphoreValues = info.wait_ticks.data(),
+            .signalSemaphoreValueCount = info.num_signal_semas,
+            .pSignalSemaphoreValues = info.signal_ticks.data(),
+        };
+        const vk::SubmitInfo submit_info = {
+            .pNext = &timeline_si,
+            .waitSemaphoreCount = info.num_wait_semas,
+            .pWaitSemaphores = info.wait_semas.data(),
+            .pWaitDstStageMask = wait_stage_masks.data(),
+            .commandBufferCount = static_cast<u32>(cmd_buffers.size()),
+            .pCommandBuffers = cmd_buffers.data(),
+            .signalSemaphoreCount = info.num_signal_semas,
+            .pSignalSemaphores = info.signal_semas.data(),
+        };
+        vk::Result submit_result;
+        {
+            std::scoped_lock lk{submit_mutex};
+            // ImGui texture uploads submit directly to the queue immediately before this work, as
+            // they do without the recorder
+            // Keep those uploads out of the recording closure so the command processor does not
+            // wait for submit_mutex here
+            ImGui::Core::TextureManager::Submit();
+            submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+        }
+        if (submit_result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceFault("SubmitExecution (recording thread)");
+        }
+        ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+        recorded_submit_tick.store(signal_value, std::memory_order_release);
+        recorded_submit_tick.notify_all();
+        recorder->Retire(static_cast<u32>(fakes.size()));
+    });
+    recorder->Kick();
+
+    work_semaphore.Refresh();
+    CollectGpuTiming();
+    BeginSession();
+
+    // Apply the pending scheduler operations before queuing this submission so it follows the same
+    // preparation as the immediate path
     PopPendingOperations();
 }
 
@@ -545,6 +800,9 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
             priority_pending_ops.pop();
         }
 
+        // This operation's tick may still be waiting on the recording thread, so wait for its
+        // submit before using the timeline result
+        WaitSubmitted(op.gpu_tick);
         work_semaphore.Wait(op.gpu_tick);
         if (stoken.stop_requested()) {
             break;

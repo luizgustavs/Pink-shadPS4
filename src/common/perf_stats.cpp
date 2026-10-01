@@ -131,6 +131,13 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::WaitMarkerLate, "wait_marker_late", Unit::Count},
     {Id::WaitMarkerEarly, "wait_marker_early", Unit::Count},
     {Id::PooledImages, "pooled_images", Unit::Count},
+    {Id::RecorderCommands, "rec_cmds", Unit::Count},
+    {Id::RecorderDrains, "rec_drains", Unit::Count},
+    {Id::RecorderDrainNs, "rec_drain_ms", Unit::Ms},
+    {Id::RecorderBusyNs, "rec_busy_ms", Unit::Ms},
+    {Id::RecorderSubmitWaits, "rec_submit_waits", Unit::Count},
+    {Id::RecorderSubmitWaitNs, "rec_submit_wait_ms", Unit::Ms},
+    {Id::RecorderWakes, "rec_wakes", Unit::Count},
 }};
 
 constexpr bool FieldsMatchIds() {
@@ -180,15 +187,12 @@ const double ab_toggle_start = AbToggleStart();
 
 std::atomic<bool> Detail::ab_toggle_on{ab_toggle_start < 0.0};
 
-bool AbToggleFollows(std::string_view key) {
+bool AbToggleLists(std::string_view key) {
     if (ab_toggle_start < 0.0) {
         return false;
     }
     const char* env = std::getenv("SHADPS4_AB_TOGGLE_KEYS");
-    if (!env || !*env) {
-        return true;
-    }
-    std::string_view list{env};
+    std::string_view list{env ? env : ""};
     while (!list.empty()) {
         const size_t comma = list.find(',');
         std::string_view item = list.substr(0, comma);
@@ -204,6 +208,14 @@ bool AbToggleFollows(std::string_view key) {
         list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
     }
     return false;
+}
+
+bool AbToggleFollows(std::string_view key) {
+    if (ab_toggle_start < 0.0) {
+        return false;
+    }
+    const char* env = std::getenv("SHADPS4_AB_TOGGLE_KEYS");
+    return !env || !*env || AbToggleLists(key);
 }
 
 void OnReportEmitted(double seconds_since_start) {

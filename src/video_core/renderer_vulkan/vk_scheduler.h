@@ -4,7 +4,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -26,6 +28,7 @@ class VkCtxScope;
 namespace Vulkan {
 
 class Instance;
+class CommandRecorder;
 
 struct RenderAttachment {
     vk::ImageView image_view;
@@ -355,7 +358,10 @@ using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 
 class Scheduler {
 public:
-    explicit Scheduler(const Instance& instance);
+    /// Send Vulkan commands and submits through record_thread when cp_record_thread is enabled
+    /// CommandBuffer returns fake handles for that path, with their lifetime managed by the
+    /// recorder described in vk_recorder.h
+    explicit Scheduler(const Instance& instance, bool record_thread = false);
     ~Scheduler();
 
     /// Sends the current execution context to the GPU
@@ -392,6 +398,32 @@ public:
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
+
+    /// Run a queue operation such as a sparse bind in submission order, either immediately or on
+    /// the recording thread under submit_mutex
+    /// Immediate callers already hold that mutex through the submit callback
+    void RunOnQueue(Common::UniqueFunction<void>&& func);
+
+    /// Wait until tick has actually reached the queue before any host wait, marker poll or
+    /// dependent submit from another queue
+    /// A tick closed by the command processor may still be waiting on the recording thread
+    /// Any thread can call this, and it does nothing when recording runs directly
+    /// Check submission before starting those waits so no caller relies on a signal that has not
+    /// been queued yet
+    void WaitSubmitted(u64 tick);
+
+    /// Wait until the cp_record_thread recorder has run all queued operations so later work can use
+    /// their results or safely change ownership
+    void SyncRecorder();
+
+    /// Let the calling thread take over recording on this scheduler when shutdown changes threads
+    /// The previous thread must have stopped recording before this handover so only one producer
+    /// writes to the command stream
+    void ClaimRecorder();
+
+    [[nodiscard]] bool IsRecorded() const noexcept {
+        return recording;
+    }
 
     /// Starts a new rendering scope with provided state.
     void BeginRendering(const RenderState& new_state);
@@ -520,6 +552,19 @@ private:
 
     void SubmitExecution(SubmitInfo& info);
 
+    /// Prepare SubmitExecution on the calling thread and queue its actual submit on the recording
+    /// thread after the recorded commands
+    void SubmitRecorded(SubmitInfo& info);
+
+    /// Allocate and begin the real command buffer on the recording thread, then connect it with the
+    /// fake handle used by the producer
+    void BeginRecorded(vk::CommandBuffer fake);
+
+    /// Choose the next submit mode from cp_record_thread and the current SHADPS4_AB_TOGGLE interval
+    /// Drain the recording thread before returning to real handles so it can hand the command pool
+    /// back safely
+    void SelectRecordingMode();
+
     void PriorityPendingOpsThread(std::stop_token stoken);
 
     void BeginGpuTiming();
@@ -587,6 +632,18 @@ private:
 ///< confirmation
     u64 ahead_submits{}; // gpu_checkpoints: numbers the ahead submits in the submit ledger
     const u32 wait_spin_us;
+
+    /// Keep the newest tick already submitted to the queue, whether by the recorder or directly
+    /// during an interval with the setting off under SHADPS4_AB_TOGGLE
+    std::atomic<u64> recorded_submit_tick{0};
+    /// Remember whether this submit records its command buffers on the recording thread
+    /// Choose that mode at the first session and keep it for the whole submit, including
+    /// SHADPS4_AB_TOGGLE runs
+    bool recording{};
+    bool record_toggle{};
+    /// Keep this as the last member so it is destroyed first and drains its pending work while the
+    /// command pool is still alive
+    std::unique_ptr<CommandRecorder> recorder;
 };
 
 } // namespace Vulkan

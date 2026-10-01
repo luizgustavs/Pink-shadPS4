@@ -324,6 +324,8 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             .memoryBarrierCount = 1,
             .pMemoryBarriers = &host_barrier,
         });
+        // With cp_record_thread, wait until the writer has actually submitted its work before
+        // SubmitAhead queues the copy that depends on it
         scheduler.SubmitAhead(wait_tick);
         scheduler.WaitAhead(writers == WriterState::Done);
         static const bool verify = std::getenv("SHADPS4_READBACK_AHEAD_VERIFY") != nullptr;
@@ -885,32 +887,8 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
         return;
     }
 
-    std::vector<vk::SparseBufferMemoryBindInfo> buffer_binds;
-    buffer_binds.reserve(pending_binds.size());
-
-    for (const auto& binds : pending_binds) {
-        buffer_binds.emplace_back(vk::SparseBufferMemoryBindInfo{
-            .buffer = binds.arena->Handle(),
-            .bindCount = static_cast<u32>(binds.binds.size()),
-            .pBinds = binds.binds.data(),
-        });
-    }
-
     const u64 signal_tick = memory_semaphore.NextTick();
     const auto signal_sema = memory_semaphore.Handle();
-
-    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
-        .signalSemaphoreValueCount = 1u,
-        .pSignalSemaphoreValues = &signal_tick,
-    };
-
-    const vk::BindSparseInfo sparse_info = {
-        .pNext = &timeline_si,
-        .bufferBindCount = static_cast<u32>(buffer_binds.size()),
-        .pBufferBinds = buffer_binds.data(),
-        .signalSemaphoreCount = 1u,
-        .pSignalSemaphores = &signal_sema,
-    };
 
     info.AddWait(signal_sema, signal_tick);
     if (migration_binds_pending) {
@@ -918,11 +896,41 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
         migration_bind_tick = scheduler.CurrentTick() - 1;
         migration_binds_pending = false;
     }
-    auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
-    if (submit_result == vk::Result::eErrorDeviceLost) {
-        instance.ReportDeviceFault("SubmitPendingArenaBinds");
-    }
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+
+    // Queue the sparse bind immediately before the submit that waits for it
+    // When cp_record_thread moves that work to another thread, the closure must own the bind lists
+    // until it runs
+    scheduler.RunOnQueue([this, binds = std::move(pending_binds), signal_tick, signal_sema] {
+        std::vector<vk::SparseBufferMemoryBindInfo> buffer_binds;
+        buffer_binds.reserve(binds.size());
+
+        for (const auto& arena_binds : binds) {
+            buffer_binds.emplace_back(vk::SparseBufferMemoryBindInfo{
+                .buffer = arena_binds.arena->Handle(),
+                .bindCount = static_cast<u32>(arena_binds.binds.size()),
+                .pBinds = arena_binds.binds.data(),
+            });
+        }
+
+        const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+            .signalSemaphoreValueCount = 1u,
+            .pSignalSemaphoreValues = &signal_tick,
+        };
+
+        const vk::BindSparseInfo sparse_info = {
+            .pNext = &timeline_si,
+            .bufferBindCount = static_cast<u32>(buffer_binds.size()),
+            .pBufferBinds = buffer_binds.data(),
+            .signalSemaphoreCount = 1u,
+            .pSignalSemaphores = &signal_sema,
+        };
+
+        auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+        if (submit_result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceFault("SubmitPendingArenaBinds");
+        }
+        ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    });
 
     pending_binds.clear();
 }

@@ -161,6 +161,20 @@ enum class Id : u32 {
     // Count images whose memory was sub-allocated from image_memory_pool instead of using an
     // individual allocation
     PooledImages,
+    // Count Vulkan calls sent to the recording thread and the time the command processor spends
+    // waiting for it
+    // Also track how long the recording thread stays busy processing those calls
+    RecorderCommands,
+    RecorderDrains,
+    RecorderDrainNs,
+    RecorderBusyNs,
+    // Count command processor waits that need the recording thread to submit a tick before Finish
+    // or Wait can continue
+    RecorderSubmitWaits,
+    RecorderSubmitWaitNs,
+    // Count times the command processor wakes a sleeping recording thread after making another
+    // command batch available
+    RecorderWakes,
     Count,
 };
 
@@ -179,6 +193,12 @@ inline bool AbToggleActive() {
 /// Whether the key follows SHADPS4_AB_TOGGLE: always with the toggle unless SHADPS4_AB_TOGGLE_KEYS lists other
 /// keys (comma separated), so keys held on both sides of an in-run A/B stay on. Read once, at key setup
 bool AbToggleFollows(std::string_view key);
+
+/// Check whether SHADPS4_AB_TOGGLE_KEYS includes this key while SHADPS4_AB_TOGGLE is enabled
+/// Settings needing startup work, such as cp_record_thread, prepare it for the run even if their
+/// initial interval is off
+/// The thread must already exist when a later interval enables recording
+bool AbToggleLists(std::string_view key);
 
 /// Whether a key that follows the toggle (AbToggleFollows) runs in this report interval
 inline bool AbToggleOn(bool follows) {
