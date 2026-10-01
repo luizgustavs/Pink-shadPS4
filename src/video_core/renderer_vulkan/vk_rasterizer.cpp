@@ -8,6 +8,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include <tuple>
@@ -510,7 +511,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
                             : nullptr},
       mapped_page_table_toggle{Common::PerfStats::AbToggleFollows("mapped_page_table")},
       mapped_page_table_verify{mapped_page_table &&
-                               std::getenv("SHADPS4_MAPPED_PAGE_TABLE_VERIFY") != nullptr} {
+                               std::getenv("SHADPS4_MAPPED_PAGE_TABLE_VERIFY") != nullptr},
+      incremental_bind{EmulatorSettings.IsIncrementalBind()},
+      incremental_bind_toggle{Common::PerfStats::AbToggleFollows("incremental_bind")},
+      incremental_bind_verify{incremental_bind &&
+                              std::getenv("SHADPS4_INCREMENTAL_BIND_VERIFY") != nullptr} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -518,6 +523,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     if (mapped_page_table) {
         LOG_WARNING(Render_Vulkan, "Workaround mapped_page_table enabled{}",
                     mapped_page_table_verify ? " (verify)" : "");
+    }
+    if (incremental_bind) {
+        LOG_WARNING(Render_Vulkan, "Workaround incremental_bind enabled{}",
+                    incremental_bind_verify ? " (verify)" : "");
     }
 
     scheduler.SetSessionCallback([this] { buffer_cache.FlushSyncBatch(true); });
@@ -1104,6 +1113,22 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     if (GpuCheckpoints::DiagEnabled()) {
         diag_detail.Reset();
     }
+    bind_cache = nullptr;
+    if (incremental_bind && Common::PerfStats::AbToggleOn(incremental_bind_toggle)) {
+        auto& slot = pipeline->BindCacheSlot();
+        if (!slot) {
+            slot = std::make_shared<BindCache>();
+        }
+        bind_cache = static_cast<BindCache*>(slot.get());
+        bind_generations = {
+            .sync_flushes = buffer_cache.SyncBatchGeneration(),
+            .image_sets = texture_cache.ImageSetGeneration(),
+            .maps = buffer_cache.MappingGeneration(),
+            .arenas = buffer_cache.ArenaGeneration(),
+        };
+        bind_cache_buffer_index = 0;
+        bind_cache_image_index = 0;
+    }
 
     bool uses_dma = false;
 
@@ -1266,6 +1291,27 @@ void Rasterizer::ResetBindings(bool is_compute) {
     buffer_cache.CloseGpuWrites();
     scheduler.CountRecordedCommand();
     FlushPeriodic();
+}
+
+void Rasterizer::VerifyIncrementalBind(bool matches, const char* kind, u64 pgm_hash, VAddr address) {
+    Common::PerfStats::Add(Common::PerfStats::Id::BindVerifyChecks);
+    ++bind_verify_checks;
+    if (!matches) {
+        Common::PerfStats::Add(Common::PerfStats::Id::BindVerifyMismatches);
+        if (++bind_verify_mismatches <= 32) {
+            LOG_ERROR(Render_Vulkan,
+                      "incremental_bind verify: reused {} of shader {:#x} at {:#x} differs from the "
+                      "full bind",
+                      kind, pgm_hash, address);
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - bind_verify_last_report >= std::chrono::seconds{60}) {
+        bind_verify_last_report = now;
+        LOG_WARNING(Render_Vulkan,
+                    "incremental_bind verify: {} reusable slots checked, {} mismatches",
+                    bind_verify_checks, bind_verify_mismatches);
+    }
 }
 
 void Rasterizer::FlushPeriodic() {
@@ -1498,20 +1544,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         } else {
             const auto vsharp = desc.GetSharp(stage);
-            // A V# whose base is not GPU-mapped cannot be a real resource (garbage sharps of draws the game
-            // predicates away). Bind a null descriptor instead of asserting in ClampRangeSize or creating a
-            // buffer over unmapped memory
-            if (vsharp.base_address <= 1 || vsharp.GetSize() == 0 ||
-                !IsMapped(vsharp.base_address, 1)) {
-                buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
-            } else {
-                const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-                if (size != vsharp.GetSize()) {
-                    LOG_DEBUG(Render, "Clamped size from {} to {} for stage {:#x}",
-                              vsharp.GetSize(), size, stage.pgm_hash);
-                }
-                const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-                    vsharp.base_address, size, desc.is_written, desc.is_formatted);
+            const auto bind_range = [&](const VideoCore::Buffer* buffer, u64 offset, u64 size) {
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -1541,6 +1574,70 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                                sizeof(ref.cpu_words));
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+            };
+
+            // Reuse the previous read-only V# binding from this pipeline when its descriptor,
+            // arenas, sync batch and GPU mappings are unchanged
+            // Those checks keep the same arena range valid for the next draw without repeating the
+            // buffer lookups
+            BindCache::BufferSlot* slot =
+                bind_cache ? &bind_cache->Buffer(bind_cache_buffer_index++) : nullptr;
+            const bool reuse = slot && !desc.is_written && slot->Matches(vsharp, bind_generations);
+            if (reuse && !incremental_bind_verify) {
+                buffer_cache.ReuseReadBuffer(slot->arena, vsharp.base_address, slot->size,
+                                             desc.is_formatted);
+                Common::PerfStats::Add(Common::PerfStats::Id::BindReusedBuffers);
+                bind_range(slot->arena, slot->offset, slot->size);
+            } else {
+                // With verification enabled, run the full binding path for this slot and compare
+                // its result with the binding we would have reused
+                const std::optional<BindCache::BufferSlot> reused =
+                    reuse ? std::optional{*slot} : std::nullopt;
+                const bool reused_valid =
+                    reuse && buffer_cache.CheckReusedBuffer(slot->arena, slot->offset,
+                                                            vsharp.base_address, slot->size);
+                if (slot) {
+                    slot->arena = nullptr;
+                }
+                bool reuse_matches = false;
+                // A V# with an unmapped base address cannot describe a usable resource
+                // This can happen with stale descriptors in draws the game would predicate away, so
+                // bind null instead of asserting or using unmapped memory
+                // Do not pass that address to ClampRangeSize or create a buffer over a range the
+                // guest has not mapped
+                if (vsharp.base_address <= 1 || vsharp.GetSize() == 0 ||
+                    !IsMapped(vsharp.base_address, 1)) {
+                    buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                } else {
+                    const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                    if (size != vsharp.GetSize()) {
+                        LOG_DEBUG(Render, "Clamped size from {} to {} for stage {:#x}",
+                                  vsharp.GetSize(), size, stage.pgm_hash);
+                    }
+                    const auto [buffer, offset] = buffer_cache.ObtainBuffer(
+                        vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                    const bool stream = buffer == &buffer_cache.GetStreamBuffer();
+                    if (slot && !desc.is_written && !stream) {
+                        *slot = {
+                            .sharp = vsharp,
+                            .arena = buffer,
+                            .offset = offset,
+                            .size = static_cast<u32>(size),
+                            .sync_flushes = bind_generations.sync_flushes,
+                            .maps = bind_generations.maps,
+                            .arenas = bind_generations.arenas,
+                        };
+                    }
+                    // The full binding path may copy a small range into the stream buffer even
+                    // though the same range is still valid in its arena
+                    reuse_matches = reused && reused_valid && size == reused->size &&
+                                    (stream ||
+                                     (buffer == reused->arena && offset == reused->offset));
+                    bind_range(buffer, offset, size);
+                }
+                if (reused) {
+                    VerifyIncrementalBind(reuse_matches, "V#", stage.pgm_hash, vsharp.base_address);
+                }
             }
         }
 
@@ -1646,10 +1743,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                  is_written);
         }
     };
-    const auto find_bound_image = [&](VideoCore::ImageId& image_id,
-                                      VideoCore::TextureCache::ImageDesc& desc,
-                                      const Shader::ImageResource& image_desc) {
-        image_id = texture_cache.FindImage(desc);
+    const auto mark_bound = [&](VideoCore::ImageId& image_id,
+                                const Shader::ImageResource& image_desc) {
         auto* image = &texture_cache.GetImage(image_id);
         if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
             // If this image has an associated depth image, it's a stencil attachment. Redirect the access to
@@ -1663,6 +1758,18 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image->binding.force_general |= image_desc.is_written;
         }
         image->binding.is_bound = 1u;
+    };
+    // Keep FindImage's result in the incremental_bind slot before the binding applies a depth
+    // redirect to that image
+    const auto find_bound_image = [&](VideoCore::ImageId& image_id,
+                                      VideoCore::TextureCache::ImageDesc& desc,
+                                      const Shader::ImageResource& image_desc,
+                                      BindCache::ImageSlot* slot = nullptr) {
+        image_id = texture_cache.FindImage(desc);
+        if (slot) {
+            slot->bindings.emplace_back(image_id, desc);
+        }
+        mark_bound(image_id, image_desc);
     };
     // A rejected T# still fills every descriptor the shader declares, with the declared type
     const auto append_null_binding = [&](const Shader::ImageResource& image_desc) {
@@ -1711,6 +1818,70 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
             image_descriptor_array_sizes.push_back(num_bindings);
         };
+
+        // Reuse the previous T# resolution when its descriptor, registered images and GPU mappings
+        // have not changed
+        // A rejected T# stays rejected because its checks only depend on the descriptor and image
+        // resource already stored in the slot
+        // Keep that rejected result too so it continues to bind null descriptors just like the full
+        // path
+        BindCache::ImageSlot* slot =
+            bind_cache ? &bind_cache->Image(bind_cache_image_index++) : nullptr;
+        const bool reuse = slot && slot->Matches(tsharp, bind_generations) &&
+                           (slot->rejected || slot->bindings.size() == num_bindings);
+        if (reuse && !incremental_bind_verify) {
+            Common::PerfStats::Add(Common::PerfStats::Id::BindReusedImages);
+            if (slot->rejected) {
+                append_null_bindings();
+                continue;
+            }
+            count_lod_stats(tsharp, image_desc.is_written);
+            for (const auto& [cached_id, cached_desc] : slot->bindings) {
+                auto& image_id = image_bindings.emplace_back(cached_id, cached_desc).first;
+                // Keep the LRU touch that FindImage normally performs even when we reuse its image
+                // result and skip the lookup
+                texture_cache.GetImage(image_id).tick_accessed_last = scheduler.CurrentTick();
+                mark_bound(image_id, image_desc);
+            }
+            image_descriptor_array_sizes.push_back(num_bindings);
+            continue;
+        }
+        // With verification enabled, run the full binding path again and compare its result with
+        // the T# binding we would have reused
+        std::optional<BindCache::ImageSlot> reused;
+        if (reuse) {
+            reused.emplace(*slot);
+        }
+        if (slot) {
+            slot->valid = false;
+            slot->bindings.clear();
+            slot->sharp = tsharp;
+            slot->image_sets = bind_generations.image_sets;
+            slot->maps = bind_generations.maps;
+        }
+        const auto finish_slot = [&](bool rejected) {
+            if (!slot) {
+                return;
+            }
+            slot->rejected = rejected;
+            slot->valid = true;
+            if (!reused) {
+                return;
+            }
+            bool matches = reused->rejected == rejected &&
+                           reused->bindings.size() == slot->bindings.size();
+            for (size_t i = 0; matches && i < slot->bindings.size(); ++i) {
+                const auto& [old_id, old_desc] = reused->bindings[i];
+                const auto& [new_id, new_desc] = slot->bindings[i];
+                matches = old_id == new_id && old_desc.type == new_desc.type &&
+                          old_desc.view_info == new_desc.view_info &&
+                          old_desc.info.guest_address == new_desc.info.guest_address &&
+                          old_desc.info.guest_size == new_desc.info.guest_size &&
+                          old_desc.info.pixel_format == new_desc.info.pixel_format;
+            }
+            VerifyIncrementalBind(matches, "T#", stage.pgm_hash, tsharp.Address());
+        };
+
         if (texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
         }
@@ -1718,6 +1889,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         std::optional<ImageDesc> bound_desc;
         if (!is_bindable(tsharp, image_desc, bound_desc)) {
             append_null_bindings();
+            finish_slot(true);
             continue;
         }
         count_lod_stats(tsharp, image_desc.is_written);
@@ -1737,10 +1909,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 desc.view_info.range.extent.levels = 1;
             }
 
-            find_bound_image(image_id, desc, image_desc);
+            find_bound_image(image_id, desc, image_desc, slot);
         }
 
         image_descriptor_array_sizes.push_back(num_bindings);
+        finish_slot(false);
     }
 
     // Second pass to re-bind images that were updated after binding

@@ -850,6 +850,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    image_set_generation.fetch_add(1, std::memory_order_release);
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     stat_images.fetch_add(1, std::memory_order_relaxed);
     if (image.info.guest_size > stat_largest_image.load(std::memory_order_relaxed)) {
@@ -865,6 +866,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    image_set_generation.fetch_add(1, std::memory_order_release);
     if (!lru_cache.Free(image.lru_id)) {
         LOG_ERROR(Render_Vulkan, "Texture cache: LRU item of image addr={:#x} freed twice",
                   image.info.guest_address);

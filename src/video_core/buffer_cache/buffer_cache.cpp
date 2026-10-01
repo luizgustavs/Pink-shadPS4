@@ -714,6 +714,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
             const auto* new_arena =
                 &arenas.emplace_back(instance, base_block << block_shift,
                                      num_pages << ARENA_PAGE_BITS, MemoryType::Sparse);
+            arena_generation.fetch_add(1, std::memory_order_release);
             address_space[first_page] = new_arena;
             address_space[last_page] = new_arena;
         }
@@ -730,6 +731,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     const u64 total_size = first_size + last_size;
     const u64 end_block = (first_addr + total_size) >> block_shift;
     auto* new_arena = &arenas.emplace_back(instance, first_addr, total_size, MemoryType::Sparse);
+    arena_generation.fetch_add(1, std::memory_order_release);
     auto* bind = BindsForArena(new_arena);
     migration_binds_pending = true;
     resident_ranges.ForEachInRange(base_block, end_block, [&](const Backing& backing) {
@@ -752,6 +754,19 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
         address_space[base_page + page] = new_arena;
     }
     return new_arena;
+}
+
+bool BufferCache::CheckReusedBuffer(const Buffer* arena, u64 offset, VAddr device_addr, u32 size) {
+    const u64 first_block = device_addr >> block_shift;
+    const u64 last_block = (device_addr + size - 1) >> block_shift;
+    if (address_space[first_block >> blocks_per_arena_page_shift] != arena ||
+        address_space[last_block >> blocks_per_arena_page_shift] != arena ||
+        arena->Offset(device_addr) != offset) {
+        return false;
+    }
+    bool resident = true;
+    resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64, u64) { resident = false; });
+    return resident && sync_batch.Contains(device_addr, device_addr + size);
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
@@ -933,6 +948,7 @@ void BufferCache::FlushSyncBatch(bool from_scheduler) {
             });
     }
     sync_batch.Clear();
+    sync_batch_generation.fetch_add(1, std::memory_order_release);
     dma_sync_covered = false;
     if (copies.empty()) {
         return;

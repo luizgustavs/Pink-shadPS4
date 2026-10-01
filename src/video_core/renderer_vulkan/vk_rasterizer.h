@@ -11,6 +11,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/mapped_page_table.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_bind_cache.h"
 #include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -165,6 +166,9 @@ private:
     void BindIndexBuffer(u32 index_offset = 0);
 
     void ResetBindings(bool is_compute);
+    /// Count reused V# and T# slots checked against a full binding and log any mismatch so the
+    /// cache assumptions can be verified
+    void VerifyIncrementalBind(bool matches, const char* kind, u64 pgm_hash, VAddr address);
     /// Submits periodically without waiting
     void FlushPeriodic();
 
@@ -242,6 +246,22 @@ private:
     std::unique_ptr<VideoCore::MappedPageTable> mapped_page_table;
     const bool mapped_page_table_toggle; ///< Whether mapped_page_table is active for this interval of SHADPS4_AB_TOGGLE
     const bool mapped_page_table_verify;
+    // Keep the cache for the pipeline being bound, its starting generations and the next V# and T#
+    // slots to visit
+    // The cache pointer is null when incremental_bind is disabled so the call follows the regular
+    // binding path
+    const bool incremental_bind;
+    const bool incremental_bind_toggle; ///< Whether incremental_bind is active for this interval of SHADPS4_AB_TOGGLE
+    /// With SHADPS4_INCREMENTAL_BIND_VERIFY, bind reusable slots through the full path as well and
+    /// compare the two results
+    const bool incremental_bind_verify;
+    BindCache* bind_cache{};
+    BindCache::Generations bind_generations{};
+    u32 bind_cache_buffer_index{};
+    u32 bind_cache_image_index{};
+    u64 bind_verify_checks{};
+    u64 bind_verify_mismatches{};
+    std::chrono::steady_clock::time_point bind_verify_last_report{};
     std::array<u32, 256> lod_stats_uses{};
     u64 lod_stats_packets_minute{};
     u64 lod_stats_banks_minute{};

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <memory>
+
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -65,6 +67,12 @@ public:
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
 
+    /// Keep this pipeline's BindCache for incremental_bind, create it on first use and release it
+    /// when the pipeline is destroyed
+    std::shared_ptr<void>& BindCacheSlot() const noexcept {
+        return bind_cache;
+    }
+
 protected:
     [[nodiscard]] std::string GetDebugString() const;
 
@@ -78,6 +86,7 @@ protected:
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     bool uses_push_descriptors{};
     bool is_compute;
+    mutable std::shared_ptr<void> bind_cache;
 };
 
 } // namespace Vulkan

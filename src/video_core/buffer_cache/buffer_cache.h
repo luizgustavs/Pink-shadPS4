@@ -139,6 +139,35 @@ public:
     /// so their writes belong to the current command buffer from now on
     void CloseGpuWrites();
 
+    /// Count sync batch flushes so reused bindings can tell whether their ranges are still in the
+    /// same growing batch
+    [[nodiscard]] u64 SyncBatchGeneration() const noexcept {
+        return sync_batch_generation.load(std::memory_order_acquire);
+    }
+
+    /// Count arena creations so reused ObtainBuffer results can tell whether the arena layout has
+    /// changed since their last binding
+    [[nodiscard]] u64 ArenaGeneration() const noexcept {
+        return arena_generation.load(std::memory_order_acquire);
+    }
+
+    /// Do the work ObtainBuffer still needs for a reused read-only arena binding with unchanged
+    /// arenas and sync batch
+    /// This includes copying an aliased image into its texel buffer because the GPU may have
+    /// written to the image since the last bind
+    /// Reusing the buffer location does not remove the need to refresh that image data
+    void ReuseReadBuffer(const Buffer* arena, VAddr device_addr, u32 size, bool is_texel_buffer) {
+        if (is_texel_buffer) {
+            SynchronizeMemoryFromImage(arena, device_addr, size);
+        }
+    }
+
+    /// Check the assumptions behind a reused arena binding by confirming its offset and range,
+    /// residency and presence in the sync batch
+    /// The result is reusable only while all of those conditions still match what ObtainBuffer
+    /// expects
+    [[nodiscard]] bool CheckReusedBuffer(const Buffer* arena, u64 offset, VAddr device_addr, u32 size);
+
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
     /// Check that the current sync batch already contains every range a DMA sync would add before
@@ -274,6 +303,8 @@ private:
         }
     };
     DomIntervalList<SyncRange> sync_batch{};
+    std::atomic<u64> sync_batch_generation{};
+    std::atomic<u64> arena_generation{};
     /// Whether the current sync batch already covers every resident range
     bool dma_sync_covered{};
     const bool dma_sync_once;

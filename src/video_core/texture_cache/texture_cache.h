@@ -275,7 +275,14 @@ public:
                 stat_largest_image.load(std::memory_order_relaxed)};
     }
 
+    /// Count image registrations and removals so a reused T# can tell when FindImage might choose a
+    /// different registered image
+    [[nodiscard]] u64 ImageSetGeneration() const noexcept {
+        return image_set_generation.load(std::memory_order_acquire);
+    }
+
 private:
+    std::atomic<u64> image_set_generation{0};
     std::atomic<u64> stat_images{0};
     std::atomic<u64> stat_largest_image{0};
     /// Iterate over all page indices in a range

@@ -134,6 +134,12 @@ enum class Id : u32 {
     // Count the DMA range sweeps avoided by dma_sync_once_per_batch after the current sync batch
     // has already been filled
     DmaSweepsSkipped,
+    // Count V# and T# bindings reused from the previous call of the same pipeline, along with the
+    // checks made when verification is enabled
+    BindReusedBuffers,
+    BindReusedImages,
+    BindVerifyChecks,
+    BindVerifyMismatches,
     // Short GPU wait polling stats
     WaitSpins,
     WaitSpinHits,
