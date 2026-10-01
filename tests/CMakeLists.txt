@@ -68,6 +68,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/value.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/pixel_format.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/texture_cache/image_barriers.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/renderer_vulkan/liverpool_to_vk.cpp
     ${CMAKE_SOURCE_DIR}/src/common/recursive_lock.cpp
     ${CMAKE_SOURCE_DIR}/src/core/stack_ranges.cpp
 
@@ -77,6 +78,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
     ${CMAKE_SOURCE_DIR}/src/common/error.cpp
     ${CMAKE_SOURCE_DIR}/src/common/io_file.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/number_utils.cpp
     ${CMAKE_SOURCE_DIR}/src/common/logging/classes.cpp
     ${CMAKE_SOURCE_DIR}/src/common/logging/events.cpp
     ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
@@ -98,6 +100,7 @@ set(GCN_TEST_SOURCES
     common/test_recursive_lock.cpp
     core/test_stack_ranges.cpp
     gcn/test_buffer_format_lowering.cpp
+    gcn/test_component_swizzle.cpp
     gcn/test_dma_fault_bitmap.cpp
     gcn/test_graphics_workarounds.cpp
     video_core/test_image_barriers.cpp

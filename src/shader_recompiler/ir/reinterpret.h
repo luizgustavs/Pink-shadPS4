@@ -15,9 +15,10 @@ inline Value ApplySwizzle(IREmitter& ir, const Value& vector, const AmdGpu::Comp
     const auto zero = ir.Imm32(0.f);
     const auto one = ir.Imm32(1.f);
     const auto constants_vec = ir.CompositeConstruct(zero, one, zero, zero);
+    const auto mapping = swizzle.Normalized();
     const auto swizzled =
-        ir.CompositeShuffle(constants_vec, vector, size_t(swizzle.r), size_t(swizzle.g),
-                            size_t(swizzle.b), size_t(swizzle.a));
+        ir.CompositeShuffle(constants_vec, vector, size_t(mapping.r), size_t(mapping.g),
+                            size_t(mapping.b), size_t(mapping.a));
     return swizzled;
 }
 

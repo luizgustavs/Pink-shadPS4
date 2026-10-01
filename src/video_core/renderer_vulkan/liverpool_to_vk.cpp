@@ -425,7 +425,7 @@ vk::BorderColor BorderColor(AmdGpu::BorderColor color) {
 }
 
 vk::ComponentSwizzle ComponentSwizzle(AmdGpu::CompSwizzle comp_swizzle) {
-    switch (comp_swizzle) {
+    switch (AmdGpu::NormalizeCompSwizzle(comp_swizzle)) {
     case AmdGpu::CompSwizzle::Zero:
         return vk::ComponentSwizzle::eZero;
     case AmdGpu::CompSwizzle::One:
