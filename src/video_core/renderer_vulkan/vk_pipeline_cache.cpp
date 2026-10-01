@@ -878,8 +878,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 
     vk::ShaderModule module{};
 
-    const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
-    if (it == program->modules.end()) {
+    const auto found = program->FindPermut(spec);
+    if (!found) {
         // Choose an index above all permutations in memory and on disk so this compile cannot
         // overwrite an existing shader binary
         perm_idx = Storage::DataBase::Instance().AllocateShaderBinaryIndex(
@@ -892,8 +892,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         program->InsertPermut(module, std::move(spec), perm_idx);
     } else {
         info.AddBindings(binding);
-        module = it->module;
-        perm_idx = std::distance(program->modules.begin(), it);
+        perm_idx = *found;
+        module = program->modules[perm_idx].module;
         perm_hash = HashCombine(params.hash, perm_idx);
     }
     if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {

@@ -3,11 +3,14 @@
 
 #pragma once
 
+#include <algorithm>
 #include <functional>
+#include <optional>
 #include <utility>
 #include <variant>
 #include <boost/container/small_vector.hpp>
 #include <tsl/robin_map.h>
+#include "common/assert.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
@@ -51,12 +54,20 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
+    /// Keep the indices of occupied modules slots in ascending order so searches skip the empty
+    /// slots
+    /// Stored permutation indices can leave gaps, and checking those gaps was most of the work in
+    /// the old search
+    /// AllocateShaderBinaryIndex keeps the stored indices stable, so we must keep the same order
+    /// without renumbering them
+    boost::container::small_vector<u32, MaxPermutations> valid_permuts{};
 
     Program() = default;
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
         : info{stage, l_stage, params} {}
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
+        valid_permuts.push_back(static_cast<u32>(modules.size()));
         modules.emplace_back(module, std::move(spec));
     }
 
@@ -64,6 +75,27 @@ struct Program {
                       size_t perm_idx) {
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
         modules[perm_idx] = {module, std::move(spec)};
+        const auto it = std::ranges::lower_bound(valid_permuts, static_cast<u32>(perm_idx));
+        if (it == valid_permuts.end() || *it != perm_idx) {
+            valid_permuts.insert(it, static_cast<u32>(perm_idx));
+        }
+    }
+
+    /// Find the first occupied permutation with a matching specialization, keeping the same index
+    /// order as a full modules search
+    /// Skipping an empty slot should never change which matching permutation is selected
+    std::optional<size_t> FindPermut(const Shader::StageSpecialization& spec) const {
+        std::optional<size_t> found{};
+        for (const u32 idx : valid_permuts) {
+            if (modules[idx].spec == spec) {
+                found = idx;
+                break;
+            }
+        }
+        DEBUG_ASSERT(found.value_or(modules.size()) ==
+                     static_cast<size_t>(std::distance(
+                         modules.begin(), std::ranges::find(modules, spec, &Module::spec))));
+        return found;
     }
 };
 

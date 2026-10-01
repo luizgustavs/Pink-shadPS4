@@ -318,12 +318,11 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         module = CompileSPV(spv, instance.GetDevice());
         it_pgm.value() = std::move(program);
     } else {
-        const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
-        if (it != it_pgm.value()->modules.end()) {
+        if (const auto found = it_pgm.value()->FindPermut(spec)) {
             // A matching permutation is valid only at its original index. A different index means
             // the store holds entries from more than one cache generation, so this pipeline is
             // left to compile at runtime.
-            const auto idx = std::distance(it_pgm.value()->modules.begin(), it);
+            const auto idx = *found;
             if (perm_idx != idx) {
                 LOG_WARNING(Render_Vulkan,
                             "Cached permutation {} of {}_{:x} conflicts with index {}, skipping "
@@ -331,7 +330,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
                             perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
                 return false;
             }
-            module = it->module;
+            module = it_pgm.value()->modules[idx].module;
         } else {
             module = CompileSPV(spv, instance.GetDevice());
         }
