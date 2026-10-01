@@ -9,6 +9,7 @@
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/mapped_page_table.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -120,6 +121,12 @@ public:
 
 private:
     bool IsMappedCached(VAddr addr, VAddr end);
+    /// With SHADPS4_MAPPED_PAGE_TABLE_VERIFY, compare each table answer with the interval set and
+    /// report how often the table returns Unknown once a minute
+    void VerifyMappedPageTable(VAddr addr, u64 size, VideoCore::MappedPageTable::Answer answer);
+    /// Mirror the mapping change for [addr, addr + size) in the page table while
+    /// mapped_ranges_mutex is still held
+    void UpdateMappedPageTable(VAddr addr, u64 size, bool mapped);
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
@@ -230,6 +237,11 @@ private:
     // cp_recording_cuts: IsMapped answers from a per-thread cache of mapped runs
     const bool recording_cuts;
     const bool recording_cuts_toggle; ///< cp_recording_cuts follows SHADPS4_AB_TOGGLE
+    // Keep a table of 16 KB mapped pages beside mapped_ranges for checks without the shared lock,
+    // or leave it null when the setting is off
+    std::unique_ptr<VideoCore::MappedPageTable> mapped_page_table;
+    const bool mapped_page_table_toggle; ///< Whether mapped_page_table is active for this interval of SHADPS4_AB_TOGGLE
+    const bool mapped_page_table_verify;
     std::array<u32, 256> lod_stats_uses{};
     u64 lod_stats_packets_minute{};
     u64 lod_stats_banks_minute{};

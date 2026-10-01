@@ -512,6 +512,9 @@ struct GPUSettings {
     Setting<u32> wait_spin_us{0};
     // Run ahead readbacks on a transfer-only queue when one is available
     Setting<bool> readback_ahead_transfer_queue{false};
+    // Answer IsMapped from a table of mapped 16 KB pages so common buffer checks can avoid taking
+    // the shared lock
+    Setting<bool> mapped_page_table{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -569,6 +572,7 @@ struct GPUSettings {
             make_override<GPUSettings>("wait_spin_us", &GPUSettings::wait_spin_us),
             make_override<GPUSettings>("readback_ahead_transfer_queue",
                                        &GPUSettings::readback_ahead_transfer_queue),
+            make_override<GPUSettings>("mapped_page_table", &GPUSettings::mapped_page_table),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -588,7 +592,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    srt_walker_clean_reads, shader_code_clean_reads,
                                    readback_ahead, periodic_flush_commands,
                                    cp_recording_cuts, gpu_overhead_cuts, dma_sweep_skip_stacks,
-                                   wait_spin_us, readback_ahead_transfer_queue)
+                                   wait_spin_us, readback_ahead_transfer_queue, mapped_page_table)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -901,6 +905,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, DmaSweepSkipStacks, dma_sweep_skip_stacks)
     SETTING_FORWARD(m_gpu, WaitSpinUs, wait_spin_us)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackAheadTransferQueue, readback_ahead_transfer_queue)
+    SETTING_FORWARD_BOOL(m_gpu, MappedPageTable, mapped_page_table)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

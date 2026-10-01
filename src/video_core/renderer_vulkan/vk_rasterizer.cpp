@@ -504,11 +504,21 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       lod_stats_enabled{EmulatorSettings.IsLodStatsFromBindings()},
       periodic_flush_commands{EmulatorSettings.GetPeriodicFlushCommands()},
       recording_cuts{EmulatorSettings.IsCpRecordingCuts()},
-      recording_cuts_toggle{Common::PerfStats::AbToggleFollows("cp_recording_cuts")} {
+      recording_cuts_toggle{Common::PerfStats::AbToggleFollows("cp_recording_cuts")},
+      mapped_page_table{EmulatorSettings.IsMappedPageTable()
+                            ? std::make_unique<VideoCore::MappedPageTable>()
+                            : nullptr},
+      mapped_page_table_toggle{Common::PerfStats::AbToggleFollows("mapped_page_table")},
+      mapped_page_table_verify{mapped_page_table &&
+                               std::getenv("SHADPS4_MAPPED_PAGE_TABLE_VERIFY") != nullptr} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    if (mapped_page_table) {
+        LOG_WARNING(Render_Vulkan, "Workaround mapped_page_table enabled{}",
+                    mapped_page_table_verify ? " (verify)" : "");
+    }
 
     scheduler.SetSessionCallback([this] { buffer_cache.FlushSyncBatch(true); });
     pipeline_cache.read_clean_memory = [this](VAddr addr, void* out, u64 size) {
@@ -2329,6 +2339,20 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
         // Memory range wrapped the address space, cannot be mapped.
         return false;
     }
+    if (mapped_page_table && Common::PerfStats::AbToggleOn(mapped_page_table_toggle)) {
+        // BindBuffers checks every V# on every draw, and taking the shared lock then walking the
+        // interval set cost about 6 ms per frame in SotC
+        // The table answers directly when the range uses pages that are fully mapped or completely
+        // empty, which covers most buffer bindings
+        // Other ranges still use the interval set to get the exact byte-level answer
+        const auto answer = mapped_page_table->Query(addr, addr + size);
+        if (mapped_page_table_verify) [[unlikely]] {
+            VerifyMappedPageTable(addr, size, answer);
+        }
+        if (answer != VideoCore::MappedPageTable::Answer::Unknown) {
+            return answer == VideoCore::MappedPageTable::Answer::Mapped;
+        }
+    }
     if (recording_cuts && Common::PerfStats::AbToggleOn(recording_cuts_toggle)) {
         return IsMappedCached(addr, addr + size);
     }
@@ -2336,6 +2360,69 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
 
     Common::RecursiveSharedLock lock{mapped_ranges_mutex};
     return boost::icl::contains(mapped_ranges, range);
+}
+
+void Rasterizer::VerifyMappedPageTable(VAddr addr, u64 size,
+                                       VideoCore::MappedPageTable::Answer answer) {
+    using Answer = VideoCore::MappedPageTable::Answer;
+    static std::atomic<u64> queries{};
+    static std::atomic<u64> unknown{};
+    static std::atomic<u64> mismatches{};
+    static std::atomic<s64> last_report_ms{};
+
+    const u64 total = queries.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (answer == Answer::Unknown) {
+        unknown.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        bool exact;
+        {
+            const auto range =
+                decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+            Common::RecursiveSharedLock lock{mapped_ranges_mutex};
+            exact = boost::icl::contains(mapped_ranges, range);
+        }
+        if (exact != (answer == Answer::Mapped)) {
+            const u64 count = mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 16) {
+                LOG_ERROR(Render_Vulkan,
+                          "mapped_page_table: {:#x}+{:#x} table={} interval set={} (a map/unmap "
+                          "between the two lookups also explains it)",
+                          addr, size, answer == Answer::Mapped, exact);
+            }
+        }
+    }
+
+    const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    s64 last_ms = last_report_ms.load(std::memory_order_relaxed);
+    if (last_ms == 0) {
+        last_report_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed);
+        return;
+    }
+    if (now_ms - last_ms >= 60'000 &&
+        last_report_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
+        const u64 num_unknown = unknown.load(std::memory_order_relaxed);
+        LOG_WARNING(Render_Vulkan,
+                    "mapped_page_table verify: {} queries, {} unknown ({:.3f} %), {} mismatches",
+                    total, num_unknown,
+                    100.0 * static_cast<double>(num_unknown) / static_cast<double>(total),
+                    mismatches.load(std::memory_order_relaxed));
+    }
+}
+
+void Rasterizer::UpdateMappedPageTable(VAddr addr, u64 size, bool mapped) {
+    if (!mapped_page_table) {
+        return;
+    }
+    mapped_page_table->Update(addr, addr + size, mapped, [this](VAddr start, VAddr end) {
+        u64 bytes = 0;
+        for (const auto& range :
+             mapped_ranges & decltype(mapped_ranges)::interval_type::right_open(start, end)) {
+            bytes += boost::icl::length(range);
+        }
+        return bytes;
+    });
 }
 
 bool Rasterizer::IsMappedCached(VAddr addr, VAddr end) {
@@ -2381,6 +2468,7 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+        UpdateMappedPageTable(addr, size, true);
     }
     buffer_cache.OnMappingChanged();
 }
@@ -2396,6 +2484,7 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+        UpdateMappedPageTable(addr, size, false);
     }
     buffer_cache.OnMappingChanged();
 }
