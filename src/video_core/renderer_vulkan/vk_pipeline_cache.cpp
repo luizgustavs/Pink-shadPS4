@@ -850,13 +850,17 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
-        const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
+        // A permutation can exist on disk even if we did not preload it, so index 0 may already
+        // belong to another shader specialization
+        const size_t perm_idx = Storage::DataBase::Instance().AllocateShaderBinaryIndex(params.hash, 0);
+        const auto module =
+            CompileModule(program->info, runtime_info, params.code, perm_idx, binding);
         auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
+        const auto perm_hash = HashCombine(params.hash, perm_idx);
 
-        RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
-        program->AddPermut(module, std::move(spec));
-        if (auto& fetch = program->modules[0].spec.fetch_shader_data; !fetch.Empty()) {
+        RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+        program->InsertPermut(module, std::move(spec), perm_idx);
+        if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
             fetch_shader = &fetch;
         }
         return std::make_tuple(&program->info, module, perm_hash);
@@ -876,11 +880,16 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
     if (it == program->modules.end()) {
+        // Choose an index above all permutations in memory and on disk so this compile cannot
+        // overwrite an existing shader binary
+        perm_idx = Storage::DataBase::Instance().AllocateShaderBinaryIndex(
+            params.hash, static_cast<u32>(program->modules.size()));
+        perm_hash = HashCombine(params.hash, perm_idx);
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
-        program->AddPermut(module, std::move(spec));
+        program->InsertPermut(module, std::move(spec), perm_idx);
     } else {
         info.AddBindings(binding);
         module = it->module;
