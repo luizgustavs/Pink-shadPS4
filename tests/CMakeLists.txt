@@ -97,6 +97,7 @@ set(GCN_TEST_SOURCES
     stubs/signals_stub.cpp
 
     # Tests
+    common/test_lru_cache.cpp
     common/test_recursive_lock.cpp
     core/test_stack_ranges.cpp
     gcn/test_buffer_format_lowering.cpp

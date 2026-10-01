@@ -865,7 +865,10 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
-    lru_cache.Free(image.lru_id);
+    if (!lru_cache.Free(image.lru_id)) {
+        LOG_ERROR(Render_Vulkan, "Texture cache: LRU item of image addr={:#x} freed twice",
+                  image.info.guest_address);
+    }
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     stat_images.fetch_sub(1, std::memory_order_relaxed);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
@@ -1106,7 +1109,18 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::TouchImage(const Image& image) {
-    lru_cache.Touch(image.lru_id, gc_tick);
+    if (!lru_cache.Touch(image.lru_id, gc_tick)) {
+        // The image was already freed, so leave its LRU entry alone
+        // Adding it back to the list could create a cycle and keep garbage collection running
+        // forever
+        static std::atomic<u32> reports{};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 20) {
+            LOG_ERROR(Render_Vulkan,
+                      "Texture cache: touch of a freed image addr={:#x} size={:#x} flags={:#x}",
+                      image.info.guest_address, image.info.guest_size,
+                      static_cast<u32>(image.flags));
+        }
+    }
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {

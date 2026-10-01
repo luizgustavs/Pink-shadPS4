@@ -17,6 +17,7 @@ class LeastRecentlyUsedCache {
         TickType tick;
         Item* next{};
         Item* prev{};
+        bool linked{}; ///< Whether this item still belongs to the LRU list and has not been returned to the free list
     };
 
 public:
@@ -32,25 +33,38 @@ public:
         return new_id;
     }
 
-    void Touch(size_t id, TickType tick) {
+    /// Return false for a freed item so touching it cannot put a free entry back into the LRU list
+    /// and create a cycle
+    bool Touch(size_t id, TickType tick) {
         auto& item = item_pool[id];
+        if (!item.linked) {
+            return false;
+        }
         if (item.tick >= tick) {
-            return;
+            return true;
         }
         item.tick = tick;
         if (&item == last_item) {
-            return;
+            return true;
         }
         Detach(item);
         Attach(item);
+        return true;
     }
 
-    void Free(size_t id) {
+    /// Return false if this item was already freed so the same identifier cannot be handed out
+    /// twice
+    bool Free(size_t id) {
         auto& item = item_pool[id];
+        if (!item.linked) {
+            return false;
+        }
         Detach(item);
         item.prev = nullptr;
         item.next = nullptr;
+        item.linked = false;
         free_items.push_back(id);
+        return true;
     }
 
     template <typename Func>
@@ -92,6 +106,7 @@ private:
     }
 
     void Attach(Item& item) {
+        item.linked = true;
         if (!first_item) {
             first_item = &item;
         }
