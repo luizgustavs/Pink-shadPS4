@@ -92,9 +92,17 @@ struct Item {
     u64 due_ns;
     Common::UniqueFunction<void> func;
 };
-std::mutex timer_mutex;
-std::condition_variable timer_cv;
-std::deque<Item> items;
+/// Keep this timer state alive until process exit because the detached worker may still be waiting
+/// on it during static destruction
+struct TimerState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<Item> items;
+};
+TimerState& Timer() {
+    static auto* const state = new TimerState;
+    return *state;
+}
 
 u64 NowNs() {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -104,9 +112,10 @@ u64 NowNs() {
 
 void Worker() {
     Common::SetCurrentThreadName("shadPS4:LabelTimer");
+    auto& [timer_mutex, timer_cv, items] = Timer();
     std::unique_lock lk{timer_mutex};
     while (true) {
-        timer_cv.wait(lk, [] { return !items.empty(); });
+        timer_cv.wait(lk, [&] { return !items.empty(); });
         const u64 due = items.front().due_ns;
         const u64 now = NowNs();
         if (now < due) {
@@ -186,11 +195,12 @@ std::optional<u32> PendingDword(VAddr addr) {
 void Push(u64 delay_ns, Common::UniqueFunction<void>&& func) {
     static std::once_flag started;
     std::call_once(started, [] { std::thread{Worker}.detach(); });
+    auto& timer = Timer();
     {
-        std::scoped_lock lk{timer_mutex};
-        items.push_back(Item{NowNs() + delay_ns, std::move(func)});
+        std::scoped_lock lk{timer.mutex};
+        timer.items.push_back(Item{NowNs() + delay_ns, std::move(func)});
     }
-    timer_cv.notify_one();
+    timer.cv.notify_one();
 }
 } // namespace DelayedLabels
 
@@ -1053,9 +1063,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         : data_sel == DataSelect::Data64
                             ? DelayedLabels::AddPending(label_addr, packet.DataQWord(), sizeof(u64))
                             : 0;
+                    // The guest may have unmapped this label while the timer was waiting, so drop
+                    // the delayed write instead of aborting on an invalid address
+                    const auto write_delayed = [](void* address, u64 data, u32 num_bytes) {
+                        Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Label,
+                                                          reinterpret_cast<u64>(address), num_bytes,
+                                                          &data, 1);
+                        if (!Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes)) {
+                            LOG_WARNING(Render, "eop_label_delay_us: label {} unmapped before its "
+                                                "delayed write, dropped",
+                                        fmt::ptr(address));
+                        }
+                    };
                     DelayedLabels::Push(u64{delay_us} * 1000,
-                                        [packet, write_label, signal_irq, label_addr, seq] {
-                                            packet.SignalFence(write_label, signal_irq);
+                                        [packet, write_delayed, signal_irq, label_addr, seq] {
+                                            packet.SignalFence(write_delayed, signal_irq);
                                             if (seq != 0) {
                                                 DelayedLabels::RemovePending(label_addr, seq);
                                             }
