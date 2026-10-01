@@ -850,7 +850,8 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
-    image_set_generation.fetch_add(1, std::memory_order_release);
+    StampPages(image.info.guest_address, image.info.guest_size,
+               image_set_generation.fetch_add(1, std::memory_order_acq_rel) + 1);
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     stat_images.fetch_add(1, std::memory_order_relaxed);
     if (image.info.guest_size > stat_largest_image.load(std::memory_order_relaxed)) {
@@ -866,7 +867,8 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
-    image_set_generation.fetch_add(1, std::memory_order_release);
+    StampPages(image.info.guest_address, image.info.guest_size,
+               image_set_generation.fetch_add(1, std::memory_order_acq_rel) + 1);
     if (!lru_cache.Free(image.lru_id)) {
         LOG_ERROR(Render_Vulkan, "Texture cache: LRU item of image addr={:#x} freed twice",
                   image.info.guest_address);
@@ -1110,8 +1112,10 @@ void TextureCache::RunGarbageCollector() {
     GarbageCollectSamplers();
 }
 
-void TextureCache::TouchImage(const Image& image) {
-    if (!lru_cache.Touch(image.lru_id, gc_tick)) {
+void TextureCache::TouchImage(Image& image) {
+    if (lru_cache.Touch(image.lru_id, gc_tick)) {
+        image.lru_touch_tick = gc_tick;
+    } else {
         // The image was already freed, so leave its LRU entry alone
         // Adding it back to the list could create a cycle and keep garbage collection running
         // forever
@@ -1121,6 +1125,35 @@ void TextureCache::TouchImage(const Image& image) {
                       "Texture cache: touch of a freed image addr={:#x} size={:#x} flags={:#x}",
                       image.info.guest_address, image.info.guest_size,
                       static_cast<u32>(image.flags));
+        }
+    }
+}
+
+void TextureCache::EnablePageStamps() {
+    // Use 8 MB to keep one generation stamp for each 1 MB page in the 40-bit GPU address space
+    page_stamps = std::make_unique<std::atomic<u64>[]>(NumStampPages);
+}
+
+void TextureCache::StampPages(VAddr addr, u64 size, u64 generation) {
+    if (!page_stamps) {
+        return;
+    }
+    // Stamp the same pages used to register this image so cached lookups can see every change that
+    // affects their search range
+    ForEachPage(addr, size, [&](u64 page) {
+        if (page < NumStampPages) {
+            page_stamps[page].store(generation, std::memory_order_release);
+        }
+    });
+}
+
+void TextureCache::TouchReusedImage(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    image.tick_accessed_last = scheduler.CurrentTick();
+    if (image.lru_touch_tick != gc_tick) {
+        std::scoped_lock lock{mutex};
+        if (True(image.flags & ImageFlagBits::Registered)) {
+            TouchImage(image);
         }
     }
 }

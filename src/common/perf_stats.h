@@ -140,6 +140,13 @@ enum class Id : u32 {
     BindReusedImages,
     BindVerifyChecks,
     BindVerifyMismatches,
+    // Count T# cache hits, missing entries and entries whose pages gained or lost an image since
+    // the last lookup
+    // Also count incremental_bind slots kept valid by checking only the pages used by their image
+    TsharpCacheHits,
+    TsharpCacheNew,
+    TsharpCacheStale,
+    TsharpCacheSlotPages,
     // Short GPU wait polling stats
     WaitSpins,
     WaitSpinHits,

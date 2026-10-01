@@ -259,8 +259,19 @@ private:
     BindCache::Generations bind_generations{};
     u32 bind_cache_buffer_index{};
     u32 bind_cache_image_index{};
+    // Share T# resolutions across pipelines and remember whether that cache is enabled for the
+    // current binding call
+    // The pointer stays null when tsharp_cache is disabled and the regular resolution path remains
+    // available
+    std::unique_ptr<TsharpCache> tsharp_cache;
+    const bool tsharp_cache_toggle; ///< Whether tsharp_cache is active for this interval of SHADPS4_AB_TOGGLE
+    /// With SHADPS4_TSHARP_CACHE_VERIFY, resolve cached T# entries through the full lookup again
+    /// and compare the images and views
+    const bool tsharp_cache_verify;
+    bool tsharp_cache_on{};
     u64 bind_verify_checks{};
     u64 bind_verify_mismatches{};
+    u64 bind_verify_raced{};
     std::chrono::steady_clock::time_point bind_verify_last_report{};
     std::array<u32, 256> lod_stats_uses{};
     u64 lod_stats_packets_minute{};

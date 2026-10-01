@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -281,8 +282,42 @@ public:
         return image_set_generation.load(std::memory_order_acquire);
     }
 
+    /// Start recording image generations on each affected page whenever an image is registered or
+    /// removed for tsharp_cache and keep those stamps available for later cached lookup checks
+    void EnablePageStamps();
+
+    /// Check whether any image was registered or removed on the pages covering [addr, addr + size)
+    /// after generation
+    /// FindImage only searches those pages, so its earlier result still holds if none changed
+    /// Return false when page stamps are unavailable and a cached lookup cannot be checked this way
+    [[nodiscard]] bool PagesUnchangedSince(VAddr addr, u64 size, u64 generation) const noexcept {
+        if (!page_stamps || size == 0) {
+            return false;
+        }
+        const u64 page_end = (addr + size - 1) >> Traits::PAGE_BITS;
+        if (page_end >= NumStampPages) {
+            return false;
+        }
+        for (u64 page = addr >> Traits::PAGE_BITS; page <= page_end; ++page) {
+            if (page_stamps[page].load(std::memory_order_acquire) > generation) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Do the extra image work FindImage normally performs when incremental_bind or tsharp_cache
+    /// reuses a lookup result
+    /// Touch the LRU under its lock, at most once per GC tick, so cached bindings still keep an
+    /// image recently used
+    void TouchReusedImage(ImageId image_id);
+
 private:
+    static constexpr u64 NumStampPages = 1ULL << (Traits::ADDRESS_SPACE_BITS - Traits::PAGE_BITS);
+    void StampPages(VAddr addr, u64 size, u64 generation);
+
     std::atomic<u64> image_set_generation{0};
+    std::unique_ptr<std::atomic<u64>[]> page_stamps;
     std::atomic<u64> stat_images{0};
     std::atomic<u64> stat_largest_image{0};
     /// Iterate over all page indices in a range
@@ -332,7 +367,7 @@ private:
     void DeleteImage(ImageId image_id);
 
     /// Touch the image in the LRU cache.
-    void TouchImage(const Image& image);
+    void TouchImage(Image& image);
 
     void FreeImage(ImageId image_id) {
         UntrackImage(image_id);

@@ -515,7 +515,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       incremental_bind{EmulatorSettings.IsIncrementalBind()},
       incremental_bind_toggle{Common::PerfStats::AbToggleFollows("incremental_bind")},
       incremental_bind_verify{incremental_bind &&
-                              std::getenv("SHADPS4_INCREMENTAL_BIND_VERIFY") != nullptr} {
+                              std::getenv("SHADPS4_INCREMENTAL_BIND_VERIFY") != nullptr},
+      tsharp_cache{EmulatorSettings.IsTsharpCache() ? std::make_unique<TsharpCache>() : nullptr},
+      tsharp_cache_toggle{Common::PerfStats::AbToggleFollows("tsharp_cache")},
+      tsharp_cache_verify{tsharp_cache && std::getenv("SHADPS4_TSHARP_CACHE_VERIFY") != nullptr} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -527,6 +530,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     if (incremental_bind) {
         LOG_WARNING(Render_Vulkan, "Workaround incremental_bind enabled{}",
                     incremental_bind_verify ? " (verify)" : "");
+    }
+    if (tsharp_cache) {
+        // Enable page stamps before registering the first image so an unstamped page correctly
+        // means that no image has changed there
+        texture_cache.EnablePageStamps();
+        LOG_WARNING(Render_Vulkan, "Workaround tsharp_cache enabled{}",
+                    tsharp_cache_verify ? " (verify)" : "");
     }
 
     scheduler.SetSessionCallback([this] { buffer_cache.FlushSyncBatch(true); });
@@ -1129,6 +1139,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         bind_cache_buffer_index = 0;
         bind_cache_image_index = 0;
     }
+    tsharp_cache_on = tsharp_cache && Common::PerfStats::AbToggleOn(tsharp_cache_toggle);
 
     bool uses_dma = false;
 
@@ -1309,8 +1320,9 @@ void Rasterizer::VerifyIncrementalBind(bool matches, const char* kind, u64 pgm_h
     if (now - bind_verify_last_report >= std::chrono::seconds{60}) {
         bind_verify_last_report = now;
         LOG_WARNING(Render_Vulkan,
-                    "incremental_bind verify: {} reusable slots checked, {} mismatches",
-                    bind_verify_checks, bind_verify_mismatches);
+                    "incremental_bind verify: {} reusable slots checked, {} mismatches, {} T# raced "
+                    "with a GPU unmap",
+                    bind_verify_checks, bind_verify_mismatches, bind_verify_raced);
     }
 }
 
@@ -1759,15 +1771,15 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
         image->binding.is_bound = 1u;
     };
-    // Keep FindImage's result in the incremental_bind slot before the binding applies a depth
-    // redirect to that image
+    // Keep FindImage's result in the shared resolution before applying the depth redirect used by
+    // incremental_bind and tsharp_cache
     const auto find_bound_image = [&](VideoCore::ImageId& image_id,
                                       VideoCore::TextureCache::ImageDesc& desc,
                                       const Shader::ImageResource& image_desc,
-                                      BindCache::ImageSlot* slot = nullptr) {
+                                      BindCache::ImageResolution* resolution = nullptr) {
         image_id = texture_cache.FindImage(desc);
-        if (slot) {
-            slot->bindings.emplace_back(image_id, desc);
+        if (resolution) {
+            resolution->bindings.emplace_back(image_id, desc);
         }
         mark_bound(image_id, image_desc);
     };
@@ -1819,67 +1831,109 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image_descriptor_array_sizes.push_back(num_bindings);
         };
 
-        // Reuse the previous T# resolution when its descriptor, registered images and GPU mappings
-        // have not changed
-        // A rejected T# stays rejected because its checks only depend on the descriptor and image
-        // resource already stored in the slot
-        // Keep that rejected result too so it continues to bind null descriptors just like the full
-        // path
+        // incremental_bind keeps this slot's previous T# result, while tsharp_cache can reuse the
+        // last result from any pipeline
+        // Use either result only while its mapping and image checks still hold, including a
+        // previously rejected descriptor
+        // Read the image generation for each T# because a lookup earlier in this call may have
+        // registered or removed an image
+        // The rejection checks only read the T# and image resource, so a reusable rejected result
+        // should keep binding the same null descriptors
+        const u64 image_sets = texture_cache.ImageSetGeneration();
+        const u64 maps = buffer_cache.MappingGeneration();
+        bind_generations.image_sets = image_sets;
         BindCache::ImageSlot* slot =
             bind_cache ? &bind_cache->Image(bind_cache_image_index++) : nullptr;
-        const bool reuse = slot && slot->Matches(tsharp, bind_generations) &&
-                           (slot->rejected || slot->bindings.size() == num_bindings);
-        if (reuse && !incremental_bind_verify) {
-            Common::PerfStats::Add(Common::PerfStats::Id::BindReusedImages);
-            if (slot->rejected) {
+        const auto holds = [&](const BindCache::ImageResolution& resolution) {
+            return (resolution.rejected || resolution.bindings.size() == num_bindings) &&
+                   (tsharp_cache_on ? resolution.PagesUnchanged(texture_cache)
+                                    : resolution.SameGenerations(bind_generations));
+        };
+        std::optional<TsharpCache::Key> tsharp_key;
+        const BindCache::ImageResolution* cached = nullptr;
+        bool from_tsharp_cache = false;
+        if (slot && slot->SameSharp(tsharp) && holds(slot->resolution)) {
+            cached = &slot->resolution;
+            if (tsharp_cache_on && !slot->resolution.SameGenerations(bind_generations)) {
+                Common::PerfStats::Add(Common::PerfStats::Id::TsharpCacheSlotPages);
+            }
+        } else if (tsharp_cache_on) {
+            tsharp_key = TsharpCache::MakeKey(tsharp, image_desc, num_bindings);
+            const auto* entry = tsharp_cache->Find(*tsharp_key);
+            if (entry && holds(*entry)) {
+                cached = entry;
+                from_tsharp_cache = true;
+            } else {
+                Common::PerfStats::Add(entry ? Common::PerfStats::Id::TsharpCacheStale
+                                             : Common::PerfStats::Id::TsharpCacheNew);
+            }
+        }
+        if (cached && !incremental_bind_verify && !tsharp_cache_verify) {
+            Common::PerfStats::Add(from_tsharp_cache ? Common::PerfStats::Id::TsharpCacheHits
+                                                     : Common::PerfStats::Id::BindReusedImages);
+            if (from_tsharp_cache && slot) {
+                slot->sharp = tsharp;
+                slot->valid = true;
+                slot->resolution = *cached;
+                cached = &slot->resolution;
+            }
+            if (cached->rejected) {
                 append_null_bindings();
                 continue;
             }
             count_lod_stats(tsharp, image_desc.is_written);
-            for (const auto& [cached_id, cached_desc] : slot->bindings) {
+            for (const auto& [cached_id, cached_desc] : cached->bindings) {
                 auto& image_id = image_bindings.emplace_back(cached_id, cached_desc).first;
                 // Keep the LRU touch that FindImage normally performs even when we reuse its image
                 // result and skip the lookup
-                texture_cache.GetImage(image_id).tick_accessed_last = scheduler.CurrentTick();
+                texture_cache.TouchReusedImage(image_id);
                 mark_bound(image_id, image_desc);
             }
             image_descriptor_array_sizes.push_back(num_bindings);
             continue;
         }
-        // With verification enabled, run the full binding path again and compare its result with
-        // the T# binding we would have reused
-        std::optional<BindCache::ImageSlot> reused;
-        if (reuse) {
-            reused.emplace(*slot);
+        // With verification enabled, resolve the reused T# through the full lookup again and
+        // compare the resulting images and views
+        std::optional<BindCache::ImageResolution> reused;
+        if (cached) {
+            reused.emplace(*cached);
         }
-        if (slot) {
-            slot->valid = false;
-            slot->bindings.clear();
-            slot->sharp = tsharp;
-            slot->image_sets = bind_generations.image_sets;
-            slot->maps = bind_generations.maps;
-        }
+        BindCache::ImageResolution fresh{.image_sets = image_sets, .maps = maps};
         const auto finish_slot = [&](bool rejected) {
-            if (!slot) {
-                return;
+            fresh.rejected = rejected;
+            if (reused) {
+                bool matches = reused->rejected == rejected &&
+                               reused->bindings.size() == fresh.bindings.size();
+                for (size_t i = 0; matches && i < fresh.bindings.size(); ++i) {
+                    const auto& [old_id, old_desc] = reused->bindings[i];
+                    const auto& [new_id, new_desc] = fresh.bindings[i];
+                    matches = old_id == new_id && old_desc.type == new_desc.type &&
+                              old_desc.view_info == new_desc.view_info &&
+                              old_desc.info.guest_address == new_desc.info.guest_address &&
+                              old_desc.info.guest_size == new_desc.info.guest_size &&
+                              old_desc.info.pixel_format == new_desc.info.pixel_format;
+                }
+                // The guest may unmap GPU memory between the reused result and the verification
+                // lookup
+                // That changes the lookup result even without caching, just as it would if a normal
+                // lookup happened immediately before the unmap
+                const bool raced = !matches && buffer_cache.MappingGeneration() != maps;
+                bind_verify_raced += raced;
+                VerifyIncrementalBind(matches || raced,
+                                      from_tsharp_cache ? "T# (tsharp_cache)" : "T#",
+                                      stage.pgm_hash, tsharp.Address());
             }
-            slot->rejected = rejected;
-            slot->valid = true;
-            if (!reused) {
-                return;
+            if (slot) {
+                slot->sharp = tsharp;
+                slot->valid = true;
+                slot->resolution = fresh;
             }
-            bool matches = reused->rejected == rejected &&
-                           reused->bindings.size() == slot->bindings.size();
-            for (size_t i = 0; matches && i < slot->bindings.size(); ++i) {
-                const auto& [old_id, old_desc] = reused->bindings[i];
-                const auto& [new_id, new_desc] = slot->bindings[i];
-                matches = old_id == new_id && old_desc.type == new_desc.type &&
-                          old_desc.view_info == new_desc.view_info &&
-                          old_desc.info.guest_address == new_desc.info.guest_address &&
-                          old_desc.info.guest_size == new_desc.info.guest_size &&
-                          old_desc.info.pixel_format == new_desc.info.pixel_format;
+            if (tsharp_cache_on) {
+                if (!tsharp_key) {
+                    tsharp_key = TsharpCache::MakeKey(tsharp, image_desc, num_bindings);
+                }
+                tsharp_cache->Store(*tsharp_key, fresh);
             }
-            VerifyIncrementalBind(matches, "T#", stage.pgm_hash, tsharp.Address());
         };
 
         if (texture_cache.IsMeta(tsharp.Address())) {
@@ -1892,6 +1946,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             finish_slot(true);
             continue;
         }
+        fresh.address = bound_desc->info.guest_address;
+        fresh.size = bound_desc->info.guest_size;
         count_lod_stats(tsharp, image_desc.is_written);
 
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
@@ -1909,7 +1965,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 desc.view_info.range.extent.levels = 1;
             }
 
-            find_bound_image(image_id, desc, image_desc, slot);
+            find_bound_image(image_id, desc, image_desc, &fresh);
         }
 
         image_descriptor_array_sizes.push_back(num_bindings);

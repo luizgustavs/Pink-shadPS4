@@ -169,6 +169,9 @@ public:
     u64 image_uid{};
     u64 lru_id{};
     u64 tick_accessed_last{};
+    /// Remember the last GC tick that touched this image so repeated cached bindings update its LRU
+    /// position only once per tick
+    u64 lru_touch_tick{~0ULL};
     u64 hash{};
 
     struct {
