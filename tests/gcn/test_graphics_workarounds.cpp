@@ -124,6 +124,36 @@ TEST(LdsBarrierUniformReadlane, BarriersStayInsideReadLaneUniformBranch) {
     EmulatorSettings.SetLdsBarrierUniformReadlane(false);
 }
 
+// A workgroup larger than one GCN wave needs a barrier where a divergent branch touching shared
+// memory merges again
+// This covers the single-wave tail used by SotC auto-exposure reductions
+// Straight-line blocks keep relying on the barriers already placed by the guest, so the pass should
+// not add barriers there
+TEST(LdsBarriersLargeGroups, MergeBarrierAfterDivergentBranch) {
+    for (const bool enabled : {false, true}) {
+        EmulatorSettings.SetLdsBarriersLargeGroups(enabled);
+        Info info = MakeComputeInfo();
+        UniformBranchProgram p{info};
+        {
+            IR::IREmitter ir{*p.entry};
+            ir.WriteShared(32, ir.Imm32(1u), ir.Imm32(0u));
+        }
+        {
+            IR::IREmitter ir{*p.body};
+            const IR::U32 offset = ir.Imm32(16u);
+            ir.WriteShared(32, ir.Imm32(1u), offset);
+            (void)ir.LoadShared(32, false, offset);
+        }
+        RuntimeInfo runtime_info = MakeComputeRuntime();
+        runtime_info.hw.cs.workgroup_size = {256, 1, 1};
+        Optimization::SharedMemoryBarrierPass(p.program, runtime_info, MakeProfile());
+        EXPECT_EQ(CountOpcode(*p.entry, IR::Opcode::Barrier), 0u);
+        EXPECT_EQ(CountOpcode(*p.body, IR::Opcode::Barrier), 0u);
+        EXPECT_EQ(CountOpcode(*p.merge, IR::Opcode::Barrier), enabled ? 1u : 0u);
+    }
+    EmulatorSettings.SetLdsBarriersLargeGroups(true);
+}
+
 bool HasReadLaneOfLane(const IR::Block& block, u32 lane) {
     return std::ranges::any_of(block.Instructions(), [lane](const IR::Inst& inst) {
         return inst.GetOpcode() == IR::Opcode::ReadLane && inst.Arg(1).IsImmediate() &&

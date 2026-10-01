@@ -491,6 +491,9 @@ struct GPUSettings {
     Setting<bool> wave64_uniform_branches{false};
     // Use GCN reduction identities for lanes missing from small host workgroups
     Setting<bool> wave64_missing_lane_identity{true};
+    // Add LDS barriers after divergent branches in compute groups larger than one GCN wave so
+    // narrower host subgroups see completed shared writes
+    Setting<bool> lds_barriers_large_groups{true};
     // Record GPU commands and submits to identify the first unfinished submit after device loss
     // Add NVIDIA checkpoints when available; recording adds a small cost per command
     Setting<bool> gpu_checkpoints{false};
@@ -573,6 +576,8 @@ struct GPUSettings {
                                        &GPUSettings::wave64_uniform_branches),
             make_override<GPUSettings>("wave64_missing_lane_identity",
                                        &GPUSettings::wave64_missing_lane_identity),
+            make_override<GPUSettings>("lds_barriers_large_groups",
+                                       &GPUSettings::lds_barriers_large_groups),
             make_override<GPUSettings>("gpu_checkpoints", &GPUSettings::gpu_checkpoints),
             make_override<GPUSettings>("srt_walker_clean_reads",
                                        &GPUSettings::srt_walker_clean_reads),
@@ -610,6 +615,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    lds_barrier_uniform_readlane, early_fragment_tests_from_z_order,
                                    lod_stats_from_bindings, dynamic_tsharp_array_size,
                                    wave64_uniform_branches, wave64_missing_lane_identity,
+                                   lds_barriers_large_groups,
                                    gpu_checkpoints,
                                    srt_walker_clean_reads, shader_code_clean_reads,
                                    readback_ahead, periodic_flush_commands,
@@ -919,6 +925,7 @@ public:
     SETTING_FORWARD(m_gpu, DynamicTsharpArraySize, dynamic_tsharp_array_size)
     SETTING_FORWARD_BOOL(m_gpu, Wave64UniformBranches, wave64_uniform_branches)
     SETTING_FORWARD_BOOL(m_gpu, Wave64MissingLaneIdentity, wave64_missing_lane_identity)
+    SETTING_FORWARD_BOOL(m_gpu, LdsBarriersLargeGroups, lds_barriers_large_groups)
     SETTING_FORWARD_BOOL(m_gpu, GpuCheckpoints, gpu_checkpoints)
     SETTING_FORWARD_BOOL(m_gpu, SrtWalkerCleanReads, srt_walker_clean_reads)
     SETTING_FORWARD_BOOL(m_gpu, ShaderCodeCleanReads, shader_code_clean_reads)

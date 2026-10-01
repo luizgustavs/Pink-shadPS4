@@ -173,9 +173,20 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
     const u32 shared_memory_size = cs_info.shared_memory_size;
     const u32 threadgroup_size =
         cs_info.workgroup_size[0] * cs_info.workgroup_size[1] * cs_info.workgroup_size[2];
-    // The compiler can only omit barriers when the local workgroup size is the same as the HW
-    // subgroup.
-    if (shared_memory_size == 0 || threadgroup_size != GcnSubgroupSize ||
+    // The compiler can skip barriers when the workgroup matches the hardware subgroup size
+    // Larger groups may still have a single-wave LDS reduction tail, such as if (tid < 32) followed
+    // by if (tid < 16), that assumes 64 lanes run together
+    // Host subgroups narrower than 64 lanes do not guarantee that, which can break SotC auto-
+    // exposure and make the sun too bright on NVIDIA
+    // With lds_barriers_large_groups, add barriers at divergent merge blocks that touch LDS and
+    // keep the guest barriers for the other waves
+    // Read this setting like lds_barrier_uniform_readlane because it is included in the shader
+    // codegen key
+    // The setting changes compiled compute code, so cached versions need to keep the value that
+    // produced their barriers
+    const bool large_group =
+        threadgroup_size > GcnSubgroupSize && EmulatorSettings.IsLdsBarriersLargeGroups();
+    if (shared_memory_size == 0 || (threadgroup_size != GcnSubgroupSize && !large_group) ||
         !profile.needs_lds_barriers) {
         return;
     }
@@ -215,12 +226,22 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
             }
             continue;
         }
-        if (node.type == Type::Block && divergence_depth == 0) {
+        if (node.type == Type::Block && divergence_depth == 0 && !large_group) {
             EmitBarrierInBlock(node.data.block);
         }
     }
+    if (large_group) {
+        // Log this compile-time workaround once for each affected shader and include the running
+        // count so its use is easy to track
+        static std::atomic<u32> large_group_shaders{0};
+        LOG_WARNING(Render_Recompiler,
+                    "Workaround lds_barriers_large_groups: shader {:#x} ({} threads) gets LDS "
+                    "barriers after divergent branches (affected shaders: {})",
+                    program.info.pgm_hash, threadgroup_size, large_group_shaders.fetch_add(1) + 1);
+    }
     if (ctx.changed_decision) {
-        // Compile-time workaround: one line per affected shader, with the running count
+        // Log this compile-time workaround once for each affected shader and include the running
+        // count so its use is easy to track
         static std::atomic<u32> affected_shaders{0};
         LOG_WARNING(Render_Recompiler,
                     "Workaround lds_barrier_uniform_readlane: shader {:#x} keeps LDS barriers "
