@@ -66,6 +66,13 @@ struct UniqueImage {
 
     void Destroy();
 
+private:
+    /// Create the image using memory from the pool when image_memory_pool is enabled and the image
+    /// is supported
+    /// Return false so the caller can use the normal allocation path otherwise
+    bool TryCreatePooled(const vk::ImageCreateInfo& image_ci);
+
+public:
     operator vk::Image() const {
         return image;
     }

@@ -1,9 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <atomic>
+#include <mutex>
 #include <ranges>
 #include "common/assert.h"
 #include "common/logging/events.h"
+#include "common/perf_stats.h"
+#include "core/emulator_settings.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -101,9 +106,107 @@ void UniqueImage::Destroy() {
     }
 }
 
+namespace {
+// Keep one VMA pool per memory type for the small images handled by image_memory_pool
+// Custom pool allocations stay inside those blocks instead of using dedicated memory
+// Creating or freeing these images can then avoid repeated vkAllocateMemory and vkFreeMemory calls
+// The pool supplies the backing memory while each image still follows its normal lifetime
+constexpr VkDeviceSize PooledImageMaxBytes = 16ULL << 20;
+constexpr VkDeviceSize ImagePoolBlockBytes = 64ULL << 20;
+std::mutex image_pools_mutex;
+std::array<VmaPool, VK_MAX_MEMORY_TYPES> image_pools{};
+
+VmaPool ImagePool(VmaAllocator allocator, u32 memory_type_bits) {
+    // VMA AUTO usages need image information to choose memory, so use the device-local choice they
+    // would make for these pooled images
+    const VmaAllocationCreateInfo type_ci = {
+        .usage = VMA_MEMORY_USAGE_UNKNOWN,
+        .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+    };
+    u32 type_index{};
+    if (vmaFindMemoryTypeIndex(allocator, memory_type_bits, &type_ci, &type_index) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+    }
+    std::scoped_lock lk{image_pools_mutex};
+    auto& pool = image_pools[type_index];
+    if (!pool) {
+        const VmaPoolCreateInfo pool_ci = {
+            .memoryTypeIndex = type_index,
+            .blockSize = ImagePoolBlockBytes,
+        };
+        if (vmaCreatePool(allocator, &pool_ci, &pool) != VK_SUCCESS) {
+            pool = VK_NULL_HANDLE;
+        }
+    }
+    return pool;
+}
+} // Anonymous namespace
+
+bool UniqueImage::TryCreatePooled(const vk::ImageCreateInfo& image_ci) {
+    static const bool enabled = [] {
+        const bool on = EmulatorSettings.IsImageMemoryPool();
+        if (on) {
+            LOG_WARNING(Render_Vulkan, "Workaround image_memory_pool enabled");
+        }
+        return on;
+    }();
+    static const bool follows_toggle = Common::PerfStats::AbToggleFollows("image_memory_pool");
+    if (!enabled || !Common::PerfStats::AbToggleOn(follows_toggle)) {
+        return false;
+    }
+    const auto give_up = [](const char* reason) {
+        static std::atomic<u32> reported{};
+        if (reported.fetch_add(1) < 8) {
+            LOG_WARNING(Render_Vulkan, "image_memory_pool: not pooled ({})", reason);
+        }
+        return false;
+    };
+    // A moved-from UniqueImage no longer owns a device, so leave it without a device to use during
+    // cleanup
+    if (!device) {
+        return give_up("no device");
+    }
+    auto [create_result, new_image] = device.createImage(image_ci);
+    if (create_result != vk::Result::eSuccess) {
+        return give_up("createImage");
+    }
+    const auto requirements = device.getImageMemoryRequirements(new_image);
+    const VmaPool pool = requirements.size <= PooledImageMaxBytes
+                             ? ImagePool(allocator, requirements.memoryTypeBits)
+                             : VK_NULL_HANDLE;
+    if (!pool) {
+        device.destroyImage(new_image);
+        return requirements.size <= PooledImageMaxBytes ? give_up("no pool") : false;
+    }
+    const VmaAllocationCreateInfo alloc_ci = {
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+        .pool = pool,
+    };
+    VmaAllocationInfo alloc_info{};
+    if (vmaAllocateMemoryForImage(allocator, static_cast<VkImage>(new_image), &alloc_ci,
+                                  &allocation, &alloc_info) != VK_SUCCESS) {
+        device.destroyImage(new_image);
+        allocation = {};
+        return give_up("pool allocation");
+    }
+    if (vmaBindImageMemory(allocator, allocation, static_cast<VkImage>(new_image)) != VK_SUCCESS) {
+        vmaFreeMemory(allocator, allocation);
+        device.destroyImage(new_image);
+        allocation = {};
+        return false;
+    }
+    Common::PerfStats::Add(Common::PerfStats::Id::PooledImages);
+    image = new_image;
+    size_bytes = alloc_info.size;
+    return true;
+}
+
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     this->image_ci = image_ci;
     ASSERT(!image);
+    if (TryCreatePooled(image_ci)) {
+        return;
+    }
     const VmaAllocationCreateInfo alloc_ci = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,

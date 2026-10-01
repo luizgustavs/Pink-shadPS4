@@ -528,6 +528,9 @@ struct GPUSettings {
     // Check a GPU-written tick in host memory before querying the driver in mode 1, and also allow
     // readbacks to finish on that marker in mode 2
     Setting<u32> wait_marker{0};
+    // Sub-allocate images up to 16 MB from pools with 64 MB blocks to avoid individual device
+    // memory allocations for small images
+    Setting<bool> image_memory_pool{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -591,6 +594,7 @@ struct GPUSettings {
             make_override<GPUSettings>("incremental_bind", &GPUSettings::incremental_bind),
             make_override<GPUSettings>("tsharp_cache", &GPUSettings::tsharp_cache),
             make_override<GPUSettings>("wait_marker", &GPUSettings::wait_marker),
+            make_override<GPUSettings>("image_memory_pool", &GPUSettings::image_memory_pool),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -612,7 +616,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    cp_recording_cuts, gpu_overhead_cuts, dma_sweep_skip_stacks,
                                    wait_spin_us, readback_ahead_transfer_queue, mapped_page_table,
                                    dma_sync_once_per_batch, incremental_bind, tsharp_cache,
-                                   wait_marker)
+                                   wait_marker, image_memory_pool)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -930,6 +934,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, IncrementalBind, incremental_bind)
     SETTING_FORWARD_BOOL(m_gpu, TsharpCache, tsharp_cache)
     SETTING_FORWARD(m_gpu, WaitMarker, wait_marker)
+    SETTING_FORWARD_BOOL(m_gpu, ImageMemoryPool, image_memory_pool)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

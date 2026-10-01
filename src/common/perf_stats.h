@@ -158,6 +158,9 @@ enum class Id : u32 {
     WaitKernelPolls,
     WaitMarkerLate,
     WaitMarkerEarly,
+    // Count images whose memory was sub-allocated from image_memory_pool instead of using an
+    // individual allocation
+    PooledImages,
     Count,
 };
 
