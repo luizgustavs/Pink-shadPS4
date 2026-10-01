@@ -492,13 +492,15 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
                                          src->info.pixel_format != dst->info.pixel_format;
         const u32 src_depth_class = DepthCopyClass(src->info.pixel_format);
         const bool buffer_depth_copy =
-            depth_format_change && !instance.IsMaintenance8Supported() && src_depth_class != 0 &&
+            depth_format_change && src_depth_class != 0 &&
             src_depth_class == DepthCopyClass(dst->info.pixel_format) &&
             src->info.size == dst->info.size &&
             std::min(src->info.resources.levels, dst->info.resources.levels) == 1;
         if (buffer_depth_copy) {
-            // Vulkan cannot copy directly between depth/stencil formats such as D16 and D16S8
-            // When the guest adds stencil to a depth image, copy the depth aspect through a buffer
+            // maintenance8 allows compatible color and depth copies, but it does not allow every
+            // pair of depth and stencil formats
+            // Use a buffer for the depth copy when the guest adds stencil, as required by VUID-
+            // vkCmdCopyImage-srcImage-01548
             CopyImageWithBuffer(src, dst);
         } else if (instance.IsMaintenance8Supported() ||
                    src->info.props.is_depth == dst->info.props.is_depth) {
