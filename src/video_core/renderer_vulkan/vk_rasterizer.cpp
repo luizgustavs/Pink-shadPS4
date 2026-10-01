@@ -2708,6 +2708,10 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::GpuUnmap, addr, size);
+    // Bump the mapping generation before removing the range as well as afterward
+    // A bind reading it during removal must discard its cached answer, and an extra bump only
+    // causes another safe invalidation
+    buffer_cache.OnMappingChanged();
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);
     {
