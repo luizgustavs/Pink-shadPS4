@@ -697,7 +697,10 @@ struct PM4CmdWaitRegMem {
     }
 
     bool Test(std::span<const u32> regs) const {
-        u32 value = mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()];
+        return TestValue(mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()]);
+    }
+
+    bool TestValue(u32 value) const {
         switch (function.Value()) {
         case Function::Always: {
             return true;

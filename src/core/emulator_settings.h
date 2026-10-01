@@ -534,6 +534,9 @@ struct GPUSettings {
     // Sub-allocate images up to 16 MB from pools with 64 MB blocks to avoid individual device
     // memory allocations for small images
     Setting<bool> image_memory_pool{false};
+    // Delay gfx EOP labels by this many microseconds as a temporary timing workaround, with 0
+    // disabling it and no GPU completion guarantee
+    Setting<u32> eop_label_delay_us{0};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -600,6 +603,7 @@ struct GPUSettings {
             make_override<GPUSettings>("tsharp_cache", &GPUSettings::tsharp_cache),
             make_override<GPUSettings>("wait_marker", &GPUSettings::wait_marker),
             make_override<GPUSettings>("image_memory_pool", &GPUSettings::image_memory_pool),
+            make_override<GPUSettings>("eop_label_delay_us", &GPUSettings::eop_label_delay_us),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -622,7 +626,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    cp_recording_cuts, gpu_overhead_cuts, dma_sweep_skip_stacks,
                                    wait_spin_us, readback_ahead_transfer_queue, mapped_page_table,
                                    dma_sync_once_per_batch, incremental_bind, tsharp_cache,
-                                   wait_marker, image_memory_pool)
+                                   wait_marker, image_memory_pool, eop_label_delay_us)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -942,6 +946,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, TsharpCache, tsharp_cache)
     SETTING_FORWARD(m_gpu, WaitMarker, wait_marker)
     SETTING_FORWARD_BOOL(m_gpu, ImageMemoryPool, image_memory_pool)
+    SETTING_FORWARD(m_gpu, EopLabelDelayUs, eop_label_delay_us)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

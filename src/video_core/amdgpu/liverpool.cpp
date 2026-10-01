@@ -4,6 +4,12 @@
 #include <boost/preprocessor/stringize.hpp>
 
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <unordered_map>
 
 #include "common/assert.h"
 #include "common/cp_profiler.h"
@@ -13,6 +19,7 @@
 #include "common/perf_stats.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
+#include "common/unique_function.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
@@ -55,6 +62,149 @@ template <typename... Args>
 static void LogSync(std::string_view queue, fmt::format_string<Args...> format, Args&&... args) {
     LOG_WARNING(Render, "DrawTrace f={} {} {}", Vulkan::DrawTrace::Instance().Frame(), queue,
                 fmt::format(format, std::forward<Args>(args)...));
+}
+
+/// Delay gfx EOP labels with a timer as a temporary workaround for the SotC rock flicker
+/// The game starts CPU visibility jobs after reading the previous BOTTOM_OF_PIPE label for their
+/// memory
+/// Writing that label as soon as the packet is read can release the jobs too early and put their
+/// output in another frame
+/// The timer adds a fixed delay without waiting for the GPU or submitting work, and 2000 us helped
+/// in earlier tests
+/// It can still publish the label too early when the GPU falls behind, and readback_ahead can bring
+/// the flicker back
+/// A complete fix still needs to publish labels after the GPU finishes the commands before them
+/// Treat the delay as a timing adjustment rather than proof that the preceding work has completed,
+/// because the timer cannot see how far the GPU has progressed
+namespace DelayedLabels {
+namespace {
+struct Pending {
+    u64 value;
+    u32 bytes;
+    u64 seq;
+};
+std::mutex pending_mutex;
+std::unordered_map<VAddr, Pending> pending;
+u64 next_seq{};
+std::atomic<u32> pending_count{};
+
+struct Item {
+    u64 due_ns;
+    Common::UniqueFunction<void> func;
+};
+std::mutex timer_mutex;
+std::condition_variable timer_cv;
+std::deque<Item> items;
+
+u64 NowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+void Worker() {
+    Common::SetCurrentThreadName("shadPS4:LabelTimer");
+    std::unique_lock lk{timer_mutex};
+    while (true) {
+        timer_cv.wait(lk, [] { return !items.empty(); });
+        const u64 due = items.front().due_ns;
+        const u64 now = NowNs();
+        if (now < due) {
+            // The OS timer has roughly 1 ms resolution, so sleep for most of the remaining delay
+            // and yield near the deadline
+            if (due - now > 1'500'000) {
+                timer_cv.wait_for(lk, std::chrono::nanoseconds{due - now - 1'000'000});
+            } else {
+                lk.unlock();
+                std::this_thread::yield();
+                lk.lock();
+            }
+            continue;
+        }
+        // Every label uses the same delay and enters in command order, so the front of the queue is
+        // also the next label due
+        auto func = std::move(items.front().func);
+        items.pop_front();
+        lk.unlock();
+        func();
+        lk.lock();
+    }
+}
+} // Anonymous namespace
+
+/// Return the configured EOP label delay in microseconds, or 0 when the temporary timing workaround
+/// is disabled
+u32 DelayUs() {
+    static const u32 delay_us = [] {
+        const u32 value = EmulatorSettings.GetEopLabelDelayUs();
+        if (value != 0) {
+            LOG_WARNING(Render, "Workaround eop_label_delay_us enabled: gfx EOP labels {} us after "
+                                "the packet (crude timing patch)",
+                        value);
+            if (EmulatorSettings.IsReadbackAhead()) {
+                LOG_WARNING(Render, "eop_label_delay_us with readback_ahead: the flicker it hides "
+                                    "comes back with readback_ahead");
+            }
+        }
+        return value;
+    }();
+    return delay_us;
+}
+
+/// Keep the label waiting for its timer together with the value that command processor waits should
+/// already see
+u64 AddPending(VAddr addr, u64 value, u32 bytes) {
+    std::scoped_lock lock{pending_mutex};
+    pending[addr] = Pending{value, bytes, ++next_seq};
+    pending_count.store(static_cast<u32>(pending.size()), std::memory_order_release);
+    return next_seq;
+}
+
+void RemovePending(VAddr addr, u64 seq) {
+    std::scoped_lock lock{pending_mutex};
+    const auto it = pending.find(addr);
+    if (it != pending.end() && it->second.seq == seq) {
+        pending.erase(it);
+        pending_count.store(static_cast<u32>(pending.size()), std::memory_order_release);
+    }
+}
+
+std::optional<u32> PendingDword(VAddr addr) {
+    if (pending_count.load(std::memory_order_acquire) == 0) {
+        return std::nullopt;
+    }
+    std::scoped_lock lock{pending_mutex};
+    if (const auto it = pending.find(addr); it != pending.end()) {
+        return static_cast<u32>(it->second.value);
+    }
+    if (const auto it = pending.find(addr - 4); it != pending.end() && it->second.bytes == 8) {
+        return static_cast<u32>(it->second.value >> 32);
+    }
+    return std::nullopt;
+}
+
+void Push(u64 delay_ns, Common::UniqueFunction<void>&& func) {
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread{Worker}.detach(); });
+    {
+        std::scoped_lock lk{timer_mutex};
+        items.push_back(Item{NowNs() + delay_ns, std::move(func)});
+    }
+    timer_cv.notify_one();
+}
+} // namespace DelayedLabels
+
+/// Check WAIT_REG_MEM using the value visible to the command processor in command order
+/// With eop_label_delay_us, a pending label already has its queued value for these waits even
+/// before the timer writes guest memory
+static bool CpWaitPasses(const PM4CmdWaitRegMem* wait, std::span<const u32> regs) {
+    if (DelayedLabels::DelayUs() != 0 &&
+        wait->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
+        if (const auto value = DelayedLabels::PendingDword(wait->Address<VAddr>())) {
+            return wait->TestValue(*value);
+        }
+    }
+    return wait->Test(regs);
 }
 
 namespace CpHistory {
@@ -876,15 +1026,43 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     rasterizer->OnFence();
                 }
                 RecordLabelLag(GfxQueueId);
-                event_eop->SignalFence(
-                    [](void* address, u64 data, u32 num_bytes) {
-                        auto* memory = Core::Memory::Instance();
-                        Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Label,
-                                                          reinterpret_cast<u64>(address),
-                                                          num_bytes, &data, 1);
-                        ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
-                    },
-                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+                const auto write_label = [](void* address, u64 data, u32 num_bytes) {
+                    auto* memory = Core::Memory::Instance();
+                    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Label,
+                                                      reinterpret_cast<u64>(address), num_bytes,
+                                                      &data, 1);
+                    ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+                };
+                const auto signal_irq = [] {
+                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
+                };
+                // With eop_label_delay_us, write this gfx label and raise its interrupt after the
+                // fixed timer delay
+                // GPU timestamps and video output labels still use their normal immediate write
+                // path
+                const auto data_sel = event_eop->data_sel.Value();
+                if (const u32 delay_us = DelayedLabels::DelayUs();
+                    delay_us != 0 && data_sel != DataSelect::GpuClock64 &&
+                    data_sel != DataSelect::PerfCounter &&
+                    !vo_port->IsVoLabel(event_eop->Address<u64>())) {
+                    const PM4CmdEventWriteEop packet = *event_eop;
+                    const auto label_addr = reinterpret_cast<VAddr>(event_eop->Address<u8>());
+                    const u64 seq =
+                        data_sel == DataSelect::Data32Low
+                            ? DelayedLabels::AddPending(label_addr, packet.DataDWord(), sizeof(u32))
+                        : data_sel == DataSelect::Data64
+                            ? DelayedLabels::AddPending(label_addr, packet.DataQWord(), sizeof(u64))
+                            : 0;
+                    DelayedLabels::Push(u64{delay_us} * 1000,
+                                        [packet, write_label, signal_irq, label_addr, seq] {
+                                            packet.SignalFence(write_label, signal_irq);
+                                            if (seq != 0) {
+                                                DelayedLabels::RemovePending(label_addr, seq);
+                                            }
+                                        });
+                    break;
+                }
+                event_eop->SignalFence(write_label, signal_irq);
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -1024,7 +1202,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
-                while (!wait_reg_mem->Test(regs.reg_array)) {
+                while (!CpWaitPasses(wait_reg_mem, regs.reg_array)) {
                     Common::PerfStats::Add(Common::PerfStats::Id::CpWaitYields);
                     YIELD_GFX();
                 }
@@ -1377,7 +1555,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                         u32(wait_reg_mem->function.Value()), wait_reg_mem->ref,
                         wait_reg_mem->mask, wait_reg_mem->Test(regs.reg_array));
             }
-            while (!wait_reg_mem->Test(regs.reg_array)) {
+            while (!CpWaitPasses(wait_reg_mem, regs.reg_array)) {
                 Common::PerfStats::Add(Common::PerfStats::Id::CpWaitYields);
                 YIELD_ASC(vqid);
             }
