@@ -572,7 +572,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::SetPredication: {
-                LOG_RENDER_PROBLEM(Render, Warning, "Unimplemented IT_SET_PREDICATION");
+                // The packet stores START_ADDR_LO followed by START_ADDR_HI[7:0],
+                // PREDICATION_BOOL[8] and HINT[12]
+                // PRED_OP[18:16] selects clear, ZPass or PrimCount, and CONTINUE[31] carries the
+                // continuation flag
+                // SotC only sends the clear operation here, about 15 times per frame, which needs
+                // no work while predication is never enabled
+                const auto* body = reinterpret_cast<const u32*>(header) + 1;
+                const u32 lo = count >= 1 ? body[0] : 0;
+                const u32 ctl = count >= 2 ? body[1] : 0;
+                if (((ctl >> 16) & 7) == 0) {
+                    break;
+                }
+                LOG_RENDER_PROBLEM(Render, Warning,
+                                   "Unimplemented IT_SET_PREDICATION op={} bool={} hint={} "
+                                   "continue={} addr={:#x}",
+                                   (ctl >> 16) & 7, (ctl >> 8) & 1, (ctl >> 12) & 1, ctl >> 31,
+                                   (u64{ctl & 0xff} << 32) | (lo & ~0xfu));
                 break;
             }
             case PM4ItOpcode::IndexType: {
