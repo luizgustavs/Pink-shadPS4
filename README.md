@@ -33,7 +33,15 @@ AMD users may get a better experience with the following workaround settings:
 - **GPU wait spin:** set to `0`.
 - **GPU overhead cuts:** uncheck.
 
-## Tecnical Stuff (Workaround keys)
+## Known issues
+
+1. Many issues remain; this fork is still experimental.
+2. VRAM usage is very high. It is unclear whether playing with less than 12 GB of VRAM is viable.
+3. Some textures occasionally fail to load. Restarting the game usually fixes this.
+4. Stability on AMD graphics cards is currently uncertain.
+5. Some level-of-detail (LOD) issues remain.
+
+## Technical stuff (Workaround keys)
 
 Workarounds can improve specific games but may reduce performance or cause regressions elsewhere. Configure them in the launcher's **Workarounds** tab or in a per-game preset.
 
@@ -60,7 +68,6 @@ Workarounds can improve specific games but may reduce performance or cause regre
 | `dynamic_tsharp_array_size` | Sets the descriptor-array size for dynamically indexed texture tables; `0` disables it. |
 | `wave64_uniform_branches` | Correctly lowers wave64 lane operations inside workgroup-uniform branches. |
 | `wave64_missing_lane_identity` | Supplies PS4 reduction identity values for wave64 lanes missing on the host GPU. |
-| `lds_barriers_large_groups` | Adds shared-memory barriers to large compute workgroups (fixes the blown-out sun on NVIDIA); on by default. |
 | `gpu_checkpoints` | Records GPU commands and submits to help diagnose device loss, at a performance cost. |
 | `srt_walker_clean_reads` | Reads clean shader-resource-table data from guest memory without draining the GPU. |
 | `shader_code_clean_reads` | Checks clean shader code through guest memory to avoid unnecessary GPU readbacks. |
@@ -71,14 +78,22 @@ Workarounds can improve specific games but may reduce performance or cause regre
 | `dma_sweep_skip_stacks` | Excludes guest stacks from bulk DMA synchronization; requires `cpu_authoritative_stacks`. |
 | `gpu_overhead_cuts` | Detiles uploaded textures in VRAM and skips redundant pipeline bindings. |
 | `cp_recording_cuts` | Caches memory lookups, but may cause visual glitches. The DMA sync skip moved to `dma_sync_once_per_batch`. |
-| `mapped_page_table` | Answers GPU memory lookups from a lock-free page table instead of a locked search. |
-| `dma_sync_once_per_batch` | Adds the resident buffer ranges to a sync batch only once instead of on every DMA dispatch. |
-| `incremental_bind` | Reuses the previous bindings of a pipeline for unchanged buffers and textures. |
-| `tsharp_cache` | Reuses how a texture descriptor was resolved by any pipeline; changes what the GPU samples, check visually. |
-| `wait_marker` | With `wait_spin_us`, polls a GPU-written value before asking the driver (`1`); `2` also lets readbacks return on it. |
-| `image_memory_pool` | Sub-allocates images up to 16 MB from a memory pool instead of a dedicated allocation each. |
-| `cp_record_thread` | Records Vulkan commands on a separate thread; pairs with `readback_ahead_transfer_queue`. |
-| `eop_label_delay_us` | Crude stopgap for SotC's flickering rocks: delays GPU fence labels by a fixed time (`2000`); `0` disables it. Brings the flicker back with `readback_ahead`. |
+
+#### GPU keys added in 0.3.0
+
+These defaults are from the emulator; per-game presets may override them.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `mapped_page_table` | `false` | Answers GPU memory lookups from a table of mapped 16 KB pages to avoid locked searches. |
+| `dma_sync_once_per_batch` | `false` | Adds resident buffer ranges to a DMA sync batch only once instead of on every DMA dispatch. This replaces the DMA sync skip previously included in `cp_recording_cuts`. |
+| `incremental_bind` | `false` | Reuses unchanged read-only buffer and texture bindings from the previous call of a pipeline while their resources remain valid. |
+| `tsharp_cache` | `false` | Reuses texture descriptor lookups across pipelines while the registered images on their pages remain unchanged; changes what the GPU samples, so check visually. |
+| `wait_marker` | `0` | `0` disables it; `1` polls a GPU-written marker before querying the driver; `2` also lets readbacks complete on that marker. Requires `wait_spin_us` greater than `0`. |
+| `image_memory_pool` | `false` | Sub-allocates images up to 16 MB from pools with 64 MB blocks instead of allocating memory separately for each image. |
+| `cp_record_thread` | `false` | Moves Vulkan command recording and submissions to a separate worker thread; pairs with `readback_ahead_transfer_queue`. |
+| `lds_barriers_large_groups` | `true` | Adds shared-memory barriers to compute workgroups larger than 64 threads to fix the blown-out sun on NVIDIA. |
+| `eop_label_delay_us` | `0` | Temporary workaround for SotC's flickering rocks: delays graphics EOP labels by a fixed number of microseconds (`2000` was used in testing); `0` disables it. This does not guarantee GPU completion, and enabling `readback_ahead` can bring the flicker back. |
 
 ### Other settings used by the SotC presets
 
