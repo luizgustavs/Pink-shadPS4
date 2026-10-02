@@ -16,6 +16,7 @@ The ZIP already includes the launcher and emulator with specific settings for th
 1. Download the ZIP and extract it into a folder.
 2. Run the launcher once to create the `games` folder, then put your game folder (`CUSAXXXXX`) inside it.
 3. Play! The launcher should apply every setting for and and automatically import the correct shadPS4.exe for you 
+4. About the audio, you need to install the PS4 libs on user/sys_modules
 
 ### Recommended settings
 
