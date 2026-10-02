@@ -529,11 +529,7 @@ bool PipelineCache::CachedBytesMatch(const u32* code, const CachedBinaryInfo& ca
 }
 
 template <typename Program>
-Shader::ShaderParams PipelineCache::GetParamsCached(const Program& pgm) {
-    // Per-game shader_code_clean_reads; without it the search runs on every draw and dispatch as before
-    if (!EmulatorSettings.IsShaderCodeCleanReads()) {
-        return AmdGpu::GetParams(pgm);
-    }
+std::optional<Shader::ShaderParams> PipelineCache::GetParamsCached(const Program& pgm) {
     const auto* code = pgm.template Address<u32*>();
     const auto make_params = [&](const AmdGpu::BinaryInfo& info) {
         return Shader::ShaderParams{
@@ -542,11 +538,33 @@ Shader::ShaderParams PipelineCache::GetParamsCached(const Program& pgm) {
             .hash = info.shader_hash,
         };
     };
-    if (const auto it = binary_info_cache.find(code);
-        it != binary_info_cache.end() && CachedBytesMatch(code, it->second)) {
-        return make_params(it->second.info);
+    // With shader_code_clean_reads enabled for this game, reuse binary info while the tracked
+    // shader bytes stay unchanged so each draw or dispatch does not repeat the full search
+    const bool cached_search = EmulatorSettings.IsShaderCodeCleanReads();
+    if (cached_search) {
+        if (const auto it = binary_info_cache.find(code);
+            it != binary_info_cache.end() && CachedBytesMatch(code, it->second)) {
+            return make_params(it->second.info);
+        }
     }
-    const auto& info = AmdGpu::SearchBinaryInfo(code);
+    // The command processor may read stale state whose program address contains no valid shader
+    // Skip that draw or dispatch instead of aborting, as we already do for rejected texture
+    // descriptors, and limit the warnings because the same bad state may repeat on every draw
+    const auto* found_info = AmdGpu::FindBinaryInfo(code);
+    if (!found_info) {
+        static std::atomic<u32> missing_warnings{0};
+        constexpr u32 MaxMissingWarnings = 32;
+        if (missing_warnings.fetch_add(1, std::memory_order_relaxed) < MaxMissingWarnings) {
+            LOG_RENDER_PROBLEM(Render_Vulkan, Error,
+                               "Shader binary info not found at {}, skipping the command",
+                               fmt::ptr(code));
+        }
+        return std::nullopt;
+    }
+    if (!cached_search) {
+        return make_params(*found_info);
+    }
+    const auto& info = *found_info;
     auto& cached = binary_info_cache[code];
     cached.ranges.clear();
     cached.bytes.clear();
@@ -583,6 +601,9 @@ bool PipelineCache::RefreshGraphicsStages() {
     fetch_shader = nullptr;
 
     Shader::Backend::Bindings binding{};
+    // A shader stage with missing binary info makes the whole draw unusable, so remember that
+    // separately from a disabled stage, which simply returns false without invalidating the draw
+    bool missing_code = false;
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
@@ -600,8 +621,12 @@ bool PipelineCache::RefreshGraphicsStages() {
         }
 
         const auto params = GetParamsCached(*pgm);
+        if (!params) {
+            missing_code = true;
+            return false;
+        }
         std::tie(infos[stage_out_idx], modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
-            GetProgram(stage_in, stage_out, params, binding);
+            GetProgram(stage_in, stage_out, *params, binding);
         return true;
     };
 
@@ -609,6 +634,9 @@ bool PipelineCache::RefreshGraphicsStages() {
     modules.fill(nullptr);
 
     bind_stage(HwStage::Fragment, SwStage::Fragment);
+    if (missing_code) {
+        return false;
+    }
 
     const auto* fs_info = infos[static_cast<u32>(SwStage::Fragment)];
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
@@ -675,7 +703,9 @@ bool PipelineCache::RefreshGraphicsStages() {
         }
         break;
     case AmdGpu::ShaderStageEnable::VgtStages::Vs:
-        bind_stage(HwStage::Vertex, SwStage::Vertex);
+        if (!bind_stage(HwStage::Vertex, SwStage::Vertex) && missing_code) {
+            return false;
+        }
         break;
     default:
         LOG_RENDER_PROBLEM(Render_Vulkan, Warning, "unimplemented shader stage {}",
@@ -705,8 +735,11 @@ bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
     const auto cs_params = GetParamsCached(cs_pgm);
+    if (!cs_params) {
+        return false;
+    }
     std::tie(infos[0], modules[0], compute_key.value) =
-        GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
+        GetProgram(HwStage::Compute, SwStage::Compute, *cs_params, binding);
     return true;
 }
 

@@ -147,9 +147,10 @@ private:
         AmdGpu::BinaryInfo info;
     };
 
-    /// Gets shader parameters without rescanning unchanged code
+    /// Reuse shader parameters while the code bytes stay unchanged and return nullopt when no
+    /// valid binary info is found, so the caller can skip the draw or dispatch safely
     template <typename Program>
-    Shader::ShaderParams GetParamsCached(const Program& pgm);
+    std::optional<Shader::ShaderParams> GetParamsCached(const Program& pgm);
     bool CachedBytesMatch(const u32* code, const CachedBinaryInfo& cached);
 
     bool RefreshGraphicsKey();
