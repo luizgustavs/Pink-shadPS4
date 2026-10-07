@@ -170,6 +170,10 @@ struct PageManager::Impl {
         }
     }
 
+    bool HasPageLock(u64 page) {
+        return page_spin_locks ? spin_locks.find(page) != nullptr : locks.find(page) != nullptr;
+    }
+
     void UnlockPage(u64 page) {
         if (page_spin_locks) {
             if (auto* lock = spin_locks.find(page)) {
@@ -707,7 +711,8 @@ struct SignalImpl : public PageManager::Impl {
         const VAddr page = addr & ~(PageManager::PM_PAGE_SIZE - 1);
         const u64 page_index = page >> PageManager::PM_PAGE_BITS;
         PageState* state = cached_pages.find(page_index);
-        if (!state) {
+        // A concurrent mapping can have a page state before its lock is reserved
+        if (!state || !HasPageLock(page_index)) {
             return true;
         }
         Core::MemoryPermission perms;
