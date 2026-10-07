@@ -181,6 +181,9 @@ enum class Id : u32 {
     // Count times the command processor wakes a sleeping recording thread after making another
     // command batch available
     RecorderWakes,
+    // Texture bindings that are the draw's own read-only depth target
+    // (depth_target_sampled_layout shares one layout between the two uses)
+    DepthTargetSampled,
     Count,
 };
 

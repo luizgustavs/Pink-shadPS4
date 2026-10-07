@@ -519,7 +519,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
                               std::getenv("SHADPS4_INCREMENTAL_BIND_VERIFY") != nullptr},
       tsharp_cache{EmulatorSettings.IsTsharpCache() ? std::make_unique<TsharpCache>() : nullptr},
       tsharp_cache_toggle{Common::PerfStats::AbToggleFollows("tsharp_cache")},
-      tsharp_cache_verify{tsharp_cache && std::getenv("SHADPS4_TSHARP_CACHE_VERIFY") != nullptr} {
+      tsharp_cache_verify{tsharp_cache && std::getenv("SHADPS4_TSHARP_CACHE_VERIFY") != nullptr},
+      depth_target_sampled_layout{EmulatorSettings.IsDepthTargetSampledLayout()},
+      depth_target_sampled_toggle{
+          Common::PerfStats::AbToggleFollows("depth_target_sampled_layout")} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -581,6 +584,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         LOG_WARNING(Render_Vulkan, "Workaround force_anisotropy enabled: {}x (device max {}x)",
                     aniso, instance.MaxSamplerAnisotropy());
     }
+    if (depth_target_sampled_layout) {
+        LOG_WARNING(Render_Vulkan, "Workaround depth_target_sampled_layout enabled");
+    }
     scheduler.SkipRedundantPipelineBinds(EmulatorSettings.IsGpuOverheadCuts());
 }
 
@@ -634,6 +640,8 @@ bool Rasterizer::FilterDraw() {
 }
 
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+    depth_target_shared = depth_target_sampled_layout &&
+                          Common::PerfStats::AbToggleOn(depth_target_sampled_toggle);
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = liverpool->regs;
@@ -2024,12 +2032,28 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
                         desc.view_info.range);
                 } else {
-                    const auto new_layout = image.info.props.is_depth
-                                                ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-                                                : vk::ImageLayout::eShaderReadOnlyOptimal;
-                    needs_barrier |= runtime.Transit(
-                        &image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
-                        vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
+                    auto new_layout = image.info.props.is_depth
+                                          ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                          : vk::ImageLayout::eShaderReadOnlyOptimal;
+                    auto new_access = vk::AccessFlags2{vk::AccessFlagBits2::eShaderRead};
+                    // Use the attachment layout and access for both uses of
+                    // this read-only depth target
+                    // This avoids a barrier between sampling and attachment access
+                    if (image.info.props.is_depth && binding.is_target &&
+                        image_id == db_desc.first &&
+                        LiverpoolToVK::IsFormatDepthCompatible(image_view.info.format)) {
+                        if (const auto layout = DepthTargetLayout(image);
+                            layout && IsReadOnlyDepthLayout(*layout)) {
+                            Common::PerfStats::Add(Common::PerfStats::Id::DepthTargetSampled);
+                            if (depth_target_shared) {
+                                new_layout = *layout;
+                                new_access |= SharedDepthTargetAccess;
+                            }
+                        }
+                    }
+                    needs_barrier |= runtime.Transit(&image, new_layout,
+                                                     vk::PipelineStageFlagBits2::eAllCommands,
+                                                     new_access, desc.view_info.range);
                 }
             }
             image.usage.storage |= is_storage;
@@ -2124,6 +2148,29 @@ void Rasterizer::RefreshImageDescriptorLayouts() {
     }
 }
 
+std::optional<vk::ImageLayout> Rasterizer::DepthTargetLayout(const VideoCore::Image& image) const {
+    if (!db_desc.first) {
+        return std::nullopt;
+    }
+    const auto& desc = db_desc.second;
+    const bool has_stencil = image.info.props.has_stencil;
+    // Stencil writes can be enabled while depth writes are off
+    const bool stencil_write =
+        has_stencil && liverpool->regs.depth_control.stencil_enable && !desc.view_info.is_storage;
+    return desc.view_info.is_storage
+               ? has_stencil ? vk::ImageLayout::eDepthStencilAttachmentOptimal
+                             : vk::ImageLayout::eDepthAttachmentOptimal
+           : stencil_write ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
+           : has_stencil   ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                           : vk::ImageLayout::eDepthReadOnlyOptimal;
+}
+
+bool Rasterizer::IsReadOnlyDepthLayout(vk::ImageLayout layout) {
+    return layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal ||
+           layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+           layout == vk::ImageLayout::eDepthReadOnlyOptimal;
+}
+
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
     const auto& regs = liverpool->regs;
@@ -2208,23 +2255,18 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         texture_cache.TouchMeta(htile_address, slice, false);
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 
-        const bool has_stencil = image.info.props.has_stencil;
-        // Stencil writes can be enabled while depth writes are off.
-        const bool stencil_write =
-            has_stencil && regs.depth_control.stencil_enable && !desc.view_info.is_storage;
-        const auto new_layout = desc.view_info.is_storage
-                                    ? has_stencil ? vk::ImageLayout::eDepthStencilAttachmentOptimal
-                                                  : vk::ImageLayout::eDepthAttachmentOptimal
-                                : stencil_write
-                                    ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
-                                : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-                                              : vk::ImageLayout::eDepthReadOnlyOptimal;
-        needs_barrier |= runtime.Transit(&image, new_layout,
-                                         vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                                             vk::PipelineStageFlagBits2::eLateFragmentTests,
-                                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-                                             vk::AccessFlagBits2::eDepthStencilAttachmentRead,
-                                         desc.view_info.range);
+        const auto new_layout = *DepthTargetLayout(image);
+        // depth_target_sampled_layout: a read-only depth target keeps the access of a
+        // sampled one, so draws that sample it and draws that do not share one state
+        const bool shared = depth_target_shared && IsReadOnlyDepthLayout(new_layout);
+        needs_barrier |= runtime.Transit(
+            &image, new_layout,
+            shared ? vk::PipelineStageFlags2{vk::PipelineStageFlagBits2::eAllCommands}
+                   : vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                         vk::PipelineStageFlagBits2::eLateFragmentTests,
+            shared ? vk::AccessFlagBits2::eShaderRead | SharedDepthTargetAccess
+                   : SharedDepthTargetAccess,
+            desc.view_info.range);
 
         state.width = std::min<u32>(state.width, image.info.size.width);
         state.height = std::min<u32>(state.height, image.info.size.height);

@@ -136,6 +136,9 @@ private:
     void UpdateMappedPageTable(VAddr addr, u64 size, bool mapped);
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
+    /// Layout BeginRendering gives the current draw's depth target, none without one
+    std::optional<vk::ImageLayout> DepthTargetLayout(const VideoCore::Image& image) const;
+    static bool IsReadOnlyDepthLayout(vk::ImageLayout layout);
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
@@ -275,6 +278,14 @@ private:
     /// and compare the images and views
     const bool tsharp_cache_verify;
     bool tsharp_cache_on{};
+    // depth_target_sampled_layout, whether it follows SHADPS4_AB_TOGGLE and whether it
+    // is on for the draw being recorded
+    const bool depth_target_sampled_layout;
+    const bool depth_target_sampled_toggle;
+    bool depth_target_shared{};
+    static constexpr vk::AccessFlags2 SharedDepthTargetAccess =
+        vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+        vk::AccessFlagBits2::eDepthStencilAttachmentRead;
     u64 bind_verify_checks{};
     u64 bind_verify_mismatches{};
     u64 bind_verify_raced{};
