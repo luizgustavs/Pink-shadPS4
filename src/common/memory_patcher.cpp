@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <codecvt>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -12,6 +14,7 @@
 #include "common/harness.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "core/emulator_settings.h"
 #include "core/emulator_state.h"
 #include "core/file_format/psf.h"
 #include "memory_patcher.h"
@@ -216,6 +219,69 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
     }
 }
 
+namespace {
+
+struct BuiltinPatch {
+    u64 offset; // From the eboot load base
+    std::vector<u8> original;
+    std::vector<u8> patched;
+};
+
+std::vector<u8> HexBytes(std::string_view hex) {
+    std::vector<u8> bytes;
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+        bytes.push_back(static_cast<u8>(std::stoi(std::string{hex.substr(i, 2)}, nullptr, 16)));
+    }
+    return bytes;
+}
+
+// Force every Pro resolution entry to 3840x2160 for Shadow of the Colossus 01.01
+// Keep the branch that creates the render target heap and grow it for the 4K targets
+// Default to display mode 2 so the final pass and UI also use the 4K surfaces
+void ApplySotcPro4k() {
+    if (!EmulatorSettings.IsSotcPro4k()) {
+        return;
+    }
+    if (g_game_serial != "CUSA08809" && g_game_serial != "CUSA08804" &&
+        g_game_serial != "CUSA08034") {
+        LOG_WARNING(Loader, "sotc_pro_4k: not Shadow of the Colossus ({}), ignored",
+                    g_game_serial);
+        return;
+    }
+    if (!EmulatorSettings.IsNeo()) {
+        // The patched table only exists in the Pro mode path
+        LOG_WARNING(Loader, "sotc_pro_4k: neo_mode is off, ignored");
+        return;
+    }
+    const std::array<BuiltinPatch, 5> patches{{
+        {0x90d26, HexBytes("be03000000"), HexBytes("be02000000")},
+        {0x95d8d,
+         HexBytes("c5f810056b95f0008b855cffffff488db560ffffffba0004000031c94531c041b900040000"
+                  "4c89f7c5f8118560ffffff4489ad70ffffff4489bd74ffffff4489a578ffffff89857cffffff"),
+         HexBytes("488db560ffffff8b855cffffff48c1e0204489e14809c84889064889460848894610488946"
+                  "18ba0004000031c94531c041b9000400004c89f7909090909090909090909090909090909090")},
+        {0x9b6c0, HexBytes("0f8557010000"), HexBytes("909090909090")},
+        {0x9b6ce, HexBytes("0f8549010000"), HexBytes("909090909090")},
+        {0x9b760, HexBytes("b80000d123"), HexBytes("b80000b050")},
+    }};
+    for (const auto& patch : patches) {
+        const auto* code = reinterpret_cast<const u8*>(g_eboot_address + patch.offset);
+        if (std::memcmp(code, patch.original.data(), patch.original.size()) != 0 &&
+            std::memcmp(code, patch.patched.data(), patch.patched.size()) != 0) {
+            LOG_ERROR(Loader, "sotc_pro_4k: unexpected code at eboot+{:#x}, patch not applied",
+                      patch.offset);
+            return;
+        }
+    }
+    for (const auto& patch : patches) {
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + patch.offset), patch.patched.data(),
+                    patch.patched.size());
+    }
+    LOG_WARNING(Loader, "sotc_pro_4k: Pro mode rendering and display buffers forced to 3840x2160");
+}
+
+} // Anonymous namespace
+
 void OnGameLoaded() {
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);
     if (!patch_file.empty()) {
@@ -269,6 +335,7 @@ void OnGameLoaded() {
         }
     }
     ApplyPendingPatches();
+    ApplySotcPro4k();
 }
 
 void AddPatchToQueue(const patchInfo& patchToAdd) {

@@ -223,6 +223,10 @@ struct GeneralSettings {
     Setting<u64> cpu_affinity_mask{0};
     // Poll the keyboard slot and connected pads from one 125 Hz timer
     Setting<bool> poll_connected_pads_only{false};
+    // Enable Pro mode with 3840x2160 rendering and output for Shadow of the Colossus
+    // Reserve at least 1536 MB of extra memory and patch every dynamic
+    // resolution level to 2160p
+    Setting<bool> sotc_pro_4k{false};
 
     // return a vector of override descriptors (runtime, but tiny)
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -255,7 +259,8 @@ struct GeneralSettings {
             make_override<GeneralSettings>("cpu_affinity_mask",
                                            &GeneralSettings::cpu_affinity_mask),
             make_override<GeneralSettings>("poll_connected_pads_only",
-                                           &GeneralSettings::poll_connected_pads_only)};
+                                           &GeneralSettings::poll_connected_pads_only),
+            make_override<GeneralSettings>("sotc_pro_4k", &GeneralSettings::sotc_pro_4k)};
     }
 };
 
@@ -267,7 +272,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_
                                    discord_rpc_enabled, show_fps_counter, console_language,
                                    big_picture_scale, shadnet_server, shadnet_webapi_server,
                                    signaling_info, enable_upnp, redirect_app0_logs,
-                                   cpu_affinity_mask, poll_connected_pads_only)
+                                   cpu_affinity_mask, poll_connected_pads_only, sotc_pro_4k)
 
 // -------------------------------
 // Log settings
@@ -956,6 +961,7 @@ public:
     SETTING_FORWARD_BOOL(m_general, RedirectApp0Logs, redirect_app0_logs)
     SETTING_FORWARD(m_general, CpuAffinityMask, cpu_affinity_mask)
     SETTING_FORWARD_BOOL(m_general, PollConnectedPadsOnly, poll_connected_pads_only)
+    SETTING_FORWARD_BOOL(m_general, SotcPro4k, sotc_pro_4k)
 
     // Log settings
     SETTING_FORWARD_BOOL(m_log, LogAppend, append)

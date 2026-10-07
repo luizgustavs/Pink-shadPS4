@@ -488,6 +488,16 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                             overlayPath.string());
             }
 
+            // sotc_pro_4k needs Pro mode and room for the larger render-target heap
+            if (m_general.sotc_pro_4k.get()) {
+                m_general.neo_mode.set(true, true);
+                if (m_general.extra_dmem_in_mbytes.get() < 1536) {
+                    m_general.extra_dmem_in_mbytes.set(1536, true);
+                }
+                LOG_WARNING(Config, "sotc_pro_4k: neo_mode on, extra_dmem_in_mbytes {}",
+                            m_general.extra_dmem_in_mbytes.get());
+            }
+
             PrintChangedSummary(changed);
             EmulatorState::GetInstance()->SetGameSpecifigConfigUsed(true);
             return true;

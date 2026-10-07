@@ -50,6 +50,8 @@ ImageInfo::ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group,
     ASSERT(num_bits == 32);
 
     guest_address = cpu_address;
+    // Match the Neo display buffer ALT_TILE_MODE so the render target can be resolved
+    alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && props.is_tiled;
     UpdateSize();
 }
 
