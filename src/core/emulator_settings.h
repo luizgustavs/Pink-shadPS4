@@ -548,6 +548,10 @@ struct GPUSettings {
     // Move Vulkan command recording and submissions from the command processor to a separate
     // recording thread when this setting is enabled
     Setting<bool> cp_record_thread{false};
+    // Minimum anisotropy for linear mipmapped samplers: 0, 2, 4, 8 or 16
+    // Keep stronger guest ratios, point filtering and depth compares unchanged
+    // Cap the result at the device limit
+    Setting<u32> force_anisotropy{0};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -621,6 +625,7 @@ struct GPUSettings {
             make_override<GPUSettings>("image_memory_pool", &GPUSettings::image_memory_pool),
             make_override<GPUSettings>("eop_label_delay_us", &GPUSettings::eop_label_delay_us),
             make_override<GPUSettings>("cp_record_thread", &GPUSettings::cp_record_thread),
+            make_override<GPUSettings>("force_anisotropy", &GPUSettings::force_anisotropy),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -645,7 +650,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    wait_spin_us, readback_ahead_transfer_queue, mapped_page_table,
                                    dma_sync_once_per_batch, incremental_bind, tsharp_cache,
                                    wait_marker, image_memory_pool, eop_label_delay_us,
-                                   cp_record_thread)
+                                   cp_record_thread, force_anisotropy)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -970,6 +975,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ImageMemoryPool, image_memory_pool)
     SETTING_FORWARD(m_gpu, EopLabelDelayUs, eop_label_delay_us)
     SETTING_FORWARD_BOOL(m_gpu, CpRecordThread, cp_record_thread)
+    SETTING_FORWARD(m_gpu, ForceAnisotropy, force_anisotropy)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

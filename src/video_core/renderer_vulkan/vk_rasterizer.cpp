@@ -572,6 +572,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         LOG_WARNING(Render_Vulkan, "Workaround wait_spin_us enabled: poll up to {} us before waits",
                     spin_us);
     }
+    if (const u32 aniso = EmulatorSettings.GetForceAnisotropy(); aniso != 0) {
+        LOG_WARNING(Render_Vulkan, "Workaround force_anisotropy enabled: {}x (device max {}x)",
+                    aniso, instance.MaxSamplerAnisotropy());
+    }
     scheduler.SkipRedundantPipelineBinds(EmulatorSettings.IsGpuOverheadCuts());
 }
 
