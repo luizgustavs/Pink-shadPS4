@@ -1012,7 +1012,12 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     }
 
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
-    needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
+    // Keep a barrier for writes to indirect dispatch arguments
+    // The command processor reads those counts and a race can hang the GPU
+    if (runtime.IsBufferAccessed(buffer, base, size)) {
+        needs_barrier = true;
+        unordered_ring = -1;
+    }
 
     if (needs_barrier) {
         runtime.FlushBarriers(unordered_ring);
