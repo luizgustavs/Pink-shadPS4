@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include "common/adaptive_mutex.h"
@@ -40,7 +42,38 @@
 #include "common/spin_lock.h"
 #endif
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 namespace VideoCore {
+
+namespace {
+/// Use one atomic byte per page instead of the larger MSVC mutex
+/// Yield after a short spin because the holder may be in VirtualProtect
+struct PageSpinLock {
+    std::atomic<u8> held{0};
+
+    void lock() noexcept {
+        u32 spins = 0;
+        while (held.exchange(1, std::memory_order_acquire) != 0) {
+            while (held.load(std::memory_order_relaxed) != 0) {
+                if (++spins < 64) {
+#if defined(_M_X64) || defined(__x86_64__)
+                    _mm_pause();
+#endif
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+        }
+    }
+
+    void unlock() noexcept {
+        held.store(0, std::memory_order_release);
+    }
+};
+} // Anonymous namespace
 
 struct PageManager::Impl {
     struct PageState {
@@ -98,7 +131,11 @@ struct PageManager::Impl {
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / NUM_REGION_PAGES;
     inline static Vulkan::Rasterizer* rasterizer;
 
-    Impl() = default;
+    Impl() : page_spin_locks{EmulatorSettings.IsPageSpinLocks()} {
+        if (page_spin_locks) {
+            LOG_WARNING(Render, "Workaround page_spin_locks enabled");
+        }
+    }
     virtual ~Impl() = default;
 
     virtual void OnMap(VAddr address, size_t size) {
@@ -117,7 +154,30 @@ struct PageManager::Impl {
         const size_t start_page = begin >> PM_PAGE_BITS;
         const size_t end_page = end >> PM_PAGE_BITS;
         cached_pages.reserve(start_page, end_page);
-        locks.reserve(start_page, end_page);
+        if (page_spin_locks) {
+            spin_locks.reserve(start_page, end_page);
+        } else {
+            locks.reserve(start_page, end_page);
+        }
+    }
+
+    /// Locks a page that has a state; its lock was reserved with it
+    void LockPage(u64 page) {
+        if (page_spin_locks) {
+            spin_locks[page].lock();
+        } else {
+            locks[page].lock();
+        }
+    }
+
+    void UnlockPage(u64 page) {
+        if (page_spin_locks) {
+            if (auto* lock = spin_locks.find(page)) {
+                lock->unlock();
+            }
+        } else if (auto* lock = locks.find(page)) {
+            lock->unlock();
+        }
     }
 
     void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) {
@@ -153,7 +213,7 @@ struct PageManager::Impl {
                 continue;
             }
 
-            locks[page].lock();
+            LockPage(page);
 
             const auto old_perms = state->Perms();
             if (page == page_start) {
@@ -186,9 +246,7 @@ struct PageManager::Impl {
         release_pending();
 
         for (u64 page = page_start; page != page_end; ++page) {
-            if (auto* lock = locks.find(page)) {
-                lock->unlock();
-            }
+            UnlockPage(page);
         }
     }
 
@@ -218,7 +276,7 @@ struct PageManager::Impl {
                 continue;
             }
 
-            locks[base_page + page].lock();
+            LockPage(base_page + page);
 
             const auto old_perms = state->Perms();
             if (page == page_start) {
@@ -255,9 +313,7 @@ struct PageManager::Impl {
         release_pending();
 
         for (u64 page = page_start; page != page_end; ++page) {
-            if (auto* lock = locks.find(base_page + page)) {
-                lock->unlock();
-            }
+            UnlockPage(base_page + page);
         }
     }
 
@@ -281,6 +337,17 @@ struct PageManager::Impl {
         static constexpr bool NULL_CHECK = false;
     };
     Common::MultiLevelPageTable<MutexTraits> locks;
+    struct SpinLockTraits {
+        using Entry = PageSpinLock;
+        static constexpr size_t ADDRESS_SPACE_BITS = ADDRESS_BITS;
+        static constexpr size_t L1_BITS = 16;
+        static constexpr size_t PAGE_BITS = PM_PAGE_BITS;
+        static constexpr bool NULL_CHECK = false;
+    };
+    Common::MultiLevelPageTable<SpinLockTraits> spin_locks;
+    // page_spin_locks: fixed at boot, since switching tables while pages are held would
+    // break exclusion; the pages are locked through one table or the other
+    const bool page_spin_locks;
 };
 
 #ifdef __linux__
@@ -640,19 +707,20 @@ struct SignalImpl : public PageManager::Impl {
         const VAddr page = addr & ~(PageManager::PM_PAGE_SIZE - 1);
         const u64 page_index = page >> PageManager::PM_PAGE_BITS;
         PageState* state = cached_pages.find(page_index);
-        auto* lock = locks.find(page_index);
-        if (!state || !lock) {
+        if (!state) {
             return true;
         }
         Core::MemoryPermission perms;
         {
-            std::scoped_lock lk{*lock};
+            LockPage(page_index);
             perms = state->Perms();
             if (!True(perms & (is_write ? Core::MemoryPermission::Write
                                         : Core::MemoryPermission::Read))) {
+                UnlockPage(page_index);
                 return true;
             }
             Protect(page, PageManager::PM_PAGE_SIZE, perms);
+            UnlockPage(page_index);
         }
         static std::atomic<u64> repairs{0};
         if (const u64 count = repairs.fetch_add(1) + 1; count == 1 || count % 1000 == 0) {
