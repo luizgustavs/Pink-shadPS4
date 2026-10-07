@@ -59,6 +59,15 @@ public:
     void DispatchDirect();
     void DispatchIndirect(VAddr address, u32 offset, u32 size);
 
+    /// gcn_unordered_dispatches: ring of the packets processed next (0 = graphics,
+    /// 1 + vqid = compute queue)
+    void SetCommandRing(u8 ring) noexcept {
+        command_ring = ring < MaxCommandRings ? ring : MaxCommandRings - 1;
+    }
+    /// gcn_unordered_dispatches: the game sent a sync packet (event write,
+    /// EOP/EOS/RELEASE_MEM, ACQUIRE_MEM, a wait) on the current ring
+    void OnGameSync();
+
     void ScopeMarker(fmt::string_view fmt, fmt::format_args args, auto&& func) {
         if (host_markers_enabled) {
             ScopeMarkerBegin(fmt::vformat(fmt, args));
@@ -286,6 +295,23 @@ private:
     static constexpr vk::AccessFlags2 SharedDepthTargetAccess =
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
         vk::AccessFlagBits2::eDepthStencilAttachmentRead;
+
+    /// gcn_unordered_dispatches: notes a guest draw or dispatch on the current ring
+    /// For a dispatch whose previous command on the ring was a dispatch, with
+    /// no sync packet since, returns the ring (GCN may start it before the
+    /// previous one ends), else -1
+    s8 NoteRingCommand(bool is_dispatch);
+    static constexpr u8 MaxCommandRings = 16;
+    const bool gcn_unordered_dispatches;
+    const bool gcn_unordered_toggle; ///< gcn_unordered_dispatches follows SHADPS4_AB_TOGGLE
+    u8 command_ring{};
+    std::array<bool, MaxCommandRings> ring_last_dispatch{};
+    std::array<bool, MaxCommandRings> ring_synced{};
+    // Of the dispatch being recorded: its NoteRingCommand, and whether its buffer
+    // accesses are those of a game dispatch without DMA (DMA reaches memory the
+    // barrier tracking does not see)
+    s8 unordered_ring{-1};
+    bool game_dispatch_accesses{};
     u64 bind_verify_checks{};
     u64 bind_verify_mismatches{};
     u64 bind_verify_raced{};

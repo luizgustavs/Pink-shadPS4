@@ -522,7 +522,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       tsharp_cache_verify{tsharp_cache && std::getenv("SHADPS4_TSHARP_CACHE_VERIFY") != nullptr},
       depth_target_sampled_layout{EmulatorSettings.IsDepthTargetSampledLayout()},
       depth_target_sampled_toggle{
-          Common::PerfStats::AbToggleFollows("depth_target_sampled_layout")} {
+          Common::PerfStats::AbToggleFollows("depth_target_sampled_layout")},
+      gcn_unordered_dispatches{EmulatorSettings.IsGcnUnorderedDispatches()},
+      gcn_unordered_toggle{Common::PerfStats::AbToggleFollows("gcn_unordered_dispatches")} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -586,6 +588,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     }
     if (depth_target_sampled_layout) {
         LOG_WARNING(Render_Vulkan, "Workaround depth_target_sampled_layout enabled");
+    }
+    if (gcn_unordered_dispatches) {
+        LOG_WARNING(Render_Vulkan, "Workaround gcn_unordered_dispatches enabled");
     }
     scheduler.SkipRedundantPipelineBinds(EmulatorSettings.IsGpuOverheadCuts());
 }
@@ -723,6 +728,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
     const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Draws,
                                                     Common::PerfStats::Id::DrawNs};
+    NoteRingCommand(false);
 
     scheduler.PopPendingOperations();
 
@@ -807,6 +813,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     RENDERER_TRACE;
     const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Draws,
                                                     Common::PerfStats::Id::DrawNs};
+    NoteRingCommand(false);
 
     scheduler.PopPendingOperations();
 
@@ -915,6 +922,7 @@ void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
     const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Dispatches,
                                                     Common::PerfStats::Id::DispatchNs};
+    unordered_ring = NoteRingCommand(true);
 
     scheduler.PopPendingOperations();
 
@@ -925,6 +933,10 @@ void Rasterizer::DispatchDirect() {
     }
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+    game_dispatch_accesses = gcn_unordered_dispatches && !cs.uses_dma;
+    if (!game_dispatch_accesses) {
+        unordered_ring = -1;
+    }
     if (DrawTrace::Instance().Active()) {
         TraceCompute(cs, cs_program, "Dispatch", memory, buffer_cache, page_manager);
     }
@@ -941,7 +953,7 @@ void Rasterizer::DispatchDirect() {
     }
 
     if (needs_barrier) {
-        runtime.FlushBarriers();
+        runtime.FlushBarriers(unordered_ring);
     }
 
     scheduler.EndRendering();
@@ -973,6 +985,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
     const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Dispatches,
                                                     Common::PerfStats::Id::DispatchNs};
+    unordered_ring = NoteRingCommand(true);
 
     scheduler.PopPendingOperations();
 
@@ -980,6 +993,11 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
     if (!pipeline) {
         return;
+    }
+    game_dispatch_accesses =
+        gcn_unordered_dispatches && !pipeline->GetStage(Shader::SwStage::Compute).uses_dma;
+    if (!game_dispatch_accesses) {
+        unordered_ring = -1;
     }
     if (DrawTrace::Instance().Active()) {
         TraceCompute(pipeline->GetStage(Shader::SwStage::Compute), cs_program, "DispatchIndirect",
@@ -997,7 +1015,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
 
     if (needs_barrier) {
-        runtime.FlushBarriers();
+        runtime.FlushBarriers(unordered_ring);
     }
 
     scheduler.EndRendering();
@@ -1311,8 +1329,11 @@ void Rasterizer::ResetBindings(bool is_compute) {
         const auto write_flag =
             is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone;
         runtime.AccessBuffer(buffer, offset, size, dst_stage,
-                             vk::AccessFlagBits2::eShaderRead | write_flag);
+                             vk::AccessFlagBits2::eShaderRead | write_flag,
+                             is_compute && game_dispatch_accesses);
     }
+    unordered_ring = -1;
+    game_dispatch_accesses = false;
     bound_images.clear();
     bound_buffers.clear();
     needs_barrier = false;
@@ -1320,6 +1341,29 @@ void Rasterizer::ResetBindings(bool is_compute) {
     buffer_cache.CloseGpuWrites();
     scheduler.CountRecordedCommand();
     FlushPeriodic();
+}
+
+// GCN can overlap consecutive dispatches until the game sends a sync packet
+// Pass the ring to the runtime so it can skip unnecessary memory barriers
+// Only guest dispatch accesses without DMA are eligible
+s8 Rasterizer::NoteRingCommand(bool is_dispatch) {
+    if (!gcn_unordered_dispatches) {
+        return -1;
+    }
+    const u8 ring = command_ring;
+    const bool unordered = is_dispatch && ring_last_dispatch[ring] && !ring_synced[ring] &&
+                           Common::PerfStats::AbToggleOn(gcn_unordered_toggle);
+    ring_last_dispatch[ring] = is_dispatch;
+    ring_synced[ring] = false;
+    return unordered ? static_cast<s8>(ring) : s8{-1};
+}
+
+void Rasterizer::OnGameSync() {
+    if (!gcn_unordered_dispatches) {
+        return;
+    }
+    ring_synced[command_ring] = true;
+    runtime.OnGameSync(command_ring);
 }
 
 void Rasterizer::VerifyIncrementalBind(bool matches, const char* kind, u64 pgm_hash, VAddr address) {

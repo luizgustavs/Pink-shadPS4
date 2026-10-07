@@ -555,6 +555,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
         ProcessCommands();
+        if (rasterizer) {
+            rasterizer->SetCommandRing(0);
+        }
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -971,6 +974,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWrite: {
                 const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+                if (rasterizer) {
+                    rasterizer->OnGameSync();
+                }
                 LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
                           magic_enum::enum_name(event->event_type.Value()),
                           magic_enum::enum_name(event->event_index.Value()));
@@ -998,6 +1004,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEos: {
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+                if (rasterizer) {
+                    rasterizer->OnGameSync();
+                }
                 if (TraceSync()) {
                     LogSync("DE", "EVENT_WRITE_EOS type={} command={} addr={:#x} data={:#x}",
                             event_eos->event_type.Value(), u32(event_eos->command.Value()),
@@ -1026,6 +1035,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                if (rasterizer) {
+                    rasterizer->OnGameSync();
+                }
                 if (TraceSync()) {
                     LogSync("DE", "EVENT_WRITE_EOP type={} data_sel={} int_sel={} addr={} data={:#x}",
                             event_eop->event_type.Value(), u32(event_eop->data_sel.Value()),
@@ -1166,6 +1178,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::MemSemaphore: {
                 const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+                if (rasterizer && !mem_semaphore->IsSignaling()) {
+                    rasterizer->OnGameSync();
+                }
                 if (TraceSync()) {
                     LogSync("DE", "MEM_SEMAPHORE {} addr={:#x}",
                             mem_semaphore->IsSignaling() ? "signal" : "wait",
@@ -1183,6 +1198,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::AcquireMem: {
                 const auto* acquire_mem = reinterpret_cast<const PM4CmdAcquireMem*>(header);
+                if (rasterizer) {
+                    rasterizer->OnGameSync();
+                }
                 if (TraceSync()) {
                     LogSync("DE", "ACQUIRE_MEM cntl={:#x} base={:#x}", acquire_mem->cp_coher_cntl,
                             acquire_mem->cp_coher_base_lo);
@@ -1201,6 +1219,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::WaitRegMem: {
                 const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+                if (rasterizer) {
+                    rasterizer->OnGameSync();
+                }
                 // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
                 // Optimization: VO label waits are special because the emulator
                 // will write to the label when presentation is finished. So if
@@ -1325,6 +1346,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
         ProcessCommands();
+        if (rasterizer) {
+            rasterizer->SetCommandRing(static_cast<u8>(vqid + 1));
+        }
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
         u32 next_dw_off = header->type3.NumWords() + 1;
@@ -1435,6 +1459,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::AcquireMem: {
+            if (rasterizer) {
+                rasterizer->OnGameSync();
+            }
             if (TraceSync()) {
                 const auto* acquire_mem = reinterpret_cast<const PM4CmdAcquireMem*>(header);
                 LogSync(fmt::format("ASC{}", vqid), "ACQUIRE_MEM cntl={:#x} base={:#x}",
@@ -1549,6 +1576,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::MemSemaphore: {
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+            if (rasterizer && !mem_semaphore->IsSignaling()) {
+                rasterizer->OnGameSync();
+            }
             if (TraceSync()) {
                 LogSync(fmt::format("ASC{}", vqid), "MEM_SEMAPHORE {} addr={:#x}",
                         mem_semaphore->IsSignaling() ? "signal" : "wait",
@@ -1566,6 +1596,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+            if (rasterizer) {
+                rasterizer->OnGameSync();
+            }
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             if (TraceSync()) {
                 const bool is_mem =
@@ -1585,6 +1618,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::ReleaseMem: {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
+            if (rasterizer) {
+                rasterizer->OnGameSync();
+            }
             if (TraceSync()) {
                 LogSync(fmt::format("ASC{}", vqid),
                         "RELEASE_MEM type={} data_sel={} int_sel={} addr={:#x} data={:#x}",
@@ -1608,6 +1644,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::EventWrite: {
             // const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+            if (rasterizer) {
+                rasterizer->OnGameSync();
+            }
             break;
         }
         case PM4ItOpcode::GetLodStats: {

@@ -559,6 +559,9 @@ struct GPUSettings {
     // target and its attachment
     // This avoids barriers that would end the render pass between draws
     Setting<bool> depth_target_sampled_layout{false};
+    // Skip memory barriers for same-ring dispatches with no guest sync between them
+    // Require every tracked access to come from guest dispatches without DMA
+    Setting<bool> gcn_unordered_dispatches{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -637,6 +640,8 @@ struct GPUSettings {
                                        &GPUSettings::readback_hot_regions),
             make_override<GPUSettings>("depth_target_sampled_layout",
                                        &GPUSettings::depth_target_sampled_layout),
+            make_override<GPUSettings>("gcn_unordered_dispatches",
+                                       &GPUSettings::gcn_unordered_dispatches),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -662,7 +667,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    dma_sync_once_per_batch, incremental_bind, tsharp_cache,
                                    wait_marker, image_memory_pool, eop_label_delay_us,
                                    cp_record_thread, force_anisotropy, readback_hot_regions,
-                                   depth_target_sampled_layout)
+                                   depth_target_sampled_layout, gcn_unordered_dispatches)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -990,6 +995,7 @@ public:
     SETTING_FORWARD(m_gpu, ForceAnisotropy, force_anisotropy)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackHotRegions, readback_hot_regions)
     SETTING_FORWARD_BOOL(m_gpu, DepthTargetSampledLayout, depth_target_sampled_layout)
+    SETTING_FORWARD_BOOL(m_gpu, GcnUnorderedDispatches, gcn_unordered_dispatches)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

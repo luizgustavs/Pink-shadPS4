@@ -184,6 +184,10 @@ enum class Id : u32 {
     // Texture bindings that are the draw's own read-only depth target
     // (depth_target_sampled_layout shares one layout between the two uses)
     DepthTargetSampled,
+    // gcn_unordered_dispatches: barrier points of dispatches GCN runs unordered with
+    // the previous dispatch of their ring, and those whose memory barrier was left out
+    GcnUnorderedPoints,
+    GcnUnorderedSkips,
     Count,
 };
 

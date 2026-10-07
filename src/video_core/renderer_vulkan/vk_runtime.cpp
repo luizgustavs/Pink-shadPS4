@@ -3,6 +3,7 @@
 
 #include "common/div_ceil.h"
 #include "common/logging/events.h"
+#include "common/perf_stats.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -752,7 +753,8 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
 }
 
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
-                           vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
+                           vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+                           bool game_dispatch) {
     MakeCurrent(handle);
 
     const Interval range = {
@@ -781,9 +783,30 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
 
     memory_barrier.srcStageMask |= src_stage;
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
+    foreign_access |= !game_dispatch;
 }
 
-void Runtime::FlushBarriers() {
+void Runtime::OnGameSync(u8 ring) {
+    // Before any access, the barrier the next hit records covers only
+    // accesses made after the packet
+    if (memory_barrier.srcStageMask) {
+        synced_rings |= static_cast<u16>(1u << ring);
+    }
+}
+
+void Runtime::FlushBarriers(s8 unordered_ring) {
+    if (unordered_ring >= 0) {
+        Common::PerfStats::Add(Common::PerfStats::Id::GcnUnorderedPoints);
+        // Skip barriers only for dispatches the guest left unordered on this ring
+        // Emulator operations, draws and accesses ordered by a guest
+        // sync still need barriers
+        // Keep the accesses tracked so the next barrier covers them
+        if (memory_barrier.srcStageMask && image_barriers.empty() && !foreign_access &&
+            (synced_rings & (1u << unordered_ring)) == 0) {
+            Common::PerfStats::Add(Common::PerfStats::Id::GcnUnorderedSkips);
+            return;
+        }
+    }
     vk::DependencyInfo dep_info{};
 
     if (memory_barrier.srcStageMask) {
@@ -805,6 +828,8 @@ void Runtime::FlushBarriers() {
 
     memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
+    foreign_access = false;
+    synced_rings = 0;
 
     image_barriers.clear();
     for (auto& resource : resources) {

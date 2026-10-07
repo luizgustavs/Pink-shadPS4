@@ -67,13 +67,24 @@ public:
 
     void SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing = true);
 
+    /// `game_dispatch`: the access belongs to a game dispatch without DMA
+    /// (gcn_unordered_dispatches)
     void AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
-                      vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access);
+                      vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+                      bool game_dispatch = false);
 
     bool IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                           bool check_read_access = false);
 
-    void FlushBarriers();
+    /// Flush image barriers and the buffer accesses tracked since the last barrier
+    /// For unordered_ring, skip the memory barrier only without image
+    /// barriers, DMA or guest sync
+    /// Keep skipped accesses tracked for the next barrier
+    void FlushBarriers(s8 unordered_ring = -1);
+
+    /// gcn_unordered_dispatches: the game sent a sync packet on `ring`; a dispatch of
+    /// that ring no longer leaves out a barrier over the accesses made before it
+    void OnGameSync(u8 ring);
 
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);
@@ -93,6 +104,11 @@ private:
     std::vector<BufferBarriers> resources;
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
+    // gcn_unordered_dispatches: an access since the last barrier came from something
+    // other than a game dispatch without DMA (emulator copy, upload, draw), and the
+    // rings that sent a sync packet after an access
+    bool foreign_access{};
+    u16 synced_rings{};
 };
 
 } // namespace Vulkan

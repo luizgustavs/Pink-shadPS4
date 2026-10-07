@@ -142,6 +142,8 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::RecorderSubmitWaitNs, "rec_submit_wait_ms", Unit::Ms},
     {Id::RecorderWakes, "rec_wakes", Unit::Count},
     {Id::DepthTargetSampled, "depth_tgt_sampled", Unit::Count},
+    {Id::GcnUnorderedPoints, "gcn_points", Unit::Count},
+    {Id::GcnUnorderedSkips, "gcn_skips", Unit::Count},
 }};
 
 constexpr bool FieldsMatchIds() {
