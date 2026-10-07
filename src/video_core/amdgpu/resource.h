@@ -457,8 +457,10 @@ struct Sampler {
         return raw0 != 0 || raw1 != 0;
     }
 
+    /// Fields with no defined value on GCN. Anisotropy ratios 5-7 are not checked: the hardware
+    /// takes them as the maximum and SotC emits them in samplers it uses (see MaxAniso)
     bool Valid() const {
-        return true;
+        return filter_mode.Value() <= FilterMode::Max && mip_filter.Value() <= MipFilter::Linear;
     }
 
     bool operator==(const Sampler& other) const noexcept {

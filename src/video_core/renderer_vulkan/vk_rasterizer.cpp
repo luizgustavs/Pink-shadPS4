@@ -16,6 +16,7 @@
 
 #include "common/debug.h"
 #include "common/guest_write_journal.h"
+#include "common/logging/events.h"
 #include "common/perf_stats.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -2056,6 +2057,21 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
+        // An S# whose fields have no defined meaning on GCN (filter mode 3, mip filter 3), or a
+        // custom border color without a border color table, comes from an unused sampler slot
+        // holding garbage, so bind the default sampler. Anisotropy ratios 5-7 stay accepted
+        if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
+                                liverpool->regs.ta_bc_base.Address() == 0)) {
+            LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                               "Rejecting invalid S# max_aniso={}, filter_mode={}, mip_filter={}, "
+                               "border_color_type={}, border_color_base={:#x}",
+                               static_cast<u32>(ssharp.max_aniso.Value()),
+                               static_cast<u32>(ssharp.filter_mode.Value()),
+                               static_cast<u32>(ssharp.mip_filter.Value()),
+                               static_cast<u32>(ssharp.border_color_type.Value()),
+                               liverpool->regs.ta_bc_base.Address());
+            ssharp = AmdGpu::Sampler{};
+        }
         const auto vk_sampler =
             texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base, sampler.is_depth);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
