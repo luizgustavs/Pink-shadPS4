@@ -74,6 +74,14 @@ bool RelativeInstanceIdAffects(const Shader::RuntimeInfo& runtime_info) {
     return runtime_info.sw_stage == Shader::SwStage::Vertex &&
            runtime_info.props.num_input_vgprs > 0;
 }
+
+/// Permutations preloaded into a program already in the cache, and how many of them
+/// carried flattened user data other than the program's
+struct PreloadUdStats {
+    u32 added_permutations;
+    u32 differing;
+    u32 size_mismatch;
+} preload_ud_stats{};
 } // namespace
 
 void RegisterPipelineData(const ComputePipelineKey& key,
@@ -376,6 +384,18 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             module = it_pgm.value()->modules[idx].module;
         } else {
             module = CompileSPV(spv, instance.GetDevice());
+            // Build the pipeline with this record's flattened user data
+            // The first record may have different descriptor counts
+            // Keep a different buffer size unchanged because it uses another SRT layout
+            auto& program_ud = it_pgm.value()->info.flattened_ud_buf;
+            auto& record_ud = program->info.flattened_ud_buf;
+            ++preload_ud_stats.added_permutations;
+            if (record_ud.size() != program_ud.size()) {
+                ++preload_ud_stats.size_mismatch;
+            } else if (record_ud != program_ud) {
+                ++preload_ud_stats.differing;
+                program_ud = std::move(record_ud);
+            }
         }
     }
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
@@ -457,6 +477,11 @@ void PipelineCache::WarmUp() {
         });
 
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    LOG_INFO(Render,
+             "Preloaded permutations of known programs: {}, {} with their own flattened user data, "
+             "{} with another size (kept the program's)",
+             preload_ud_stats.added_permutations, preload_ud_stats.differing,
+             preload_ud_stats.size_mismatch);
     LOG_INFO(Render, "SRT walker code after preload: {} KiB, {} KiB shared with identical walkers",
              Shader::GetSrtCodeUsage() >> 10, Shader::GetSrtCodeShared() >> 10);
     if (num_total_pipelines > num_pipelines) {
