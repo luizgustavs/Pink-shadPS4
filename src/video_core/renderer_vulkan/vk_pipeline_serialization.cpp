@@ -21,7 +21,9 @@ namespace Serialization {
 // plus one_vgprs). ShaderMetaVersion 9: with srt_walker_clean_reads the SRT walker guest loads test the
 // clean-page bitmap first (the key is in the codegen settings key). ShaderBinaryVersion 7: subgroup built-in
 // inputs are Flat only in fragment shaders (vertex shaders had an invalid Flat)
-static constexpr u32 ShaderBinaryVersion = 7u;
+// ShaderBinaryVersion 8: upstream ISA fixes (#5030, #5031, #5141, #5185, #5186,
+// #5194, #5199, #5200, #5202)
+static constexpr u32 ShaderBinaryVersion = 8u;
 static constexpr u32 ShaderMetaVersion = 9u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
