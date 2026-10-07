@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <random>
 #include <tuple>
 #include <vector>
@@ -91,6 +92,49 @@ TEST(DomIntervalList, AddSortedKeepsDominantRanges) {
         got.emplace_back(range.start, range.end, range.written);
     }
     EXPECT_EQ(got, expected);
+}
+
+TEST(DomIntervalList, SubtractMatchesBytes) {
+    std::mt19937_64 rng{2};
+    constexpr u64 N = 512;
+    for (int iter = 0; iter < 50000; ++iter) {
+        DomIntervalList<Flagged> list;
+        std::vector<int> model(N, 0);
+        const int n = static_cast<int>(rng() % 16);
+        for (int k = 0; k < n; ++k) {
+            const u64 start = rng() % N;
+            const u64 end = std::min(N, start + 1 + rng() % 60);
+            if (rng() % 3 == 0) {
+                list.Subtract(start, end);
+                std::fill(model.begin() + start, model.begin() + end, 0);
+                continue;
+            }
+            const bool written = rng() & 1;
+            list.Add(start, end, written);
+            for (u64 x = start; x < end; ++x) {
+                model[x] = std::max(model[x], written ? 2 : 1);
+            }
+        }
+        ASSERT_EQ(Bytes(list, N), model) << "iteration " << iter;
+    }
+}
+
+TEST(IntervalList, SubtractKeepsTheOutsideParts) {
+    IntervalList<> list;
+    list.Add({0, 10});
+    list.Add({20, 30});
+    list.Add({40, 50});
+    list.Subtract(5, 45);
+    list.Subtract(100, 200);
+    list.Subtract(7, 7);
+    std::vector<std::pair<u64, u64>> got;
+    for (const auto& range : list) {
+        got.emplace_back(range.start, range.end);
+    }
+    const std::vector<std::pair<u64, u64>> expected{{0, 5}, {45, 50}};
+    EXPECT_EQ(got, expected);
+    list.Subtract(0, 50);
+    EXPECT_TRUE(list.Empty());
 }
 
 } // Anonymous namespace

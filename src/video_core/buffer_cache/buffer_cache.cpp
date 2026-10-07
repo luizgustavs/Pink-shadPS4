@@ -65,7 +65,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       loop_cap_buffer{instance, 0, 256, MemoryType::HostCached, "Loop Cap Buffer"},
       readback_ahead{EmulatorSettings.IsReadbackAhead()},
-      track_writers{readback_ahead || Common::PerfStats::Enabled()}, memory_semaphore{instance},
+      track_writers{readback_ahead || Common::PerfStats::Enabled()},
+      arena_evict_idle_s{EmulatorSettings.GetArenaEvictIdleS()}, memory_semaphore{instance},
       dma_sync_once{EmulatorSettings.IsDmaSyncOncePerBatch()},
       dma_sync_once_toggle{Common::PerfStats::AbToggleFollows("dma_sync_once_per_batch")},
       dma_sync_once_verify{dma_sync_once &&
@@ -135,6 +136,13 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         LOG_WARNING(Render_Vulkan, "Workaround range_fast_paths enabled{}",
                     range_fast_verify ? " (verify)" : "");
     }
+    if (arena_evict_idle_s != 0) {
+        arena_use = std::make_unique<u32[]>(u64{1} << (ADDRESS_SPACE_BITS - ArenaUseGranuleBits));
+        arena_epoch = std::chrono::steady_clock::now();
+        arena_last_scan = arena_epoch;
+        arena_last_report = arena_epoch;
+        LOG_WARNING(Render_Vulkan, "Workaround arena_evict_idle_s enabled: {} s", arena_evict_idle_s);
+    }
 }
 
 BufferCache::~BufferCache() = default;
@@ -142,6 +150,9 @@ BufferCache::~BufferCache() = default;
 void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
+    }
+    if (arena_use) {
+        ScanArenaAllocations();
     }
     ReportLoopCapHits();
     DebugState.num_batches_per_frame = std::exchange(num_flushes_per_frame, 0u);
@@ -558,6 +569,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     } else {
         EnsureResident(arena, first_block, last_block);
     }
+    if (arena_use && size != 0) {
+        TouchArenaUse(device_addr, size);
+    }
     AddToSyncBatch(device_addr, size, is_written, fast);
     if (is_texel_buffer && !is_written) {
         SynchronizeMemoryFromImage(arena, device_addr, size);
@@ -651,6 +665,17 @@ void BufferCache::MarkResident(u64 start_block, u64 end_block) {
         }
         const u64 index = block & mask;
         bits[index / 64] |= u64{1} << (index % 64);
+    }
+}
+
+void BufferCache::ClearResident(u64 start_block, u64 end_block) {
+    const u64 mask = blocks_per_arena_page - 1;
+    for (u64 block = start_block; block < end_block; ++block) {
+        auto& bits = resident_bits[block >> blocks_per_arena_page_shift];
+        if (bits) {
+            const u64 index = block & mask;
+            bits[index / 64] &= ~(u64{1} << (index % 64));
+        }
     }
 }
 
@@ -1125,11 +1150,41 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         return;
     }
 
-    const vk::MemoryAllocateInfo alloc_info = {
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
+    if (arena_use && !evicted_blocks.Empty()) {
+        for (const auto& range : bind_ranges) {
+            evicted_blocks.ForEachInRange(range.start, range.end, [&](const Interval& evicted) {
+                const u64 bytes =
+                    (std::min(range.end, evicted.end) - std::max(range.start, evicted.start))
+                    << block_shift;
+                arena_stats.returned_bytes += bytes;
+                if (fault_obtain) {
+                    arena_stats.returned_fault_bytes += bytes;
+                }
+            });
+            evicted_blocks.Subtract(range.start, range.end);
+        }
+    }
+
+    // Allocate residency in 2 MiB pieces so idle parts of a
+    // larger range can be released
+    const bool split = arena_use != nullptr;
+    const u64 granule_blocks =
+        u64{1} << (ArenaUseGranuleBits - std::min<u64>(block_shift, ArenaUseGranuleBits));
+    const auto allocate = [&](u64 bytes) {
+        const vk::MemoryAllocateInfo alloc_info = {
+            .allocationSize = bytes,
+            .memoryTypeIndex = arena_memory_type_index,
+        };
+        const auto memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+        arena_resident_bytes += bytes;
+        if (split) {
+            arena_allocations.emplace(static_cast<VkDeviceMemory>(memory),
+                                      ArenaAllocation{bytes, fault_obtain});
+        }
+        return memory;
     };
-    const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+    const vk::DeviceMemory shared_memory =
+        split ? vk::DeviceMemory{} : allocate(u64{resident_blocks} << block_shift);
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
@@ -1140,36 +1195,208 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
     u64 offset = staging.offset;
     for (const auto& range : bind_ranges) {
-        Backing backing;
-        backing.start = range.start;
-        backing.end = range.end;
-        backing.memory = device_memory;
-        backing.offset = memory_offset >> block_shift;
-        resident_ranges.Add(backing);
-        MarkResident(backing.start, backing.end);
-        dma_sync_covered = false;
-        dma_sweep_pieces_valid = false;
+        for (u64 start = range.start; start < range.end;) {
+            const u64 end =
+                split ? std::min<u64>(range.end, (start / granule_blocks + 1) * granule_blocks)
+                      : range.end;
+            const vk::DeviceMemory device_memory =
+                split ? allocate((end - start) << block_shift) : shared_memory;
+            const u64 piece_offset = split ? 0 : memory_offset;
+            Backing backing;
+            backing.start = start;
+            backing.end = end;
+            backing.memory = device_memory;
+            backing.offset = piece_offset >> block_shift;
+            resident_ranges.Add(backing);
+            MarkResident(backing.start, backing.end);
+            dma_sync_covered = false;
+            dma_sweep_pieces_valid = false;
 
-        LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
+            LOG_INFO(Render, "Making range start={}, end={} resident", backing.start,
+                     backing.end);
 
-        const auto& bind = binds->binds.emplace_back(vk::SparseMemoryBind{
-            .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
-            .size = (range.end - range.start) << block_shift,
-            .memory = device_memory,
-            .memoryOffset = memory_offset,
-        });
-        memory_offset += bind.size;
+            const auto& bind = binds->binds.emplace_back(vk::SparseMemoryBind{
+                .resourceOffset = (start << block_shift) - arena->cpu_addr,
+                .size = (end - start) << block_shift,
+                .memory = device_memory,
+                .memoryOffset = piece_offset,
+            });
+            memory_offset += bind.size;
 
-        for (u32 block = 0; block < bind.size; block += block_size) {
-            *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
+            for (u32 block = 0; block < bind.size; block += block_size) {
+                *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
+            }
+            const u64 copy_size = (backing.end - backing.start) * sizeof(vk::DeviceAddress);
+            copies.emplace_back(offset, backing.start * sizeof(vk::DeviceAddress), copy_size);
+            offset += copy_size;
+            start = end;
         }
-        const u64 copy_size = (backing.end - backing.start) * sizeof(vk::DeviceAddress);
-        copies.emplace_back(offset, backing.start * sizeof(vk::DeviceAddress), copy_size);
-        offset += copy_size;
     }
 
     staging.Flush();
     runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
+}
+
+void BufferCache::ScanArenaAllocations() {
+    const auto now = std::chrono::steady_clock::now();
+    arena_now_s =
+        1 + static_cast<u32>(
+                std::chrono::duration_cast<std::chrono::seconds>(now - arena_epoch).count());
+    FreeUnboundArenaMemory();
+    if (now - arena_last_scan < std::chrono::seconds{1}) {
+        return;
+    }
+    arena_last_scan = now;
+    const auto granules_idle = [&](u64 lo_block, u64 hi_block) {
+        const VAddr lo = lo_block << block_shift;
+        const VAddr hi = hi_block << block_shift;
+        for (u64 g = lo >> ArenaUseGranuleBits; g <= (hi - 1) >> ArenaUseGranuleBits; ++g) {
+            if (arena_now_s - arena_use[g] < arena_evict_idle_s) {
+                return false;
+            }
+        }
+        return true;
+    };
+    struct Candidate {
+        bool busy{};
+        boost::container::small_vector<Interval, 4> ranges;
+    };
+    std::unordered_map<VkDeviceMemory, Candidate> candidates;
+    candidates.reserve(arena_allocations.size());
+    for (const auto& backing : resident_ranges) {
+        auto& candidate = candidates[static_cast<VkDeviceMemory>(backing.memory)];
+        if (candidate.busy) {
+            continue;
+        }
+        candidate.ranges.push_back({backing.start, backing.end});
+        candidate.busy = !granules_idle(backing.start, backing.end);
+    }
+    u64 pinned_bytes = 0;
+    u64 skipped_gpu_bytes = 0;
+    for (auto& [memory, candidate] : candidates) {
+        const auto it = arena_allocations.find(memory);
+        if (it == arena_allocations.end()) {
+            continue;
+        }
+        const ArenaAllocation allocation = it->second;
+        if (allocation.pinned) {
+            pinned_bytes += allocation.bytes;
+            continue;
+        }
+        if (candidate.busy) {
+            continue;
+        }
+        // GPU-written bytes live only in this memory until they are read back
+        const bool gpu_written = std::ranges::any_of(candidate.ranges, [&](const Interval& range) {
+            const VAddr addr = range.start << block_shift;
+            const u64 size = (range.end - range.start) << block_shift;
+            return gpu_modified_ranges.Intersects(addr, size) ||
+                   memory_tracker->IsRegionGpuModified(addr, size) ||
+                   IsPendingWrittenSync(addr, size);
+        });
+        if (gpu_written) {
+            skipped_gpu_bytes += allocation.bytes;
+            continue;
+        }
+        EvictArenaAllocation(vk::DeviceMemory{memory}, allocation.bytes,
+                             {candidate.ranges.data(), candidate.ranges.size()});
+    }
+    arena_stats.pinned_bytes = pinned_bytes;
+    arena_stats.skipped_gpu_bytes = skipped_gpu_bytes;
+    if (now - arena_last_report >= std::chrono::minutes{1}) {
+        arena_last_report = now;
+        LOG_WARNING(Render_Vulkan, "arena_evict_idle_s: {}", ArenaEvictReport());
+    }
+}
+
+void BufferCache::EvictArenaAllocation(vk::DeviceMemory memory, u64 bytes,
+                                       std::span<const Interval> ranges) {
+    // Clear page table entries in this command buffer so later accesses fault
+    // Wait for this tick before unbinding because earlier commands
+    // may still read the memory
+    PendingUnbind unbind{scheduler.CurrentTick(), memory, bytes, {ranges.begin(), ranges.end()}};
+    for (const auto& range : ranges) {
+        const VAddr addr = range.start << block_shift;
+        const u64 size = (range.end - range.start) << block_shift;
+        resident_ranges.Subtract(range.start, range.end);
+        ClearResident(range.start, range.end);
+        sync_batch.Subtract(addr, addr + size);
+        // The next residency allocates new memory: every page must be uploaded again
+        memory_tracker->MarkRegionAsCpuModified(addr, size);
+        runtime.FillBuffer(bda_pagetable_buffer.get(), range.start * sizeof(vk::DeviceAddress),
+                           (range.end - range.start) * sizeof(vk::DeviceAddress), 0u);
+        evicted_blocks.Add({range.start, range.end});
+        LOG_INFO(Render, "arena_evict_idle_s: evicting range start={}, end={}", range.start,
+                 range.end);
+    }
+    arena_allocations.erase(static_cast<VkDeviceMemory>(memory));
+    pending_unbinds.push_back(std::move(unbind));
+    // Ranges left the batch and the arena: answers cached against either
+    // (range_fast_paths, incremental_bind) are stale
+    sync_batch_generation.fetch_add(1, std::memory_order_release);
+    arena_generation.fetch_add(1, std::memory_order_release);
+    dma_sync_covered = false;
+    dma_sweep_pieces_valid = false;
+    ++arena_stats.evicted_allocations;
+    arena_stats.evicted_bytes += bytes;
+}
+
+void BufferCache::QueueArenaUnbinds() {
+    while (!pending_unbinds.empty() && scheduler.IsFree(pending_unbinds.front().tick)) {
+        const auto& unbind = pending_unbinds.front();
+        for (const auto& range : unbind.ranges) {
+            // Blocks made resident again since then are bound to their new memory
+            resident_ranges.ForEachGap(range.start, range.end, [&](u64 start, u64 end) {
+                for (u64 block = start; block < end;) {
+                    const u64 page = block >> blocks_per_arena_page_shift;
+                    const u64 page_end =
+                        std::min(end, (page + 1) << blocks_per_arena_page_shift);
+                    if (const Buffer* arena = address_space[page]) {
+                        BindsForArena(arena)->binds.push_back(vk::SparseMemoryBind{
+                            .resourceOffset = (block << block_shift) - arena->cpu_addr,
+                            .size = (page_end - block) << block_shift,
+                            .memory = {},
+                            .memoryOffset = 0,
+                        });
+                    }
+                    block = page_end;
+                }
+            });
+        }
+        // The submit after these binds waits for them
+        pending_frees.push_back({scheduler.CurrentTick(), unbind.memory, unbind.bytes});
+        pending_unbinds.pop_front();
+    }
+}
+
+void BufferCache::FreeUnboundArenaMemory() {
+    while (!pending_frees.empty() && scheduler.IsFree(pending_frees.front().tick)) {
+        const auto& item = pending_frees.front();
+        instance.GetDevice().freeMemory(item.memory);
+        arena_resident_bytes -= item.bytes;
+        arena_stats.freed_bytes += item.bytes;
+        pending_frees.pop_front();
+    }
+}
+
+std::string BufferCache::ArenaEvictReport() const {
+    return fmt::format("resident={}MB allocations={} pinned={}MB gpu_written_idle={}MB "
+                       "evicted={}/{}MB freed={}MB returned={}MB (dma_fault {}MB)",
+                       arena_resident_bytes >> 20, arena_allocations.size(),
+                       arena_stats.pinned_bytes >> 20, arena_stats.skipped_gpu_bytes >> 20,
+                       arena_stats.evicted_allocations, arena_stats.evicted_bytes >> 20,
+                       arena_stats.freed_bytes >> 20, arena_stats.returned_bytes >> 20,
+                       arena_stats.returned_fault_bytes >> 20);
+}
+
+bool BufferCache::IsPendingWrittenSync(VAddr addr, u64 size) const {
+    auto it = std::ranges::upper_bound(sync_batch, addr, {}, &SyncRange::end);
+    for (; it != sync_batch.end() && it->start < addr + size; ++it) {
+        if (it->written) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
@@ -1226,6 +1453,10 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
 }
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
+    if (!pending_unbinds.empty()) {
+        // Last, after every bind this submit's commands asked for
+        QueueArenaUnbinds();
+    }
     if (pending_binds.empty()) {
         return;
     }

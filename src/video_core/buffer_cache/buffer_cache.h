@@ -8,6 +8,8 @@
 #include <chrono>
 #include <deque>
 #include <span>
+#include <string>
+#include <unordered_map>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -103,6 +105,15 @@ public:
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
                                                              bool is_texel_buffer = false);
+
+    /// Make ranges read by shader DMA resident
+    /// Keep these allocations during idle eviction because they
+    /// have no binding timestamps
+    void ObtainFaultedRange(VAddr device_addr, u32 size) {
+        fault_obtain = true;
+        (void)ObtainBuffer(device_addr, size, false);
+        fault_obtain = false;
+    }
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
@@ -233,13 +244,37 @@ private:
     /// With `fast`, skipped when the same binding was added to this batch with
     /// the same or a dominant flag
     void AddToSyncBatch(VAddr addr, u64 size, bool is_written, bool fast);
-    /// Residency bitmap, kept with resident_ranges on or off
-    /// (residency is never released)
+    /// Residency bitmap, kept with resident_ranges on or off (only
+    /// arena_evict_idle_s releases residency)
     void MarkResident(u64 start_block, u64 end_block);
+    void ClearResident(u64 start_block, u64 end_block);
     [[nodiscard]] bool IsResident(u64 first_block, u64 last_block) const;
     /// SHADPS4_RANGE_FAST_VERIFY: counts and logs a shortcut that differs
     /// from the interval structures
     void RangeFastMismatch(const char* what, VAddr addr, u64 size);
+    /// arena_evict_idle_s: a binding uses [addr, addr + size) of the arena now
+    void TouchArenaUse(VAddr addr, u64 size) {
+        const u32 now = arena_now_s;
+        for (u64 g = addr >> ArenaUseGranuleBits; g <= (addr + size - 1) >> ArenaUseGranuleBits;
+             ++g) {
+            arena_use[g] = now;
+        }
+    }
+    /// arena_evict_idle_s: once a second, the allocations no binding used for the set
+    /// time and that hold no GPU-written bytes leave the arena
+    /// Called between frames
+    void ScanArenaAllocations();
+    /// arena_evict_idle_s: takes the ranges of one allocation out of the arena now; the
+    /// unbind and the free wait for the GPU
+    void EvictArenaAllocation(vk::DeviceMemory memory, u64 bytes, std::span<const Interval> ranges);
+    /// arena_evict_idle_s: queues the unbinds whose GPU work finished (before a
+    /// submit), and frees the memory earlier unbinds released
+    void QueueArenaUnbinds();
+    void FreeUnboundArenaMemory();
+    [[nodiscard]] std::string ArenaEvictReport() const;
+    /// A written binding of [addr, addr + size) is in the sync batch
+    [[nodiscard]] bool IsPendingWrittenSync(VAddr addr, u64 size) const;
+
     /// range_fast_paths: the DMA sweep's resident ranges (or stack-free pieces) merged
     /// into the sync batch in one pass
     void AddDmaSweepSorted(bool skip_stacks);
@@ -332,6 +367,54 @@ private:
     std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
     std::deque<Buffer> arenas;
     std::vector<ArenaBinds> pending_binds;
+
+    /// arena_evict_idle_s: one entry per allocation EnsureResident made
+    struct ArenaAllocation {
+        u64 bytes;
+        bool pinned; ///< Made resident by a DMA fault: shaders read it without a binding, so it stays
+    };
+    std::unordered_map<VkDeviceMemory, ArenaAllocation> arena_allocations;
+    /// Evicted ranges (blocks) waiting until the GPU no longer runs
+    /// commands that may read them
+    struct PendingUnbind {
+        u64 tick;
+        vk::DeviceMemory memory;
+        u64 bytes;
+        std::vector<Interval> ranges;
+    };
+    std::deque<PendingUnbind> pending_unbinds;
+    /// Memory unbound by the submit of `tick`, freed once it ran
+    struct PendingFree {
+        u64 tick;
+        vk::DeviceMemory memory;
+        u64 bytes;
+    };
+    std::deque<PendingFree> pending_frees;
+    /// Evicted blocks not resident since (to count returns)
+    IntervalList<> evicted_blocks;
+    /// Seconds stamp of the last binding per 2 MiB of guest address space;
+    /// null when the key is off
+    static constexpr u64 ArenaUseGranuleBits = 21;
+    std::unique_ptr<u32[]> arena_use;
+    u32 arena_now_s{1};
+    const u32 arena_evict_idle_s;
+    std::chrono::steady_clock::time_point arena_epoch{};
+    std::chrono::steady_clock::time_point arena_last_scan{};
+    std::chrono::steady_clock::time_point arena_last_report{};
+    bool fault_obtain{};
+    /// Device memory bound to the sparse arenas, and the
+    /// eviction counters of the report
+    u64 arena_resident_bytes{};
+    struct ArenaEvictStats {
+        u64 pinned_bytes{};       ///< Last scan
+        u64 skipped_gpu_bytes{};  ///< Last scan: idle, but holding GPU-written bytes
+        u64 evicted_allocations{};
+        u64 evicted_bytes{};
+        u64 freed_bytes{};
+        u64 returned_bytes{};       ///< Evicted bytes a binding made resident again
+        u64 returned_fault_bytes{}; ///< Of those, by a DMA fault
+    };
+    ArenaEvictStats arena_stats;
     Vulkan::Semaphore memory_semaphore;
     /// Graphics tick that makes migrated arena bindings visible to transfer copies
     bool migration_binds_pending{};
