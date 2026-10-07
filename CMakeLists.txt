@@ -1131,6 +1131,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/buffer_cache/region_manager.h
                src/video_core/renderer_vulkan/liverpool_to_vk.cpp
                src/video_core/renderer_vulkan/liverpool_to_vk.h
+               src/video_core/renderer_vulkan/vk_access_bitmap.cpp
+               src/video_core/renderer_vulkan/vk_access_bitmap.h
                src/video_core/renderer_vulkan/vk_bind_cache.h
                src/video_core/renderer_vulkan/vk_common.cpp
                src/video_core/renderer_vulkan/vk_common.h

@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "common/div_ceil.h"
 #include "common/logging/events.h"
 #include "common/perf_stats.h"
+#include "core/emulator_settings.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -106,8 +109,18 @@ static u32 BufferImageCopySize(const vk::BufferImageCopy& copy, const vk::Format
 }
 
 Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
-    : instance{instance_}, scheduler{scheduler_}, staging_pool{instance_, scheduler_} {
+    : instance{instance_}, scheduler{scheduler_}, staging_pool{instance_, scheduler_},
+      access_bitmap_tracking{EmulatorSettings.IsAccessBitmapTracking()},
+      access_bitmap_toggle{Common::PerfStats::AbToggleFollows("access_bitmap_tracking")},
+      access_bitmap_verify{access_bitmap_tracking &&
+                           std::getenv("SHADPS4_ACCESS_BITMAP_VERIFY") != nullptr} {
     blit_helper = std::make_unique<VideoCore::BlitHelper>(instance, scheduler);
+    access_bitmap_on =
+        access_bitmap_tracking && Common::PerfStats::AbToggleOn(access_bitmap_toggle);
+    if (access_bitmap_tracking) {
+        LOG_WARNING(Render_Vulkan, "Workaround access_bitmap_tracking enabled{}",
+                    access_bitmap_verify ? " (verify)" : "");
+    }
 
     memory_barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
     memory_barrier.dstAccessMask =
@@ -744,6 +757,53 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
+    if (!access_bitmap_on) {
+        return IsBufferAccessedList(handle, offset, size, check_read_access);
+    }
+    const bool has_access = IsBufferAccessedBitmap(handle, offset, size, check_read_access);
+    if (access_bitmap_verify) {
+        ++access_bitmap_checks;
+        if (has_access != IsBufferAccessedList(handle, offset, size, check_read_access)) {
+            Common::PerfStats::Add(Common::PerfStats::Id::AccessBitmapMismatches);
+            if (++access_bitmap_mismatches <= 32) {
+                LOG_ERROR(Render_Vulkan,
+                          "access_bitmap_tracking verify: buffer {:#x} [{:#x}, {:#x}) read check {} "
+                          "gives {} on the bitmap",
+                          handle->CpuAddr(), offset, offset + size, check_read_access, has_access);
+            }
+        }
+        if (access_bitmap_checks % 1000000 == 0) {
+            LOG_WARNING(Render_Vulkan, "access_bitmap_tracking verify: {} checks, {} mismatches",
+                        access_bitmap_checks, access_bitmap_mismatches);
+        }
+    }
+    return has_access;
+}
+
+bool Runtime::IsBufferAccessedBitmap(const VideoCore::Buffer* handle, u64 offset, u64 size,
+                                     bool check_read_access) {
+    BufferBitmaps* bitmaps = FindBitmaps(handle, false);
+    if (!bitmaps) {
+        return false;
+    }
+    bool hit;
+    bool has_access = bitmaps->writes.Overlaps(offset, offset + size, hit);
+    bool any_hit = hit;
+    if (check_read_access && !has_access) {
+        has_access = bitmaps->reads.Overlaps(offset, offset + size, hit);
+        any_hit |= hit;
+    }
+    if (any_hit) {
+        Common::PerfStats::Add(Common::PerfStats::Id::AccessBitmapHits);
+        if (!has_access) {
+            Common::PerfStats::Add(Common::PerfStats::Id::AccessBitmapFalseHits);
+        }
+    }
+    return has_access;
+}
+
+bool Runtime::IsBufferAccessedList(const VideoCore::Buffer* handle, u64 offset, u64 size,
+                                   bool check_read_access) {
     MakeCurrent(handle);
     bool has_access = resource->write_ranges.Overlaps(offset, offset + size);
     if (check_read_access && !has_access) {
@@ -755,8 +815,6 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
                            bool game_dispatch) {
-    MakeCurrent(handle);
-
     const Interval range = {
         .start = offset,
         .end = offset + size,
@@ -774,11 +832,23 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
-    if (src_access & WRITE_MASK) {
-        resource->write_ranges.Add(range);
+    if (access_bitmap_on) {
+        BufferBitmaps* bitmaps = FindBitmaps(handle, true);
+        if (src_access & WRITE_MASK) {
+            bitmaps->writes.Add(range.start, range.end);
+        }
+        if (src_access & READ_MASK) {
+            bitmaps->reads.Add(range.start, range.end);
+        }
     }
-    if (src_access & READ_MASK) {
-        resource->read_ranges.Add(range);
+    if (!access_bitmap_on || access_bitmap_verify) {
+        MakeCurrent(handle);
+        if (src_access & WRITE_MASK) {
+            resource->write_ranges.Add(range);
+        }
+        if (src_access & READ_MASK) {
+            resource->read_ranges.Add(range);
+        }
     }
 
     memory_barrier.srcStageMask |= src_stage;
@@ -838,6 +908,7 @@ void Runtime::FlushBarriers(s8 unordered_ring) {
     }
     resources.clear();
     resource = nullptr;
+    ClearBitmaps();
 }
 
 void Runtime::MakeCurrent(const VideoCore::Buffer* handle) {
@@ -850,6 +921,53 @@ void Runtime::MakeCurrent(const VideoCore::Buffer* handle) {
         return;
     }
     resource = &resources.emplace_back(handle);
+}
+
+Runtime::BufferBitmaps* Runtime::FindBitmaps(const VideoCore::Buffer* handle, bool create) {
+    if (bitmap_resource && bitmap_resource->handle == handle) {
+        return bitmap_resource;
+    }
+    for (const auto& bitmaps : bitmap_resources) {
+        if (bitmaps->handle == handle) {
+            bitmap_resource = bitmaps.get();
+            return bitmap_resource;
+        }
+    }
+    if (!create) {
+        return nullptr;
+    }
+    const u64 size = handle->SizeBytes();
+    const auto it = std::ranges::find_if(
+        bitmap_free, [size](const auto& bitmaps) { return bitmaps->reads.SizeBytes() == size; });
+    if (it != bitmap_free.end()) {
+        bitmap_resources.push_back(std::move(*it));
+        bitmap_free.erase(it);
+    } else {
+        bitmap_resources.push_back(std::make_unique<BufferBitmaps>(size));
+    }
+    bitmap_resource = bitmap_resources.back().get();
+    bitmap_resource->handle = handle;
+    return bitmap_resource;
+}
+
+void Runtime::ClearBitmaps() {
+    for (auto& bitmaps : bitmap_resources) {
+        bitmaps->reads.Clear();
+        bitmaps->writes.Clear();
+        bitmaps->handle = nullptr;
+        bitmap_free.push_back(std::move(bitmaps));
+    }
+    bitmap_resources.clear();
+    bitmap_resource = nullptr;
+    // Buffers of sizes that stop coming back would keep their bitmaps
+    // (4 MiB for a 4 GiB arena)
+    constexpr std::size_t MaxFree = 16;
+    if (bitmap_free.size() > MaxFree) {
+        bitmap_free.erase(bitmap_free.begin(), bitmap_free.end() - MaxFree);
+    }
+    // The key switches here, with the bitmaps and the interval lists empty
+    access_bitmap_on =
+        access_bitmap_tracking && Common::PerfStats::AbToggleOn(access_bitmap_toggle);
 }
 
 } // namespace Vulkan

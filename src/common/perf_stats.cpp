@@ -144,6 +144,9 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::DepthTargetSampled, "depth_tgt_sampled", Unit::Count},
     {Id::GcnUnorderedPoints, "gcn_points", Unit::Count},
     {Id::GcnUnorderedSkips, "gcn_skips", Unit::Count},
+    {Id::AccessBitmapHits, "access_bm_hits", Unit::Count},
+    {Id::AccessBitmapFalseHits, "access_bm_false_hits", Unit::Count},
+    {Id::AccessBitmapMismatches, "access_bm_mismatches", Unit::Count},
 }};
 
 constexpr bool FieldsMatchIds() {

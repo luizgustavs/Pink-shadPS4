@@ -6,6 +6,7 @@
 #include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/renderer_vulkan/vk_access_bitmap.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/types.h"
@@ -88,6 +89,16 @@ public:
 
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);
+    bool IsBufferAccessedList(const VideoCore::Buffer* handle, u64 offset, u64 size,
+                              bool check_read_access);
+
+    struct BufferBitmaps;
+    /// The bitmaps of a buffer accessed since the last barrier, or null;
+    /// create takes a pair for it
+    BufferBitmaps* FindBitmaps(const VideoCore::Buffer* handle, bool create);
+    bool IsBufferAccessedBitmap(const VideoCore::Buffer* handle, u64 offset, u64 size,
+                                bool check_read_access);
+    void ClearBitmaps();
 
 private:
     const Instance& instance;
@@ -109,6 +120,29 @@ private:
     // rings that sent a sync packet after an access
     bool foreign_access{};
     u16 synced_rings{};
+
+    // access_bitmap_tracking: the same ranges as BufferBarriers, kept in bitmaps
+    // The bitmaps of a cleared buffer go back to bitmap_free for the
+    // next buffer of the same size
+    struct BufferBitmaps {
+        explicit BufferBitmaps(u64 size) : reads{size}, writes{size} {}
+        const VideoCore::Buffer* handle{};
+        AccessBitmap reads;
+        AccessBitmap writes;
+    };
+    const bool access_bitmap_tracking;
+    const bool access_bitmap_toggle;
+    // SHADPS4_ACCESS_BITMAP_VERIFY: the interval lists stay up to date and every
+    // check compares both answers
+    const bool access_bitmap_verify;
+    // Whether the ranges since the last barrier are in the bitmaps; switches
+    // only when both are empty
+    bool access_bitmap_on{};
+    BufferBitmaps* bitmap_resource{};
+    std::vector<std::unique_ptr<BufferBitmaps>> bitmap_resources;
+    std::vector<std::unique_ptr<BufferBitmaps>> bitmap_free;
+    u64 access_bitmap_checks{};
+    u64 access_bitmap_mismatches{};
 };
 
 } // namespace Vulkan

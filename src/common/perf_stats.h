@@ -188,6 +188,12 @@ enum class Id : u32 {
     // the previous dispatch of their ring, and those whose memory barrier was left out
     GcnUnorderedPoints,
     GcnUnorderedSkips,
+    // access_bitmap_tracking: buffer access checks whose bitmap matched, and those of
+    // them the exact ranges did not confirm; with SHADPS4_ACCESS_BITMAP_VERIFY, checks
+    // whose answer differs from the interval lists
+    AccessBitmapHits,
+    AccessBitmapFalseHits,
+    AccessBitmapMismatches,
     Count,
 };
 
