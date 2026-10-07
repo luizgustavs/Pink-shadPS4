@@ -36,6 +36,12 @@ enum class Id : u32 {
     Readbacks,
     ReadbackNs,
     ReadbackBytes,
+    // readback_hot_regions: recent readback windows downloaded along with a
+    // readback that drained the GPU, and the command processor time spent
+    // recording and writing them
+    ReadbackHotRegions,
+    ReadbackHotBytes,
+    ReadbackHotNs,
     ImageDownloads,
     // Vulkan drains, timeline waits, submits and GPU time from rasterizer command buffer timestamps
     VkFinish,

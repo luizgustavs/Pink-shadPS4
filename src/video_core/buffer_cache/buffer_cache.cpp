@@ -71,7 +71,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       dma_sync_once_verify{dma_sync_once &&
                            std::getenv("SHADPS4_DMA_SYNC_ONCE_VERIFY") != nullptr},
       sweep_skip_stacks{EmulatorSettings.IsDmaSweepSkipStacks()},
-      sweep_skip_toggle{Common::PerfStats::AbToggleFollows("dma_sweep_skip_stacks")} {
+      sweep_skip_toggle{Common::PerfStats::AbToggleFollows("dma_sweep_skip_stacks")},
+      readback_hot_regions{EmulatorSettings.IsReadbackHotRegions()},
+      readback_hot_toggle{Common::PerfStats::AbToggleFollows("readback_hot_regions")} {
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -122,6 +124,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     if (dma_sync_once) {
         LOG_WARNING(Render_Vulkan, "Workaround dma_sync_once_per_batch enabled{}",
                     dma_sync_once_verify ? " (SHADPS4_DMA_SYNC_ONCE_VERIFY)" : "");
+    }
+    if (readback_hot_regions) {
+        LOG_WARNING(Render_Vulkan, "Workaround readback_hot_regions enabled");
     }
 }
 
@@ -255,6 +260,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
+    const bool hot_regions = TouchHotReadback(arena, device_addr, size);
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     const VAddr arena_base = arena->cpu_addr;
@@ -338,6 +344,9 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             Common::PerfStats::Add(Common::PerfStats::Id::GuestReadbackFinish);
         }
         runtime.CopyBuffer(arena, download.buffer, copies);
+        if (hot_regions) {
+            RecordHotDownloads(device_addr);
+        }
         scheduler.FinishHostRead();
     }
 
@@ -373,6 +382,130 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         }
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+    if (!hot_downloads.empty()) {
+        ApplyHotDownloads(heap_guard ? &*heap_guard : nullptr);
+    }
+}
+
+bool BufferCache::TouchHotReadback(const Buffer* arena, VAddr addr, u64 size) {
+    if (!readback_hot_regions || !Common::PerfStats::AbToggleOn(readback_hot_toggle)) {
+        return false;
+    }
+    // Games read back the same few windows every frame, one after another:
+    // remember them for a while
+    static constexpr size_t MaxHotReadbacks = 64;
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& hot : hot_readbacks) {
+        if (hot.arena == arena && hot.addr == addr && hot.size == size) {
+            hot.last_request = now;
+            return true;
+        }
+    }
+    if (hot_readbacks.size() < MaxHotReadbacks) {
+        hot_readbacks.push_back({arena, addr, size, now});
+    } else {
+        *std::ranges::min_element(hot_readbacks, {}, &HotReadback::last_request) = {arena, addr,
+                                                                                     size, now};
+    }
+    return true;
+}
+
+void BufferCache::RecordHotDownloads(VAddr skip_addr) {
+    // Download other recent GPU-written windows while this readback drains the GPU
+    // Keep DownloadMemory rules for CPU-owned stacks, modified ranges and clean pages
+    const Common::PerfStats::ScopedNs perf_timer{Common::PerfStats::Id::ReadbackHotNs};
+    static constexpr auto HotReadbackLifetime = std::chrono::seconds(2);
+    const auto now = std::chrono::steady_clock::now();
+    hot_downloads.clear();
+    hot_copies.clear();
+    u64 total_size_bytes = 0;
+    for (const auto& hot : hot_readbacks) {
+        if (hot.addr == skip_addr || now - hot.last_request > HotReadbackLifetime) {
+            continue;
+        }
+        const VAddr arena_base = hot.arena->cpu_addr;
+        const u32 first_copy = static_cast<u32>(hot_copies.size());
+        bool gpu_modified = false;
+        memory_tracker->ForEachDownloadRange<false>(
+            hot.addr, hot.size, [&](u64 address, u64 range_size) {
+                gpu_modified = true;
+                gpu_modified_ranges.ForEachInRange(address, range_size, [&](VAddr start, VAddr end) {
+                    for (const auto& [lo, len] : memory->SubtractStackRanges(start, end - start)) {
+                        hot_copies.push_back(vk::BufferCopy{
+                            .srcOffset = lo - arena_base,
+                            .dstOffset = total_size_bytes,
+                            .size = len,
+                        });
+                        total_size_bytes += Common::AlignUp(len, 64ULL);
+                    }
+                });
+                gpu_modified_ranges.Subtract(address, range_size);
+                InvalidateCleanPages(address, range_size);
+            });
+        // Skip clean windows instead of unmarking their pages again
+        // That repeated work caused stutters when moving around the map
+        if (!gpu_modified) {
+            continue;
+        }
+        // Windows the tracker marks GPU-written without GPU-written
+        // bytes left are only unmarked
+        const u32 num_copies = static_cast<u32>(hot_copies.size()) - first_copy;
+        hot_downloads.push_back({hot.arena, hot.addr, hot.size, first_copy, num_copies});
+    }
+    hot_total = total_size_bytes;
+    if (total_size_bytes == 0) {
+        return;
+    }
+    if (!hot_buffer || hot_buffer->SizeBytes() < total_size_bytes) {
+        hot_buffer = std::make_unique<Buffer>(instance, 0,
+                                              std::bit_ceil(std::max<u64>(total_size_bytes, 1_MB)),
+                                              MemoryType::HostCached, "Readback Hot Regions");
+    }
+    for (const auto& item : hot_downloads) {
+        if (item.num_copies != 0) {
+            runtime.CopyBuffer(item.arena, hot_buffer.get(),
+                               std::span{hot_copies}.subspan(item.first_copy, item.num_copies));
+        }
+    }
+    Common::PerfStats::Add(Common::PerfStats::Id::ReadbackHotBytes, total_size_bytes);
+}
+
+void BufferCache::ApplyHotDownloads(BpeHeapGuard* heap_guard) {
+    const Common::PerfStats::ScopedNs perf_timer{Common::PerfStats::Id::ReadbackHotNs};
+    if (hot_total != 0) {
+        hot_buffer->Invalidate(0, hot_total);
+    }
+    for (const auto& item : hot_downloads) {
+        const VAddr arena_base = item.arena->cpu_addr;
+        for (u32 i = item.first_copy; i < item.first_copy + item.num_copies; ++i) {
+            const auto& copy = hot_copies[i];
+            const VAddr copy_addr = arena_base + copy.srcOffset;
+            const u8* src = hot_buffer->mapped_data.data() + copy.dstOffset;
+            // A page can become a stack while the GPU drains: subtract the stacks again
+            for (const auto& [lo, len] : memory->SubtractStackRanges(copy_addr, copy.size)) {
+                Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::BufferReadback,
+                                                  lo, len, src + (lo - copy_addr), item.addr);
+                if (heap_guard) {
+                    if (const u64 kept = heap_guard->Write(lo, src + (lo - copy_addr), len);
+                        kept != 0) {
+                        Common::GuestWriteJournal::Record(
+                            Common::GuestWriteJournal::Source::HeapGuardKept, lo, len, nullptr,
+                            kept);
+                        ReportHeapGuardHit(lo, kept);
+                    }
+                    continue;
+                }
+                memory->TryWriteBacking(std::bit_cast<u8*>(lo), src + (lo - copy_addr), len);
+            }
+        }
+        if (item.num_copies != 0) {
+            Common::PerfStats::Add(Common::PerfStats::Id::ReadbackHotRegions);
+        }
+        memory_tracker->UnmarkRegionAsGpuModified(item.addr, item.size, false);
+    }
+    hot_downloads.clear();
+    hot_copies.clear();
+    hot_total = 0;
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,

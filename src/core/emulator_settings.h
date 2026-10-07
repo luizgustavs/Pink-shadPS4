@@ -552,6 +552,9 @@ struct GPUSettings {
     // Keep stronger guest ratios, point filtering and depth compares unchanged
     // Cap the result at the device limit
     Setting<u32> force_anisotropy{0};
+    // Download other recent GPU-written windows during the same drain
+    // Their next CPU read can use the data without another GPU wait
+    Setting<bool> readback_hot_regions{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -626,6 +629,8 @@ struct GPUSettings {
             make_override<GPUSettings>("eop_label_delay_us", &GPUSettings::eop_label_delay_us),
             make_override<GPUSettings>("cp_record_thread", &GPUSettings::cp_record_thread),
             make_override<GPUSettings>("force_anisotropy", &GPUSettings::force_anisotropy),
+            make_override<GPUSettings>("readback_hot_regions",
+                                       &GPUSettings::readback_hot_regions),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -650,7 +655,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    wait_spin_us, readback_ahead_transfer_queue, mapped_page_table,
                                    dma_sync_once_per_batch, incremental_bind, tsharp_cache,
                                    wait_marker, image_memory_pool, eop_label_delay_us,
-                                   cp_record_thread, force_anisotropy)
+                                   cp_record_thread, force_anisotropy, readback_hot_regions)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -976,6 +981,7 @@ public:
     SETTING_FORWARD(m_gpu, EopLabelDelayUs, eop_label_delay_us)
     SETTING_FORWARD_BOOL(m_gpu, CpRecordThread, cp_record_thread)
     SETTING_FORWARD(m_gpu, ForceAnisotropy, force_anisotropy)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackHotRegions, readback_hot_regions)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

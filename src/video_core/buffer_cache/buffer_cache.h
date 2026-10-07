@@ -36,6 +36,7 @@ namespace VideoCore {
 
 class TextureCache;
 class MemoryTracker;
+class BpeHeapGuard;
 class PageManager;
 
 class BufferCache {
@@ -200,6 +201,17 @@ private:
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
+    /// readback_hot_regions: a readback window requested now;
+    /// returns whether the key is on
+    bool TouchHotReadback(const Buffer* arena, VAddr addr, u64 size);
+
+    /// readback_hot_regions: records copies of the GPU-written bytes of the other
+    /// recent readback windows into hot_buffer, before the readback drains the GPU
+    void RecordHotDownloads(VAddr skip_addr);
+
+    /// readback_hot_regions: after the drain, writes the hot downloads to guest memory
+    void ApplyHotDownloads(BpeHeapGuard* heap_guard);
+
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
     /// Logs compute_loop_cap hits: the first one, then a count per minute
@@ -263,6 +275,30 @@ private:
     boost::container::small_vector<std::pair<VAddr, u64>, 16> open_writes;
     const bool readback_ahead;
     const bool track_writers;
+    /// readback_hot_regions: readback windows requested in the last seconds
+    struct HotReadback {
+        const Buffer* arena;
+        VAddr addr;
+        u64 size;
+        std::chrono::steady_clock::time_point last_request;
+    };
+    std::vector<HotReadback> hot_readbacks;
+    /// readback_hot_regions: windows with copies recorded by
+    /// RecordHotDownloads, waiting for the drain
+    struct HotDownload {
+        const Buffer* arena;
+        VAddr addr;
+        u64 size;
+        u32 first_copy;
+        u32 num_copies;
+    };
+    std::vector<HotDownload> hot_downloads;
+    std::vector<vk::BufferCopy> hot_copies;
+    /// readback_hot_regions: host buffer the hot copies land in, reused by every drain
+    /// and grown in powers of two (a staging request of a different size each drain
+    /// allocated a dedicated buffer)
+    std::unique_ptr<Buffer> hot_buffer;
+    u64 hot_total{};
     // Frente J probe: the readback being downloaded was asked for by a guest thread's fault
     bool guest_readback{};
 
@@ -315,6 +351,8 @@ private:
     /// Stack generation used by the last covered DMA sweep
     const bool sweep_skip_stacks;
     const bool sweep_skip_toggle;
+    const bool readback_hot_regions;
+    const bool readback_hot_toggle;
     u64 dma_sync_stack_generation{};
     /// Cached resident ranges with guest stacks removed
     std::vector<std::pair<VAddr, u64>> dma_sweep_pieces;
