@@ -144,13 +144,23 @@ VmaPool ImagePool(VmaAllocator allocator, u32 memory_type_bits) {
 }
 } // Anonymous namespace
 
-bool UniqueImage::TryCreatePooled(const vk::ImageCreateInfo& image_ci) {
+bool UniqueImage::TryCreatePooled(const vk::ImageCreateInfo& image_ci, bool texture) {
     static const bool enabled = [] {
         const bool on = EmulatorSettings.IsImageMemoryPool();
         if (on) {
             LOG_WARNING(Render_Vulkan, "Workaround image_memory_pool enabled");
         }
         return on;
+    }();
+    // Allocate large textures separately so freed space is not trapped
+    // in partly used pool blocks
+    static const VkDeviceSize texture_max_bytes = [] {
+        const u32 max_kb = EmulatorSettings.GetImagePoolTextureMaxKb();
+        if (max_kb != 0 && EmulatorSettings.IsImageMemoryPool()) {
+            LOG_WARNING(Render_Vulkan, "Workaround image_pool_texture_max_kb enabled: {} KiB",
+                        max_kb);
+        }
+        return VkDeviceSize{max_kb} << 10;
     }();
     static const bool follows_toggle = Common::PerfStats::AbToggleFollows("image_memory_pool");
     if (!enabled || !Common::PerfStats::AbToggleOn(follows_toggle)) {
@@ -173,6 +183,11 @@ bool UniqueImage::TryCreatePooled(const vk::ImageCreateInfo& image_ci) {
         return give_up("createImage");
     }
     const auto requirements = device.getImageMemoryRequirements(new_image);
+    if (texture && texture_max_bytes != 0 && requirements.size > texture_max_bytes) {
+        // Create() gives it an allocation of its own
+        device.destroyImage(new_image);
+        return false;
+    }
     const VmaPool pool = requirements.size <= PooledImageMaxBytes
                              ? ImagePool(allocator, requirements.memoryTypeBits)
                              : VK_NULL_HANDLE;
@@ -203,14 +218,21 @@ bool UniqueImage::TryCreatePooled(const vk::ImageCreateInfo& image_ci) {
     return true;
 }
 
-void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
+void UniqueImage::Create(const vk::ImageCreateInfo& image_ci, bool texture) {
     this->image_ci = image_ci;
     ASSERT(!image);
-    if (TryCreatePooled(image_ci)) {
+    if (TryCreatePooled(image_ci, texture)) {
         return;
     }
+    // Keep this texture out of VMA's default pools too, since they also
+    // retain partly used blocks
+    static const bool own_textures =
+        EmulatorSettings.IsImageMemoryPool() && EmulatorSettings.GetImagePoolTextureMaxKb() != 0;
+    const bool own = texture && own_textures;
     const VmaAllocationCreateInfo alloc_ci = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+        .flags = static_cast<VmaAllocationCreateFlags>(
+            VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT |
+            (own ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0)),
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .requiredFlags = 0,
         .preferredFlags = 0,
@@ -235,7 +257,8 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
-             Common::SlotVector<ImageView>& slot_image_views_, const ImageInfo& info_)
+             Common::SlotVector<ImageView>& slot_image_views_, const ImageInfo& info_,
+             bool texture)
     : runtime{&runtime_}, slot_image_views{&slot_image_views_}, info{info_} {
     if (info.pixel_format == vk::Format::eUndefined) {
         return;
@@ -305,7 +328,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     backing = &backing_images.emplace_back();
     backing->num_samples = info.num_samples;
     backing->image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
-    backing->image.Create(image_ci);
+    backing->image.Create(image_ci, texture);
 
     Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
                           "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,

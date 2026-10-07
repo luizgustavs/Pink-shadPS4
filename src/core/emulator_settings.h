@@ -585,6 +585,10 @@ struct GPUSettings {
     // included) above which the image GC starts freeing idle images; 0 = automatic
     // (half of the budget beyond 8 GB)
     Setting<u32> texture_gc_trigger_mb{0};
+    // Give sampled textures above this KiB threshold their own allocation
+    // Use 0 to disable the threshold and require image_memory_pool
+    // Keep render targets, storage images and smaller textures in the pool
+    Setting<u32> image_pool_texture_max_kb{0};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -675,6 +679,8 @@ struct GPUSettings {
                                        &GPUSettings::texture_gc_full_scan),
             make_override<GPUSettings>("texture_gc_trigger_mb",
                                        &GPUSettings::texture_gc_trigger_mb),
+            make_override<GPUSettings>("image_pool_texture_max_kb",
+                                       &GPUSettings::image_pool_texture_max_kb),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -698,7 +704,7 @@ struct GPUSettings {
         image_memory_pool, eop_label_delay_us, cp_record_thread, force_anisotropy,                  \
         readback_hot_regions, depth_target_sampled_layout, gcn_unordered_dispatches,                \
         access_bitmap_tracking, page_spin_locks, range_fast_paths, unbounded_vsharp_cap_mb,         \
-        texture_gc_full_scan, texture_gc_trigger_mb))
+        texture_gc_full_scan, texture_gc_trigger_mb, image_pool_texture_max_kb))
 template <typename BasicJsonType,
           nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0>
 void to_json(BasicJsonType& nlohmann_json_j, const GPUSettings& nlohmann_json_t) {
@@ -1044,6 +1050,7 @@ public:
     SETTING_FORWARD(m_gpu, UnboundedVsharpCapMb, unbounded_vsharp_cap_mb)
     SETTING_FORWARD_BOOL(m_gpu, TextureGcFullScan, texture_gc_full_scan)
     SETTING_FORWARD(m_gpu, TextureGcTriggerMb, texture_gc_trigger_mb)
+    SETTING_FORWARD(m_gpu, ImagePoolTextureMaxKb, image_pool_texture_max_kb)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

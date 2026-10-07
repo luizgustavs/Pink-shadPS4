@@ -627,7 +627,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
-        image_id = slot_images.insert(instance, runtime, slot_image_views, info);
+        image_id = slot_images.insert(instance, runtime, slot_image_views, info,
+                                      desc.type == BindingType::Texture);
         RegisterImage(image_id);
     }
 

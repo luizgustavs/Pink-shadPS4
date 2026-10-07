@@ -62,7 +62,9 @@ struct UniqueImage {
         return *this;
     }
 
-    void Create(const vk::ImageCreateInfo& image_ci);
+    /// `texture`: made for a sampled T# (image_pool_texture_max_kb can
+    /// keep it out of the pool)
+    void Create(const vk::ImageCreateInfo& image_ci, bool texture = false);
 
     void Destroy();
 
@@ -70,7 +72,7 @@ private:
     /// Create the image using memory from the pool when image_memory_pool is enabled and the image
     /// is supported
     /// Return false so the caller can use the normal allocation path otherwise
-    bool TryCreatePooled(const vk::ImageCreateInfo& image_ci);
+    bool TryCreatePooled(const vk::ImageCreateInfo& image_ci, bool texture);
 
 public:
     operator vk::Image() const {
@@ -91,8 +93,10 @@ public:
 };
 
 struct Image {
+    /// `texture`: made for a sampled T# (image_pool_texture_max_kb)
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,
-                   Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);
+                   Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info,
+                   bool texture = false);
     ~Image();
 
     Image(const Image&) = delete;
