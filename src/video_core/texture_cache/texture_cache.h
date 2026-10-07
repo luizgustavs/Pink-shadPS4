@@ -424,6 +424,7 @@ private:
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;
+    const bool gc_full_scan; ///< texture_gc_full_scan
     PageTable page_table;
     std::mutex mutex;
     std::mutex samplers_mutex;

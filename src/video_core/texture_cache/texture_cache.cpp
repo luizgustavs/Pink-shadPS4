@@ -30,6 +30,10 @@ namespace VideoCore {
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
+// GC ticks an image must stay unused before the GC frees it
+// below the pressure threshold
+static constexpr u64 GcIdleTicks = 16;
+static constexpr u64 GcFullScanIdleTicks = 300; // texture_gc_full_scan
 
 /// Hashes guest memory through its physical backing, like XXH3_64bits over the guest range. A direct read can
 /// fault, and inside the fault handler a nested fault on memory the tracker does not handle (not GPU mapped,
@@ -62,7 +66,8 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, liverpool{liverpool_},
       buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, runtime, buffer_cache.GetStreamBuffer()},
-      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
+      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()},
+      gc_full_scan{EmulatorSettings.IsTextureGcFullScan()} {
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -74,22 +79,31 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         trigger_gc_memory = 0;
         pressure_gc_memory = DEFAULT_PRESSURE_GC_MEMORY;
         critical_gc_memory = DEFAULT_CRITICAL_GC_MEMORY;
-        return;
+    } else {
+        const s64 device_local_memory = static_cast<s64>(instance.GetTotalMemoryBudget());
+        const s64 min_spacing_expected = device_local_memory - 1_GB;
+        const s64 min_spacing_critical = device_local_memory - 512_MB;
+        const s64 mem_threshold = std::min<s64>(device_local_memory, TARGET_GC_THRESHOLD);
+        const s64 min_vacancy_expected = (6 * mem_threshold) / 10;
+        const s64 min_vacancy_critical = (2 * mem_threshold) / 10;
+        pressure_gc_memory = static_cast<u64>(std::max<u64>(
+            std::min(device_local_memory - min_vacancy_expected, min_spacing_expected),
+            DEFAULT_PRESSURE_GC_MEMORY));
+        critical_gc_memory = static_cast<u64>(std::max<u64>(
+            std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
+            DEFAULT_CRITICAL_GC_MEMORY));
+        trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
     }
 
-    const s64 device_local_memory = static_cast<s64>(instance.GetTotalMemoryBudget());
-    const s64 min_spacing_expected = device_local_memory - 1_GB;
-    const s64 min_spacing_critical = device_local_memory - 512_MB;
-    const s64 mem_threshold = std::min<s64>(device_local_memory, TARGET_GC_THRESHOLD);
-    const s64 min_vacancy_expected = (6 * mem_threshold) / 10;
-    const s64 min_vacancy_critical = (2 * mem_threshold) / 10;
-    pressure_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_expected, min_spacing_expected),
-                      DEFAULT_PRESSURE_GC_MEMORY));
-    critical_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
-                      DEFAULT_CRITICAL_GC_MEMORY));
-    trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
+    if (const u32 trigger_mb = EmulatorSettings.GetTextureGcTriggerMb(); trigger_mb != 0) {
+        trigger_gc_memory = u64{trigger_mb} * 1_MB;
+        LOG_WARNING(Render_Vulkan, "Workaround texture_gc_trigger_mb enabled: {} MB", trigger_mb);
+    }
+    if (gc_full_scan) {
+        LOG_WARNING(Render_Vulkan, "Workaround texture_gc_full_scan enabled");
+    }
+    LOG_INFO(Render_Vulkan, "Texture GC thresholds: trigger {} MB, pressure {} MB, critical {} MB",
+             trigger_gc_memory / 1_MB, pressure_gc_memory / 1_MB, critical_gc_memory / 1_MB);
 }
 
 TextureCache::~TextureCache() = default;
@@ -1026,7 +1040,12 @@ void TextureCache::GarbageCollectImages() {
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_memory >= pressure_gc_memory;
         aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
-        ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
+        // A tick is one OnSubmit (~1 per frame)
+        // Once the full scan reaches the CPU-uploaded images, 16 ticks frees textures
+        // still in use and they are uploaded again
+        ticks_to_destroy = aggresive   ? 160
+                           : pressured ? 80
+                                       : (gc_full_scan ? GcFullScanIdleTicks : GcIdleTicks);
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
     };
@@ -1034,7 +1053,12 @@ void TextureCache::GarbageCollectImages() {
         if (num_deletions == 0) {
             return true;
         }
-        --num_deletions;
+        // texture_gc_full_scan: only freed images use the budget, so the
+        // GPU-modified images kept at the head of the LRU do not stop the GC before
+        // the idle CPU-uploaded ones
+        if (!gc_full_scan) {
+            --num_deletions;
+        }
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
@@ -1044,6 +1068,9 @@ void TextureCache::GarbageCollectImages() {
         }
         if (download && !pressured) {
             return false;
+        }
+        if (gc_full_scan) {
+            --num_deletions;
         }
         if (download) {
             DownloadImageMemory(image_id);

@@ -539,7 +539,8 @@ struct GPUSettings {
     // Check a GPU-written tick in host memory before querying the driver in mode 1, and also allow
     // readbacks to finish on that marker in mode 2
     Setting<u32> wait_marker{0};
-    // Sub-allocate images up to 16 MB from pools with 64 MB blocks to avoid individual device
+    // Sub-allocate images up to 16 MB from pools with 32 MB blocks
+    // to avoid individual device
     // memory allocations for small images
     Setting<bool> image_memory_pool{false};
     // Delay gfx EOP labels by this many microseconds as a temporary timing workaround, with 0
@@ -576,6 +577,14 @@ struct GPUSettings {
     // This avoids keeping gigabytes resident after a bind made during
     // the initial large mapping
     Setting<u32> unbounded_vsharp_cap_mb{0};
+    // Count only freed images against the GC budget so it reaches idle CPU textures
+    // Below memory pressure, wait 300 unused ticks instead of 16 to avoid
+    // reloading active textures
+    Setting<bool> texture_gc_full_scan{false};
+    // Device memory use (MB, as the driver reports it, sparse buffer arena
+    // included) above which the image GC starts freeing idle images; 0 = automatic
+    // (half of the budget beyond 8 GB)
+    Setting<u32> texture_gc_trigger_mb{0};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -662,6 +671,10 @@ struct GPUSettings {
             make_override<GPUSettings>("range_fast_paths", &GPUSettings::range_fast_paths),
             make_override<GPUSettings>("unbounded_vsharp_cap_mb",
                                        &GPUSettings::unbounded_vsharp_cap_mb),
+            make_override<GPUSettings>("texture_gc_full_scan",
+                                       &GPUSettings::texture_gc_full_scan),
+            make_override<GPUSettings>("texture_gc_trigger_mb",
+                                       &GPUSettings::texture_gc_trigger_mb),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -684,7 +697,8 @@ struct GPUSettings {
         mapped_page_table, dma_sync_once_per_batch, incremental_bind, tsharp_cache, wait_marker,    \
         image_memory_pool, eop_label_delay_us, cp_record_thread, force_anisotropy,                  \
         readback_hot_regions, depth_target_sampled_layout, gcn_unordered_dispatches,                \
-        access_bitmap_tracking, page_spin_locks, range_fast_paths, unbounded_vsharp_cap_mb))
+        access_bitmap_tracking, page_spin_locks, range_fast_paths, unbounded_vsharp_cap_mb,         \
+        texture_gc_full_scan, texture_gc_trigger_mb))
 template <typename BasicJsonType,
           nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0>
 void to_json(BasicJsonType& nlohmann_json_j, const GPUSettings& nlohmann_json_t) {
@@ -1028,6 +1042,8 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, PageSpinLocks, page_spin_locks)
     SETTING_FORWARD_BOOL(m_gpu, RangeFastPaths, range_fast_paths)
     SETTING_FORWARD(m_gpu, UnboundedVsharpCapMb, unbounded_vsharp_cap_mb)
+    SETTING_FORWARD_BOOL(m_gpu, TextureGcFullScan, texture_gc_full_scan)
+    SETTING_FORWARD(m_gpu, TextureGcTriggerMb, texture_gc_trigger_mb)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

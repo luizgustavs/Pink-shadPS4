@@ -112,7 +112,9 @@ namespace {
 // Creating or freeing these images can then avoid repeated vkAllocateMemory and vkFreeMemory calls
 // The pool supplies the backing memory while each image still follows its normal lifetime
 constexpr VkDeviceSize PooledImageMaxBytes = 16ULL << 20;
-constexpr VkDeviceSize ImagePoolBlockBytes = 64ULL << 20;
+// 32 MB blocks: a partly used block holds less VRAM than a 64 MB one, and
+// a new block costs ~0.2 ms
+constexpr VkDeviceSize ImagePoolBlockBytes = 32ULL << 20;
 std::mutex image_pools_mutex;
 std::array<VmaPool, VK_MAX_MEMORY_TYPES> image_pools{};
 

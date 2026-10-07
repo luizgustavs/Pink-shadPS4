@@ -90,7 +90,7 @@ These defaults are from the emulator; per-game presets may override them.
 | `incremental_bind` | `false` | Reuses unchanged read-only buffer and texture bindings from the previous call of a pipeline while their resources remain valid. |
 | `tsharp_cache` | `false` | Reuses texture descriptor lookups across pipelines while the registered images on their pages remain unchanged; changes what the GPU samples, so check visually. |
 | `wait_marker` | `0` | `0` disables it; `1` polls a GPU-written marker before querying the driver; `2` also lets readbacks complete on that marker. Requires `wait_spin_us` greater than `0`. |
-| `image_memory_pool` | `false` | Sub-allocates images up to 16 MB from pools with 64 MB blocks instead of allocating memory separately for each image. |
+| `image_memory_pool` | `false` | Sub-allocates images up to 16 MB from pools with 32 MB blocks instead of allocating memory separately for each image. |
 | `cp_record_thread` | `false` | Moves Vulkan command recording and submissions to a separate worker thread; pairs with `readback_ahead_transfer_queue`. |
 | `lds_barriers_large_groups` | `true` | Adds shared-memory barriers to compute workgroups larger than 64 threads to fix the blown-out sun on NVIDIA. |
 | `eop_label_delay_us` | `0` | Temporary workaround for SotC's flickering rocks: delays graphics EOP labels by a fixed number of microseconds (`2000` was used in testing); `0` disables it. This does not guarantee GPU completion, and enabling `readback_ahead` can bring the flicker back. |
