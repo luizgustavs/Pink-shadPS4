@@ -194,6 +194,13 @@ enum class Id : u32 {
     AccessBitmapHits,
     AccessBitmapFalseHits,
     AccessBitmapMismatches,
+    // range_fast_paths: written bindings, sync batch adds and residency checks answered
+    // by the shortcuts; with SHADPS4_RANGE_FAST_VERIFY, shortcuts whose answer differs
+    // from the interval structures
+    RangeFastWrittenHits,
+    RangeFastSyncHits,
+    RangeFastResidentHits,
+    RangeFastMismatches,
     Count,
 };
 

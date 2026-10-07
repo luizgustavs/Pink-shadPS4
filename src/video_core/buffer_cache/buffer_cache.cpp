@@ -73,7 +73,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       sweep_skip_stacks{EmulatorSettings.IsDmaSweepSkipStacks()},
       sweep_skip_toggle{Common::PerfStats::AbToggleFollows("dma_sweep_skip_stacks")},
       readback_hot_regions{EmulatorSettings.IsReadbackHotRegions()},
-      readback_hot_toggle{Common::PerfStats::AbToggleFollows("readback_hot_regions")} {
+      readback_hot_toggle{Common::PerfStats::AbToggleFollows("readback_hot_regions")},
+      range_fast{EmulatorSettings.IsRangeFastPaths()},
+      range_fast_toggle{Common::PerfStats::AbToggleFollows("range_fast_paths")},
+      range_fast_verify{range_fast && std::getenv("SHADPS4_RANGE_FAST_VERIFY") != nullptr} {
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -127,6 +130,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     }
     if (readback_hot_regions) {
         LOG_WARNING(Render_Vulkan, "Workaround readback_hot_regions enabled");
+    }
+    if (range_fast) {
+        LOG_WARNING(Render_Vulkan, "Workaround range_fast_paths enabled{}",
+                    range_fast_verify ? " (verify)" : "");
     }
 }
 
@@ -210,7 +217,7 @@ void BufferCache::ReleaseCpuAuthoritativeRange(VAddr device_addr, u64 size) {
                                       device_addr, size);
     liverpool->SendCommand([this, device_addr, size] {
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, true);
-        gpu_modified_ranges.Subtract(device_addr, size);
+        SubtractGpuModified(device_addr, size);
         InvalidateCleanPages(device_addr, size);
     });
 }
@@ -284,7 +291,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
                 add_download(lo, lo + len);
             }
         });
-        gpu_modified_ranges.Subtract(address, size);
+        SubtractGpuModified(address, size);
         InvalidateCleanPages(address, size);
     });
     if (total_size_bytes == 0) {
@@ -453,7 +460,7 @@ void BufferCache::RecordHotDownloads(VAddr skip_addr) {
                         total_size_bytes += Common::AlignUp(len, 64ULL);
                     }
                 });
-                gpu_modified_ranges.Subtract(address, range_size);
+                SubtractGpuModified(address, range_size);
                 InvalidateCleanPages(address, range_size);
             });
         // Skip clean windows instead of unmarking their pages again
@@ -539,19 +546,141 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
-    EnsureResident(arena, first_block, last_block);
-    sync_batch.Add(device_addr, device_addr + size, is_written);
+    const bool fast = RangeFastOn();
+    if (fast && IsResident(first_block, last_block)) {
+        // EnsureResident would find no gap
+        ++range_fast_resident_hits;
+        if (range_fast_verify) [[unlikely]] {
+            resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
+                RangeFastMismatch("resident", start << block_shift, (end - start) << block_shift);
+            });
+        }
+    } else {
+        EnsureResident(arena, first_block, last_block);
+    }
+    AddToSyncBatch(device_addr, size, is_written, fast);
     if (is_texel_buffer && !is_written) {
         SynchronizeMemoryFromImage(arena, device_addr, size);
     }
     if (is_written) {
-        for (const auto& [lo, len] : memory->SubtractStackRanges(device_addr, size)) {
-            gpu_modified_ranges.Add(lo, len);
-            InvalidateCleanPages(lo, len);
-        }
+        AddGpuModified(device_addr, size, fast);
         RecordGpuWrite(device_addr, size, true);
     }
     return {arena, arena->Offset(device_addr)};
+}
+
+bool BufferCache::RangeFastOn() const {
+    return range_fast && Common::PerfStats::AbToggleOn(range_fast_toggle);
+}
+
+void BufferCache::AddGpuModified(VAddr addr, u64 size, bool fast) {
+    const u64 stack_generation = memory->StackRangesGeneration();
+    WrittenEntry* entry = nullptr;
+    if (fast && size != 0) {
+        entry = &written_entries[RangeFastSlot(addr, size)];
+        if (entry->addr == addr && entry->size == size &&
+            entry->stack_generation == stack_generation) {
+            ++range_fast_written_hits;
+            if (range_fast_verify) [[unlikely]] {
+                for (const auto& [lo, len] : memory->SubtractStackRanges(addr, size)) {
+                    if (!gpu_modified_ranges.Contains(lo, len)) {
+                        RangeFastMismatch("gpu_modified", lo, len);
+                    }
+                }
+            }
+            return;
+        }
+    }
+    for (const auto& [lo, len] : memory->SubtractStackRanges(addr, size)) {
+        gpu_modified_ranges.Add(lo, len);
+        InvalidateCleanPages(lo, len);
+    }
+    if (entry) {
+        written_entries_used += entry->size == 0;
+        *entry = {addr, size, stack_generation};
+    }
+}
+
+void BufferCache::SubtractGpuModified(VAddr addr, u64 size) {
+    gpu_modified_ranges.Subtract(addr, size);
+    if (written_entries_used == 0 || size == 0) {
+        return;
+    }
+    const VAddr end = addr + size;
+    for (auto& entry : written_entries) {
+        if (entry.size != 0 && entry.addr < end && addr < entry.addr + entry.size) {
+            entry.size = 0;
+            --written_entries_used;
+        }
+    }
+}
+
+void BufferCache::AddToSyncBatch(VAddr addr, u64 size, bool is_written, bool fast) {
+    if (!fast || size == 0) {
+        sync_batch.Add(addr, addr + size, is_written);
+        return;
+    }
+    const u64 generation = sync_batch_generation.load(std::memory_order_relaxed);
+    auto& entry = sync_entries[RangeFastSlot(addr, size)];
+    const bool same = entry.addr == addr && entry.size == size && entry.generation == generation;
+    if (same && (entry.written || !is_written)) {
+        ++range_fast_sync_hits;
+        if (range_fast_verify) [[unlikely]] {
+            bool covered = sync_batch.Contains(addr, addr + size);
+            if (covered && is_written) {
+                sync_batch.ForEachInRange(addr, addr + size, [&](const SyncRange& range) {
+                    covered &= range.written;
+                });
+            }
+            if (!covered) {
+                RangeFastMismatch("sync_batch", addr, size);
+            }
+        }
+        return;
+    }
+    sync_batch.Add(addr, addr + size, is_written);
+    entry = {addr, size, generation, is_written || (same && entry.written)};
+}
+
+void BufferCache::MarkResident(u64 start_block, u64 end_block) {
+    const u64 mask = blocks_per_arena_page - 1;
+    for (u64 block = start_block; block < end_block; ++block) {
+        auto& bits = resident_bits[block >> blocks_per_arena_page_shift];
+        if (!bits) {
+            bits = std::make_unique<u64[]>((blocks_per_arena_page + 63) / 64);
+        }
+        const u64 index = block & mask;
+        bits[index / 64] |= u64{1} << (index % 64);
+    }
+}
+
+bool BufferCache::IsResident(u64 first_block, u64 last_block) const {
+    const u64 mask = blocks_per_arena_page - 1;
+    for (u64 block = first_block; block <= last_block;) {
+        const auto& bits = resident_bits[block >> blocks_per_arena_page_shift];
+        if (!bits) {
+            return false;
+        }
+        const u64 index = block & mask;
+        const u64 word = bits[index / 64] >> (index % 64);
+        // The blocks of this word from `index` on, up to last_block
+        const u64 count = std::min<u64>(64 - index % 64, last_block - block + 1);
+        const u64 want = count == 64 ? ~u64{0} : (u64{1} << count) - 1;
+        if ((word & want) != want) {
+            return false;
+        }
+        block += count;
+    }
+    return true;
+}
+
+void BufferCache::RangeFastMismatch(const char* what, VAddr addr, u64 size) {
+    static u64 mismatches = 0;
+    Common::PerfStats::Add(Common::PerfStats::Id::RangeFastMismatches);
+    if (++mismatches <= 32) {
+        LOG_ERROR(Render_Vulkan, "range_fast_paths verify: {} shortcut differs at {:#x}+{:#x}",
+                  what, addr, size);
+    }
 }
 
 BufferCache::CleanRead BufferCache::ReadCleanPage(VAddr addr, void* out, u32 size) {
@@ -794,24 +923,27 @@ void BufferCache::SynchronizeDmaBuffers() {
     if (perf) {
         Common::PerfStats::Add(Common::PerfStats::Id::DmaSweeps);
     }
-    if (!skip_stacks) {
+    if (skip_stacks &&
+        (!dma_sweep_pieces_valid || dma_sweep_pieces_generation != stack_generation)) {
+        dma_sweep_pieces.clear();
+        for (const auto& range : resident_ranges) {
+            const VAddr device_addr = range.start << block_shift;
+            const u64 size = (range.end - range.start) << block_shift;
+            for (const auto& piece : memory->SubtractStackRanges(device_addr, size)) {
+                dma_sweep_pieces.push_back(piece);
+            }
+        }
+        dma_sweep_pieces_generation = stack_generation;
+        dma_sweep_pieces_valid = true;
+    }
+    if (RangeFastOn()) {
+        AddDmaSweepSorted(skip_stacks);
+    } else if (!skip_stacks) {
         for (const auto& range : resident_ranges) {
             const VAddr device_addr = range.start << block_shift;
             sync_batch.Add(device_addr, range.end << block_shift, false);
         }
     } else {
-        if (!dma_sweep_pieces_valid || dma_sweep_pieces_generation != stack_generation) {
-            dma_sweep_pieces.clear();
-            for (const auto& range : resident_ranges) {
-                const VAddr device_addr = range.start << block_shift;
-                const u64 size = (range.end - range.start) << block_shift;
-                for (const auto& piece : memory->SubtractStackRanges(device_addr, size)) {
-                    dma_sweep_pieces.push_back(piece);
-                }
-            }
-            dma_sweep_pieces_generation = stack_generation;
-            dma_sweep_pieces_valid = true;
-        }
         for (const auto& [lo, len] : dma_sweep_pieces) {
             sync_batch.Add(lo, lo + len, false);
         }
@@ -825,6 +957,58 @@ void BufferCache::SynchronizeDmaBuffers() {
                 Common::PerfStats::Add(Common::PerfStats::Id::DmaSweepStackBytes, len);
             }
         }
+    }
+}
+
+void BufferCache::AddDmaSweepSorted(bool skip_stacks) {
+    // Merge sorted, disjoint resident ranges into the batch in one pass
+    // Repeated Add calls would move the remaining batch for every range
+    dma_sweep_ranges.clear();
+    const auto add = [this](VAddr lo, VAddr hi) {
+        if (!dma_sweep_ranges.empty() && dma_sweep_ranges.back().end == lo) {
+            dma_sweep_ranges.back().end = hi;
+        } else {
+            dma_sweep_ranges.push_back({{lo, hi}, false});
+        }
+    };
+    if (!skip_stacks) {
+        for (const auto& range : resident_ranges) {
+            add(range.start << block_shift, range.end << block_shift);
+        }
+    } else {
+        for (const auto& [lo, len] : dma_sweep_pieces) {
+            add(lo, lo + len);
+        }
+    }
+    if (!range_fast_verify) [[likely]] {
+        sync_batch.AddSorted(dma_sweep_ranges);
+        return;
+    }
+    DomIntervalList<SyncRange> expected = sync_batch;
+    for (const auto& range : dma_sweep_ranges) {
+        expected.Add(range);
+    }
+    sync_batch.AddSorted(dma_sweep_ranges);
+    // Same bytes with the same flag; the boundaries may differ
+    // where compatible ranges touch
+    const auto merged = [](const DomIntervalList<SyncRange>& list) {
+        std::vector<SyncRange> out;
+        for (const auto& range : list) {
+            if (!out.empty() && out.back().end == range.start &&
+                out.back().written == range.written) {
+                out.back().end = range.end;
+            } else {
+                out.push_back(range);
+            }
+        }
+        return out;
+    };
+    const auto want = merged(expected);
+    const auto got = merged(sync_batch);
+    if (!std::ranges::equal(want, got, [](const SyncRange& a, const SyncRange& b) {
+            return a.start == b.start && a.end == b.end && a.written == b.written;
+        })) {
+        RangeFastMismatch("dma_sweep", want.empty() ? 0 : want.front().start, want.size());
     }
 }
 
@@ -962,6 +1146,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.memory = device_memory;
         backing.offset = memory_offset >> block_shift;
         resident_ranges.Add(backing);
+        MarkResident(backing.start, backing.end);
         dma_sync_covered = false;
         dma_sweep_pieces_valid = false;
 
@@ -1094,6 +1279,13 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
 }
 
 void BufferCache::FlushSyncBatch(bool from_scheduler) {
+    if (range_fast && Common::PerfStats::Enabled()) {
+        using Common::PerfStats::Id;
+        Common::PerfStats::Add(Id::RangeFastWrittenHits, std::exchange(range_fast_written_hits, 0));
+        Common::PerfStats::Add(Id::RangeFastSyncHits, std::exchange(range_fast_sync_hits, 0));
+        Common::PerfStats::Add(Id::RangeFastResidentHits,
+                               std::exchange(range_fast_resident_hits, 0));
+    }
     boost::container::small_vector<vk::BufferCopy, 32> copies;
     size_t total_size_bytes = 0;
     for (const auto& range : sync_batch) {

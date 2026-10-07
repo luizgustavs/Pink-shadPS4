@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/guest_write_journal.h"
+#include "common/perf_stats.h"
 #include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/memory.h"
@@ -1780,16 +1783,77 @@ void MemoryManager::UnregisterStackRange(VAddr virtual_addr, u64 size) {
     }
 }
 
+void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
+    rasterizer = rasterizer_;
+    const bool enabled = EmulatorSettings.IsRangeFastPaths();
+    stack_copy_toggle = Common::PerfStats::AbToggleFollows("range_fast_paths");
+    stack_copy_verify = enabled && std::getenv("SHADPS4_RANGE_FAST_VERIFY") != nullptr;
+    stack_copy_queries.store(enabled, std::memory_order_release);
+}
+
+bool MemoryManager::StackCopyOn() const {
+    return stack_copy_queries.load(std::memory_order_acquire) &&
+           Common::PerfStats::AbToggleOn(stack_copy_toggle);
+}
+
+namespace {
+void StackMismatch(const char* what, VAddr addr, u64 size) {
+    static std::atomic<u32> mismatches{0};
+    Common::PerfStats::Add(Common::PerfStats::Id::RangeFastMismatches);
+    if (mismatches.fetch_add(1, std::memory_order_relaxed) < 32) {
+        LOG_ERROR(Kernel_Vmm, "range_fast_paths verify: {} differs at {:#x}+{:#x}", what, addr,
+                  size);
+    }
+}
+} // Anonymous namespace
+
 bool MemoryManager::OverlapsStackRange(VAddr virtual_addr, u64 size) {
-    return stack_ranges.Overlaps(virtual_addr, size);
+    if (!StackCopyOn()) {
+        return stack_ranges.Overlaps(virtual_addr, size);
+    }
+    if (!stack_copy_verify) [[likely]] {
+        return stack_ranges.Overlaps(virtual_addr, size, true);
+    }
+    // A stack (un)registered between the two queries is not a mismatch
+    const u64 generation = stack_ranges.Generation();
+    const bool fast = stack_ranges.Overlaps(virtual_addr, size, true);
+    const bool slow = stack_ranges.Overlaps(virtual_addr, size);
+    if (fast != slow && generation == stack_ranges.Generation()) {
+        StackMismatch("OverlapsStackRange", virtual_addr, size);
+    }
+    return slow;
 }
 
 MemoryManager::StackPieces MemoryManager::SubtractStackRanges(VAddr virtual_addr, u64 size) {
-    return stack_ranges.Subtract(virtual_addr, size);
+    if (!StackCopyOn()) {
+        return stack_ranges.Subtract(virtual_addr, size);
+    }
+    if (!stack_copy_verify) [[likely]] {
+        return stack_ranges.Subtract(virtual_addr, size, true);
+    }
+    const u64 generation = stack_ranges.Generation();
+    const auto fast = stack_ranges.Subtract(virtual_addr, size, true);
+    auto slow = stack_ranges.Subtract(virtual_addr, size);
+    if (fast != slow && generation == stack_ranges.Generation()) {
+        StackMismatch("SubtractStackRanges", virtual_addr, size);
+    }
+    return slow;
 }
 
 MemoryManager::StackPieces MemoryManager::GetStackRangesIn(VAddr virtual_addr, u64 size) {
-    return stack_ranges.GetIn(virtual_addr, size);
+    if (!StackCopyOn()) {
+        return stack_ranges.GetIn(virtual_addr, size);
+    }
+    if (!stack_copy_verify) [[likely]] {
+        return stack_ranges.GetIn(virtual_addr, size, true);
+    }
+    const u64 generation = stack_ranges.Generation();
+    const auto fast = stack_ranges.GetIn(virtual_addr, size, true);
+    auto slow = stack_ranges.GetIn(virtual_addr, size);
+    if (fast != slow && generation == stack_ranges.Generation()) {
+        StackMismatch("GetStackRangesIn", virtual_addr, size);
+    }
+    return slow;
 }
 
 } // namespace Core

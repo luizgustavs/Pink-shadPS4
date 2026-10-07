@@ -22,11 +22,14 @@ public:
     void Add(VAddr start, VAddr end);
     void Remove(VAddr start, VAddr end);
 
-    bool Overlaps(VAddr virtual_addr, u64 size) const;
+    /// Read this thread's merged range copy with use_copy
+    /// Rebuild it when the generation changes and keep the same
+    /// answers as the locked map
+    bool Overlaps(VAddr virtual_addr, u64 size, bool use_copy = false) const;
     /// Returns the parts of [virtual_addr, virtual_addr + size) that are not stack memory
-    Pieces Subtract(VAddr virtual_addr, u64 size) const;
+    Pieces Subtract(VAddr virtual_addr, u64 size, bool use_copy = false) const;
     /// Returns the parts of [virtual_addr, virtual_addr + size) that are stack memory
-    Pieces GetIn(VAddr virtual_addr, u64 size) const;
+    Pieces GetIn(VAddr virtual_addr, u64 size, bool use_copy = false) const;
 
     /// Changes whenever a range is added or removed
     u64 Generation() const {
@@ -42,6 +45,10 @@ private:
 
     bool InFreeGap(VAddr virtual_addr, u64 size) const;
     void RememberFreeGap(RangeMap::const_iterator next) const;
+    /// Call func with the current sorted and merged [start, end) ranges
+    /// Return false without calling it if a nested query is already using the copy
+    template <typename Func>
+    bool WithCopy(Func&& func) const;
 
     RangeMap ranges;
     mutable std::shared_mutex mutex;

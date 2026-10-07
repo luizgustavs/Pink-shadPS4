@@ -220,6 +220,30 @@ private:
     /// gpu_modified_ranges changed in [addr, addr + size): drop the clean pages there
     void InvalidateCleanPages(VAddr addr, u64 size);
 
+    /// range_fast_paths: whether the shortcuts run now
+    /// Without them the interval structures end up the same
+    bool RangeFastOn() const;
+    /// gpu_modified_ranges.Subtract; also drops the written-binding shortcuts it may
+    /// have made stale (key on or off)
+    void SubtractGpuModified(VAddr addr, u64 size);
+    /// Skip a repeated written binding only while its bytes and
+    /// stack ranges are unchanged
+    void AddGpuModified(VAddr addr, u64 size, bool fast);
+    /// sync_batch.Add
+    /// With `fast`, skipped when the same binding was added to this batch with
+    /// the same or a dominant flag
+    void AddToSyncBatch(VAddr addr, u64 size, bool is_written, bool fast);
+    /// Residency bitmap, kept with resident_ranges on or off
+    /// (residency is never released)
+    void MarkResident(u64 start_block, u64 end_block);
+    [[nodiscard]] bool IsResident(u64 first_block, u64 last_block) const;
+    /// SHADPS4_RANGE_FAST_VERIFY: counts and logs a shortcut that differs
+    /// from the interval structures
+    void RangeFastMismatch(const char* what, VAddr addr, u64 size);
+    /// range_fast_paths: the DMA sweep's resident ranges (or stack-free pieces) merged
+    /// into the sync batch in one pass
+    void AddDmaSweepSorted(bool skip_stacks);
+
     enum class WriterState { Current, Busy, Done };
     /// Idea B: stores [addr, addr + size) as written by the command buffer being recorded. `open`: a
     /// binding whose command is not recorded yet, and may land in a later command buffer (CloseGpuWrites)
@@ -352,6 +376,41 @@ private:
     const bool sweep_skip_toggle;
     const bool readback_hot_regions;
     const bool readback_hot_toggle;
+    /// range_fast_paths
+    const bool range_fast;
+    const bool range_fast_toggle;
+    const bool range_fast_verify;
+    static constexpr size_t NumRangeFastEntries = 256;
+    static size_t RangeFastSlot(VAddr addr, u64 size) {
+        return ((addr * 0x9E3779B97F4A7C15ULL) ^ (size * 0xC2B2AE3D27D4EB4FULL)) >> 56;
+    }
+    /// Cache written bindings whose non-stack bytes are marked
+    /// GPU-modified and clean pages dropped
+    /// SubtractGpuModified clears overlapping entries and size 0 marks an empty slot
+    struct WrittenEntry {
+        VAddr addr;
+        u64 size;
+        u64 stack_generation;
+    };
+    std::array<WrittenEntry, NumRangeFastEntries> written_entries{};
+    u32 written_entries_used{};
+    /// A binding added to the sync batch of `generation`; the batch only
+    /// grows until it is flushed
+    struct SyncEntry {
+        VAddr addr;
+        u64 size;
+        u64 generation;
+        bool written;
+    };
+    std::array<SyncEntry, NumRangeFastEntries> sync_entries{};
+    /// One bit per block, per arena page, allocated with the first
+    /// resident block of the page
+    std::array<std::unique_ptr<u64[]>, NUM_ARENA_PAGES> resident_bits{};
+    /// The DMA sweep's ranges, sorted and merged, for DomIntervalList::AddSorted
+    std::vector<SyncRange> dma_sweep_ranges;
+    u64 range_fast_written_hits{};
+    u64 range_fast_sync_hits{};
+    u64 range_fast_resident_hits{};
     u64 dma_sync_stack_generation{};
     /// Cached resident ranges with guest stacks removed
     std::vector<std::pair<VAddr, u64>> dma_sweep_pieces;

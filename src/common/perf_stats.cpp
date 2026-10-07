@@ -147,6 +147,10 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::AccessBitmapHits, "access_bm_hits", Unit::Count},
     {Id::AccessBitmapFalseHits, "access_bm_false_hits", Unit::Count},
     {Id::AccessBitmapMismatches, "access_bm_mismatches", Unit::Count},
+    {Id::RangeFastWrittenHits, "rf_written_hits", Unit::Count},
+    {Id::RangeFastSyncHits, "rf_sync_hits", Unit::Count},
+    {Id::RangeFastResidentHits, "rf_resident_hits", Unit::Count},
+    {Id::RangeFastMismatches, "rf_mismatches", Unit::Count},
 }};
 
 constexpr bool FieldsMatchIds() {

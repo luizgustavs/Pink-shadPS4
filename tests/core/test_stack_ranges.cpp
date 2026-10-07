@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <optional>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -250,6 +251,54 @@ TEST(StackRangeSet, HandshakeWithWriter) {
     }
     reader.join();
     EXPECT_EQ(wrong.load(), 0u);
+}
+
+TEST(StackRangeSet, CopyQueriesMatchTheMap) {
+    // range_fast_paths: the per-thread copy answers like the map through registrations,
+    // nested and adjacent ranges and removals, and is rebuilt for another set
+    std::mt19937_64 rng{7};
+    StackRangeSet set;
+    StackRangeSet other;
+    other.Add(Heap, Heap + 0x1000);
+    std::vector<std::pair<VAddr, VAddr>> live;
+    for (int iter = 0; iter < 3000; ++iter) {
+        if (live.empty() || rng() % 3 != 0) {
+            const VAddr start = ThreadStack + (rng() % 64) * 0x1000;
+            const VAddr end = start + (1 + rng() % 8) * 0x1000;
+            set.Add(start, end);
+            live.emplace_back(start, end);
+        } else {
+            const size_t index = rng() % live.size();
+            set.Remove(live[index].first, live[index].second);
+            live.erase(live.begin() + index);
+        }
+        for (int q = 0; q < 8; ++q) {
+            const VAddr addr = ThreadStack - 0x2000 + rng() % (80 * 0x1000);
+            const u64 size = 1 + rng() % (12 * 0x1000);
+            ASSERT_EQ(set.Overlaps(addr, size, true), set.Overlaps(addr, size)) << iter;
+            ASSERT_EQ(ToVector(set.Subtract(addr, size, true)), ToVector(set.Subtract(addr, size)))
+                << iter;
+            ASSERT_EQ(ToVector(set.GetIn(addr, size, true)), ToVector(set.GetIn(addr, size)))
+                << iter;
+        }
+        if (iter % 100 == 0) {
+            ASSERT_TRUE(other.Overlaps(Heap, 0x1000, true));
+            ASSERT_FALSE(other.Overlaps(ThreadStack, 0x1000, true));
+        }
+    }
+}
+
+TEST(StackRangeSet, CopyQueriesSeeChangesFromAnotherThread) {
+    StackRangeSet set;
+    set.Add(ThreadStack, ThreadStack + ThreadStackSize);
+    EXPECT_FALSE(set.Overlaps(Heap, 0x1000, true));
+    std::thread([&] { set.Add(Heap, Heap + 0x1000); }).join();
+    EXPECT_TRUE(set.Overlaps(Heap, 0x1000, true));
+    EXPECT_TRUE(set.Subtract(Heap, 0x1000, true).empty());
+    std::thread([&] { set.Remove(Heap, Heap + 0x1000); }).join();
+    EXPECT_FALSE(set.Overlaps(Heap, 0x1000, true));
+    EXPECT_EQ(ToVector(set.GetIn(ThreadStack - 0x1000, 0x2000, true)),
+              (Pieces{{ThreadStack, 0x1000}}));
 }
 
 } // namespace

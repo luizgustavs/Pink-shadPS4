@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <array>
 #include <iterator>
+#include <utility>
+#include <vector>
 #include "core/stack_ranges.h"
 
 namespace Core {
@@ -27,6 +29,24 @@ struct FreeGapCache {
 };
 
 thread_local FreeGapCache free_gaps{};
+
+using Segments = std::vector<std::pair<VAddr, VAddr>>;
+
+// Keep a sorted, merged stack range copy for this thread and generation
+// While it is busy, nested signal queries use the locked path to avoid rebuilding it
+struct RangeCopy {
+    u64 set_id;
+    u64 generation;
+    Segments segments;
+    bool busy;
+};
+
+thread_local RangeCopy range_copy{};
+
+/// First segment that ends after `addr`
+Segments::const_iterator FirstSegmentAfter(const Segments& segments, VAddr addr) {
+    return std::ranges::upper_bound(segments, addr, {}, &std::pair<VAddr, VAddr>::second);
+}
 
 } // Anonymous namespace
 
@@ -82,8 +102,49 @@ void StackRangeSet::RememberFreeGap(RangeMap::const_iterator next) const {
     cache.next = (cache.next + 1) % cache.entries.size();
 }
 
-bool StackRangeSet::Overlaps(VAddr virtual_addr, u64 size) const {
-    if (size == 0 || !HasRanges() || InFreeGap(virtual_addr, size)) {
+template <typename Func>
+bool StackRangeSet::WithCopy(Func&& func) const {
+    RangeCopy& copy = range_copy;
+    if (copy.busy) {
+        return false;
+    }
+    copy.busy = true;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    // Update the generation after changing the ranges under the write lock
+    // A copy with the current generation still gives a valid answer
+    if (copy.set_id != id || copy.generation != Generation()) {
+        std::shared_lock lk{mutex};
+        copy.set_id = id;
+        copy.generation = generation.load(std::memory_order_relaxed);
+        copy.segments.clear();
+        for (const auto& [range, count] : ranges) {
+            const VAddr lo = range.lower();
+            const VAddr hi = range.upper();
+            if (!copy.segments.empty() && copy.segments.back().second == lo) {
+                copy.segments.back().second = hi;
+            } else {
+                copy.segments.emplace_back(lo, hi);
+            }
+        }
+    }
+    func(std::as_const(copy.segments));
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    copy.busy = false;
+    return true;
+}
+
+bool StackRangeSet::Overlaps(VAddr virtual_addr, u64 size, bool use_copy) const {
+    if (size == 0 || !HasRanges()) {
+        return false;
+    }
+    bool overlaps = false;
+    if (use_copy && WithCopy([&](const Segments& segments) {
+            const auto it = FirstSegmentAfter(segments, virtual_addr);
+            overlaps = it != segments.end() && it->first < virtual_addr + size;
+        })) {
+        return overlaps;
+    }
+    if (InFreeGap(virtual_addr, size)) {
         return false;
     }
     std::shared_lock lk{mutex};
@@ -96,18 +157,37 @@ bool StackRangeSet::Overlaps(VAddr virtual_addr, u64 size) const {
     return true;
 }
 
-StackRangeSet::Pieces StackRangeSet::Subtract(VAddr virtual_addr, u64 size) const {
+StackRangeSet::Pieces StackRangeSet::Subtract(VAddr virtual_addr, u64 size, bool use_copy) const {
     Pieces result;
     if (size == 0) {
         return result;
     }
-    if (!HasRanges() || InFreeGap(virtual_addr, size)) {
+    if (!HasRanges()) {
         result.emplace_back(virtual_addr, size);
         return result;
     }
     // The gaps between the (disjoint, sorted) stack segments that overlap the range
     const VAddr end = virtual_addr + size;
     VAddr cursor = virtual_addr;
+    if (use_copy && WithCopy([&](const Segments& segments) {
+            for (auto it = FirstSegmentAfter(segments, virtual_addr);
+                 it != segments.end() && it->first < end; ++it) {
+                const VAddr lo = std::max(it->first, virtual_addr);
+                if (lo > cursor) {
+                    result.emplace_back(cursor, lo - cursor);
+                }
+                cursor = std::max(cursor, std::min(it->second, end));
+            }
+        })) {
+        if (cursor < end) {
+            result.emplace_back(cursor, end - cursor);
+        }
+        return result;
+    }
+    if (InFreeGap(virtual_addr, size)) {
+        result.emplace_back(virtual_addr, size);
+        return result;
+    }
     std::shared_lock lk{mutex};
     const auto [first, last] =
         ranges.equal_range(boost::icl::interval<VAddr>::right_open(virtual_addr, end));
@@ -127,12 +207,26 @@ StackRangeSet::Pieces StackRangeSet::Subtract(VAddr virtual_addr, u64 size) cons
     return result;
 }
 
-StackRangeSet::Pieces StackRangeSet::GetIn(VAddr virtual_addr, u64 size) const {
+StackRangeSet::Pieces StackRangeSet::GetIn(VAddr virtual_addr, u64 size, bool use_copy) const {
     Pieces result;
-    if (size == 0 || !HasRanges() || InFreeGap(virtual_addr, size)) {
+    if (size == 0 || !HasRanges()) {
         return result;
     }
     const VAddr end = virtual_addr + size;
+    // The copy's segments are already merged
+    if (use_copy && WithCopy([&](const Segments& segments) {
+            for (auto it = FirstSegmentAfter(segments, virtual_addr);
+                 it != segments.end() && it->first < end; ++it) {
+                const VAddr lo = std::max(it->first, virtual_addr);
+                const VAddr hi = std::min(it->second, end);
+                result.emplace_back(lo, hi - lo);
+            }
+        })) {
+        return result;
+    }
+    if (InFreeGap(virtual_addr, size)) {
+        return result;
+    }
     std::shared_lock lk{mutex};
     const auto [first, last] =
         ranges.equal_range(boost::icl::interval<VAddr>::right_open(virtual_addr, end));

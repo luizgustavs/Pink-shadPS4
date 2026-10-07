@@ -568,6 +568,9 @@ struct GPUSettings {
     // Use one-byte locks for tracked 4 KiB pages, spinning briefly before yielding
     // Read only at boot because changing lock tables during use is unsafe
     Setting<bool> page_spin_locks{false};
+    // Skip repeated binding, sync and residency work when the exact answer is known
+    // Merge DMA ranges in one pass and use a per-thread stack copy
+    Setting<bool> range_fast_paths{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -651,6 +654,7 @@ struct GPUSettings {
             make_override<GPUSettings>("access_bitmap_tracking",
                                        &GPUSettings::access_bitmap_tracking),
             make_override<GPUSettings>("page_spin_locks", &GPUSettings::page_spin_locks),
+            make_override<GPUSettings>("range_fast_paths", &GPUSettings::range_fast_paths),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -673,7 +677,7 @@ struct GPUSettings {
         mapped_page_table, dma_sync_once_per_batch, incremental_bind, tsharp_cache, wait_marker,    \
         image_memory_pool, eop_label_delay_us, cp_record_thread, force_anisotropy,                  \
         readback_hot_regions, depth_target_sampled_layout, gcn_unordered_dispatches,                \
-        access_bitmap_tracking, page_spin_locks))
+        access_bitmap_tracking, page_spin_locks, range_fast_paths))
 template <typename BasicJsonType,
           nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0>
 void to_json(BasicJsonType& nlohmann_json_j, const GPUSettings& nlohmann_json_t) {
@@ -1015,6 +1019,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, GcnUnorderedDispatches, gcn_unordered_dispatches)
     SETTING_FORWARD_BOOL(m_gpu, AccessBitmapTracking, access_bitmap_tracking)
     SETTING_FORWARD_BOOL(m_gpu, PageSpinLocks, page_spin_locks)
+    SETTING_FORWARD_BOOL(m_gpu, RangeFastPaths, range_fast_paths)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

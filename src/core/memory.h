@@ -185,9 +185,8 @@ public:
     explicit MemoryManager();
     ~MemoryManager();
 
-    void SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
-        rasterizer = rasterizer_;
-    }
+    /// Also reads range_fast_paths, with the game's settings loaded
+    void SetRasterizer(Vulkan::Rasterizer* rasterizer_);
 
     AddressSpace& GetAddressSpace() {
         return impl;
@@ -417,6 +416,14 @@ private:
     s32 sdk_version{};
     Vulkan::Rasterizer* rasterizer{};
     StackRangeSet stack_ranges;
+    // range_fast_paths: stack queries read a per-thread merged copy of the ranges
+    // instead of the interval map under the shared lock
+    // SHADPS4_RANGE_FAST_VERIFY also runs the map query and compares
+    // Set by SetRasterizer; guest threads may already run, so the key is published last
+    std::atomic<bool> stack_copy_queries{};
+    bool stack_copy_toggle{};
+    bool stack_copy_verify{};
+    bool StackCopyOn() const;
 
     struct PrtArea {
         VAddr start;

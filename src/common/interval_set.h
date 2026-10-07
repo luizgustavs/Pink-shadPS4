@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <concepts>
 #include <iterator>
+#include <span>
 #include <vector>
 
 #include "common/small_vector.h"
@@ -262,4 +263,64 @@ struct DomIntervalList : public IntervalList<IV> {
         this->Splice(first, last, out.data(), out.size());
         this->Coalesce(at, out.size());
     }
+
+    /// Merge sorted, disjoint values in one pass with the same
+    /// result as repeated Add calls
+    /// Keep dominating intervals and merge compatible neighbors
+    void AddSorted(std::span<const IV> values) {
+        auto& in = this->intervals;
+        scratch.clear();
+        scratch.reserve(in.size() + values.size() * 2 + 1);
+        const auto push = [this](const IV& x) {
+            if (x.start >= x.end) {
+                return;
+            }
+            if (!scratch.empty() && scratch.back().end == x.start &&
+                scratch.back().CanMergeWith(x)) {
+                scratch.back().end = x.end;
+            } else {
+                scratch.push_back(x);
+            }
+        };
+        std::size_t i = 0;
+        for (const IV& v : values) {
+            if (v.start >= v.end) {
+                continue;
+            }
+            while (i < in.size() && in[i].end <= v.start) {
+                push(in[i++]);
+            }
+            if (i < in.size() && in[i].start < v.start) {
+                push(in[i].SubRange(in[i].start, v.start));
+                in[i] = in[i].SubRange(v.start, in[i].end);
+            }
+            u64 cur = v.start;
+            while (i < in.size() && in[i].start < v.end) {
+                const IV& it = in[i];
+                if (it.start > cur) {
+                    push(v.SubRange(cur, it.start));
+                    cur = it.start;
+                }
+                const u64 b = std::min(it.end, v.end);
+                push(it.Dominant(v) ? it.SubRange(cur, b) : v.SubRange(cur, b));
+                cur = b;
+                if (it.end > v.end) {
+                    // The tail meets the next values
+                    in[i] = it.SubRange(v.end, it.end);
+                    break;
+                }
+                ++i;
+            }
+            if (cur < v.end) {
+                push(v.SubRange(cur, v.end));
+            }
+        }
+        while (i < in.size()) {
+            push(in[i++]);
+        }
+        in.swap(scratch);
+    }
+
+private:
+    typename IntervalList<IV>::List scratch;
 };
