@@ -109,6 +109,17 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             ir.SetScalarReg(IR::ScalarReg(base_instance_sgpr),
                             ir.GetAttributeU32(IR::Attribute::BaseInstance));
         }
+        // GCN instance IDs start at zero, but gl_InstanceIndex includes firstInstance
+        // Subtract it when relative_instance_id is enabled so
+        // shaders do not add it twice
+        // Fetch shaders add the user SGPR only to v3 below
+        const auto relative_instance_id = [&] {
+            IR::U32 id = ir.GetAttributeU32(IR::Attribute::InstanceId);
+            if (EmulatorSettings.IsRelativeInstanceId()) {
+                id = ir.ISub(id, ir.GetAttributeU32(IR::Attribute::BaseInstance));
+            }
+            return id;
+        };
 
         // v0: vertex ID, always present
         IR::U32 vertex_id = ir.GetAttributeU32(IR::Attribute::VertexId);
@@ -136,7 +147,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             if (runtime_info.props.num_input_vgprs > 0) {
                 if (runtime_info.sw.vs.step_rate_0 != 0) {
                     ir.SetVectorReg(dst_vreg++,
-                                    ir.IDiv(ir.GetAttributeU32(IR::Attribute::InstanceId),
+                                    ir.IDiv(relative_instance_id(),
                                             ir.Imm32(runtime_info.sw.vs.step_rate_0)));
                 } else {
                     ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
@@ -146,7 +157,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             if (runtime_info.props.num_input_vgprs > 1) {
                 if (runtime_info.sw.vs.step_rate_1 != 0) {
                     ir.SetVectorReg(dst_vreg++,
-                                    ir.IDiv(ir.GetAttributeU32(IR::Attribute::InstanceId),
+                                    ir.IDiv(relative_instance_id(),
                                             ir.Imm32(runtime_info.sw.vs.step_rate_1)));
                 } else {
                     ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
@@ -165,6 +176,8 @@ void Translator::EmitPrologue(IR::Block* first_block) {
                     ASSERT_MSG(fetch_data.instance_offset_sgpr == base_instance_sgpr,
                                "Fetch shader in indirect draw uses wrong base instance");
                 }
+            } else {
+                instance_id = relative_instance_id();
             }
             ir.SetVectorReg(dst_vreg++, instance_id);
         }

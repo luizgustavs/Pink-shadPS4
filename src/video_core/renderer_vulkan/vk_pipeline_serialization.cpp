@@ -34,6 +34,7 @@ namespace {
 /// Emulator settings that change the generated SPIR-V. The disk cache is keyed only by the guest shader hash,
 /// so a shader compiled with other values must be recompiled, not loaded
 constexpr u32 LdsBarriersLargeGroupsBit = 46;
+constexpr u32 RelativeInstanceIdBit = 47;
 
 u64 CodegenSettingsKey() {
     return u64{EmulatorSettings.GetComputeLoopCap()} |
@@ -45,7 +46,8 @@ u64 CodegenSettingsKey() {
            (u64{EmulatorSettings.IsInlineFetchShader()} << 43) |
            (u64{EmulatorSettings.IsSrtWalkerCleanReads()} << 44) | // SRT walker code
            (u64{EmulatorSettings.IsWave64MissingLaneIdentity()} << 45) |
-           (u64{EmulatorSettings.IsLdsBarriersLargeGroups()} << LdsBarriersLargeGroupsBit);
+           (u64{EmulatorSettings.IsLdsBarriersLargeGroups()} << LdsBarriersLargeGroupsBit) |
+           (u64{EmulatorSettings.IsRelativeInstanceId()} << RelativeInstanceIdBit);
 }
 
 /// lds_barriers_large_groups only affects compute shaders that use LDS in workgroups larger than
@@ -60,6 +62,13 @@ bool LdsBarriersLargeGroupsAffects(const Shader::RuntimeInfo& runtime_info) {
     const auto& cs = runtime_info.hw.cs;
     return cs.shared_memory_size != 0 &&
            cs.workgroup_size[0] * cs.workgroup_size[1] * cs.workgroup_size[2] > 64;
+}
+
+/// relative_instance_id only affects vertex shaders that receive instance ID VGPRs
+/// (Translator::EmitPrologue), so toggling it keeps the other cached shaders
+bool RelativeInstanceIdAffects(const Shader::RuntimeInfo& runtime_info) {
+    return runtime_info.sw_stage == Shader::SwStage::Vertex &&
+           runtime_info.props.num_input_vgprs > 0;
 }
 } // namespace
 
@@ -163,7 +172,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(codegen_key);
     const u64 key_diff = codegen_key ^ CodegenSettingsKey();
     constexpr u64 lds_barriers_mask = u64{1} << LdsBarriersLargeGroupsBit;
-    if ((key_diff & ~lds_barriers_mask) != 0) {
+    constexpr u64 relative_instance_mask = u64{1} << RelativeInstanceIdBit;
+    if ((key_diff & ~(lds_barriers_mask | relative_instance_mask)) != 0) {
         return false;
     }
 
@@ -174,6 +184,10 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     spec.Deserialize(ar);
     if ((key_diff & lds_barriers_mask) != 0 &&
         LdsBarriersLargeGroupsAffects(spec.runtime_info)) {
+        return false;
+    }
+    if ((key_diff & relative_instance_mask) != 0 &&
+        RelativeInstanceIdAffects(spec.runtime_info)) {
         return false;
     }
     if (!info.Deserialize(ar)) {
