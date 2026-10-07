@@ -35,6 +35,8 @@ namespace {
 /// so a shader compiled with other values must be recompiled, not loaded
 constexpr u32 LdsBarriersLargeGroupsBit = 46;
 constexpr u32 RelativeInstanceIdBit = 47;
+constexpr u32 GcnNanSemanticsBit = 48;
+constexpr u32 LegacyMadSemanticsBit = 49;
 
 u64 CodegenSettingsKey() {
     return u64{EmulatorSettings.GetComputeLoopCap()} |
@@ -47,7 +49,9 @@ u64 CodegenSettingsKey() {
            (u64{EmulatorSettings.IsSrtWalkerCleanReads()} << 44) | // SRT walker code
            (u64{EmulatorSettings.IsWave64MissingLaneIdentity()} << 45) |
            (u64{EmulatorSettings.IsLdsBarriersLargeGroups()} << LdsBarriersLargeGroupsBit) |
-           (u64{EmulatorSettings.IsRelativeInstanceId()} << RelativeInstanceIdBit);
+           (u64{EmulatorSettings.IsRelativeInstanceId()} << RelativeInstanceIdBit) |
+           (u64{EmulatorSettings.IsGcnNanSemantics()} << GcnNanSemanticsBit) |
+           (u64{EmulatorSettings.IsLegacyMadSemantics()} << LegacyMadSemanticsBit);
 }
 
 /// lds_barriers_large_groups only affects compute shaders that use LDS in workgroups larger than

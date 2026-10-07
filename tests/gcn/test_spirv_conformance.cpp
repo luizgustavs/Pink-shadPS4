@@ -9,8 +9,10 @@
 #include <unordered_set>
 
 #include <gtest/gtest.h>
+#include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
 
+#include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
@@ -84,6 +86,14 @@ bool HasCapability(const std::vector<u32>& spirv, spv::Capability capability) {
     });
 }
 
+/// Number of GLSL.std.450 `instruction` calls in the module
+size_t CountGlslInst(const std::vector<u32>& spirv, GLSLstd450 instruction) {
+    return std::ranges::count_if(ParseSpirv(spirv), [instruction](const SpirvInst& inst) {
+        return inst.op == spv::Op::OpExtInst && inst.words.size() >= 5 &&
+               inst.words[4] == static_cast<u32>(instruction);
+    });
+}
+
 /// Ids decorated BuiltIn `builtin`, and whether any of them is also decorated Flat
 struct BuiltinDecorations {
     bool found{};
@@ -143,6 +153,28 @@ TEST(SpirvConformance, SubgroupInputsFlatOnlyInFragment) {
         EXPECT_EQ(lane_id.flat, fragment) << name;
         EXPECT_EQ(lt_mask.flat, fragment) << name;
     }
+}
+
+// gcn_nan_semantics: GCN min, max and clamp return the other operand when one is NaN,
+// which the NMin/NMax instructions guarantee and FMin/FMax/FClamp leave undefined
+TEST(SpirvConformance, GcnNanSemanticsUsesNMinNMax) {
+    for (const bool enabled : {false, true}) {
+        EmulatorSettings.SetGcnNanSemantics(enabled);
+        const auto spirv = EmitProgram(SwStage::Compute, [](IR::IREmitter& ir) {
+            const IR::F32 a{ir.Imm32(1.0f)};
+            const IR::F32 b{ir.Imm32(2.0f)};
+            (void)ir.FPMax(a, b);
+            (void)ir.FPMin(a, b);
+            (void)ir.FPClamp(a, ir.Imm32(0.0f), b);
+        });
+        DumpSpirv(spirv, std::string{"conformance_gcn_nan_semantics_"} + (enabled ? "on" : "off"));
+        EXPECT_EQ(CountGlslInst(spirv, GLSLstd450NMax), enabled ? 2u : 0u);
+        EXPECT_EQ(CountGlslInst(spirv, GLSLstd450NMin), enabled ? 2u : 0u);
+        EXPECT_EQ(CountGlslInst(spirv, GLSLstd450FMax), enabled ? 0u : 1u);
+        EXPECT_EQ(CountGlslInst(spirv, GLSLstd450FMin), enabled ? 0u : 1u);
+        EXPECT_EQ(CountGlslInst(spirv, GLSLstd450FClamp), enabled ? 0u : 1u);
+    }
+    EmulatorSettings.SetGcnNanSemantics(false);
 }
 
 } // namespace

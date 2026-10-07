@@ -497,6 +497,11 @@ struct GPUSettings {
     // Start instance ID VGPRs at zero on every draw
     // Shaders that add the start instance themselves would otherwise count it twice
     Setting<bool> relative_instance_id{false};
+    // Match GCN NaN handling for negated compares, min/max and clamp
+    // SotC uses NaN to mark occluded fog froxels
+    Setting<bool> gcn_nan_semantics{false};
+    // Use the legacy multiply rule for MAC and MAD: zero times Inf or NaN is zero
+    Setting<bool> legacy_mad_semantics{false};
     // Record GPU commands and submits to identify the first unfinished submit after device loss
     // Add NVIDIA checkpoints when available; recording adds a small cost per command
     Setting<bool> gpu_checkpoints{false};
@@ -589,6 +594,9 @@ struct GPUSettings {
                                        &GPUSettings::lds_barriers_large_groups),
             make_override<GPUSettings>("relative_instance_id",
                                        &GPUSettings::relative_instance_id),
+            make_override<GPUSettings>("gcn_nan_semantics", &GPUSettings::gcn_nan_semantics),
+            make_override<GPUSettings>("legacy_mad_semantics",
+                                       &GPUSettings::legacy_mad_semantics),
             make_override<GPUSettings>("gpu_checkpoints", &GPUSettings::gpu_checkpoints),
             make_override<GPUSettings>("srt_walker_clean_reads",
                                        &GPUSettings::srt_walker_clean_reads),
@@ -629,6 +637,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    lod_stats_from_bindings, dynamic_tsharp_array_size,
                                    wave64_uniform_branches, wave64_missing_lane_identity,
                                    lds_barriers_large_groups, relative_instance_id,
+                                   gcn_nan_semantics, legacy_mad_semantics,
                                    gpu_checkpoints,
                                    srt_walker_clean_reads, shader_code_clean_reads,
                                    readback_ahead, periodic_flush_commands,
@@ -941,6 +950,8 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, Wave64MissingLaneIdentity, wave64_missing_lane_identity)
     SETTING_FORWARD_BOOL(m_gpu, LdsBarriersLargeGroups, lds_barriers_large_groups)
     SETTING_FORWARD_BOOL(m_gpu, RelativeInstanceId, relative_instance_id)
+    SETTING_FORWARD_BOOL(m_gpu, GcnNanSemantics, gcn_nan_semantics)
+    SETTING_FORWARD_BOOL(m_gpu, LegacyMadSemantics, legacy_mad_semantics)
     SETTING_FORWARD_BOOL(m_gpu, GpuCheckpoints, gpu_checkpoints)
     SETTING_FORWARD_BOOL(m_gpu, SrtWalkerCleanReads, srt_walker_clean_reads)
     SETTING_FORWARD_BOOL(m_gpu, ShaderCodeCleanReads, shader_code_clean_reads)
