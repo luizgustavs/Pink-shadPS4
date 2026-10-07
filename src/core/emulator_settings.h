@@ -646,28 +646,35 @@ struct GPUSettings {
         };
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, internal_screen_width,
-                                   internal_screen_height, null_gpu, copy_gpu_buffers,
-                                   readbacks_mode, readback_linear_images_enabled,
-                                   direct_memory_access_enabled, dump_shaders, patch_shaders,
-                                   vblank_frequency, full_screen, full_screen_mode, present_mode,
-                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
-                                   compute_loop_cap, preserve_split_protection,
-                                   cpu_authoritative_stacks, bpe_heap_guard_address,
-                                   lds_barrier_uniform_readlane, early_fragment_tests_from_z_order,
-                                   lod_stats_from_bindings, dynamic_tsharp_array_size,
-                                   wave64_uniform_branches, wave64_missing_lane_identity,
-                                   lds_barriers_large_groups, relative_instance_id,
-                                   gcn_nan_semantics, legacy_mad_semantics,
-                                   gpu_checkpoints,
-                                   srt_walker_clean_reads, shader_code_clean_reads,
-                                   readback_ahead, periodic_flush_commands,
-                                   cp_recording_cuts, gpu_overhead_cuts, dma_sweep_skip_stacks,
-                                   wait_spin_us, readback_ahead_transfer_queue, mapped_page_table,
-                                   dma_sync_once_per_batch, incremental_bind, tsharp_cache,
-                                   wait_marker, image_memory_pool, eop_label_delay_us,
-                                   cp_record_thread, force_anisotropy, readback_hot_regions,
-                                   depth_target_sampled_layout, gcn_unordered_dispatches)
+// Split the GPU JSON members into two lists to stay below the 64-member macro limit
+#define SHADPS4_GPU_SETTINGS_JSON(op)                                                               \
+    NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(                                                       \
+        op, window_width, window_height, internal_screen_width, internal_screen_height, null_gpu,   \
+        copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled,                           \
+        direct_memory_access_enabled, dump_shaders, patch_shaders, vblank_frequency, full_screen,   \
+        full_screen_mode, present_mode, hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,   \
+        compute_loop_cap, preserve_split_protection, cpu_authoritative_stacks,                      \
+        bpe_heap_guard_address, lds_barrier_uniform_readlane, early_fragment_tests_from_z_order,    \
+        lod_stats_from_bindings, dynamic_tsharp_array_size, wave64_uniform_branches,                \
+        wave64_missing_lane_identity, lds_barriers_large_groups, relative_instance_id))             \
+    NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(                                                       \
+        op, gcn_nan_semantics, legacy_mad_semantics, gpu_checkpoints, srt_walker_clean_reads,       \
+        shader_code_clean_reads, readback_ahead, periodic_flush_commands, cp_recording_cuts,        \
+        gpu_overhead_cuts, dma_sweep_skip_stacks, wait_spin_us, readback_ahead_transfer_queue,      \
+        mapped_page_table, dma_sync_once_per_batch, incremental_bind, tsharp_cache, wait_marker,    \
+        image_memory_pool, eop_label_delay_us, cp_record_thread, force_anisotropy,                  \
+        readback_hot_regions, depth_target_sampled_layout, gcn_unordered_dispatches))
+template <typename BasicJsonType,
+          nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0>
+void to_json(BasicJsonType& nlohmann_json_j, const GPUSettings& nlohmann_json_t) {
+    SHADPS4_GPU_SETTINGS_JSON(NLOHMANN_JSON_TO)
+}
+template <typename BasicJsonType,
+          nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0>
+void from_json(const BasicJsonType& nlohmann_json_j, GPUSettings& nlohmann_json_t) {
+    SHADPS4_GPU_SETTINGS_JSON(NLOHMANN_JSON_FROM)
+}
+#undef SHADPS4_GPU_SETTINGS_JSON
 // -------------------------------
 // Vulkan settings
 // -------------------------------
