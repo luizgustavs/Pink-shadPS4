@@ -137,6 +137,9 @@ public:
 
     /// Clean guest memory reader provided by the rasterizer
     std::function<bool(VAddr, void*, u64)> read_clean_memory;
+    /// Whether BindTextures binds this single T# as null
+    /// (Rasterizer::CheckBindableImage), set by the rasterizer
+    std::function<bool(const AmdGpu::Image&, const Shader::ImageResource&)> is_null_image;
 
 private:
     /// Cached shader metadata and the guest bytes used to find it
@@ -163,7 +166,7 @@ private:
                                                    std::string_view ext);
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
-                                   Shader::Backend::Bindings& binding);
+                                   Shader::Backend::Bindings& binding, bool store = true);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {

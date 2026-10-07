@@ -92,7 +92,13 @@ public:
     bool ReadCleanMemory(VAddr addr, void* out, u64 size);
 
     /// Returns false for a T# that describes an image Vulkan cannot create (garbage descriptor)
-    bool IsPlausibleImage(const VideoCore::ImageInfo& info);
+    bool IsPlausibleImage(const VideoCore::ImageInfo& info, bool log = true);
+    /// Check whether the texture can be bound, or should use a null descriptor
+    /// Share the checks with descriptor arrays and return the built bound_desc
+    /// Enable log to report a rejection
+    bool CheckBindableImage(const AmdGpu::Image& tsharp, const Shader::ImageResource& image_desc,
+                            std::optional<VideoCore::TextureCache::ImageDesc>& bound_desc,
+                            bool log);
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);

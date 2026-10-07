@@ -544,6 +544,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     pipeline_cache.read_clean_memory = [this](VAddr addr, void* out, u64 size) {
         return ReadCleanMemory(addr, out, size);
     };
+    pipeline_cache.is_null_image = [this](const AmdGpu::Image& tsharp,
+                                          const Shader::ImageResource& image_desc) {
+        std::optional<VideoCore::TextureCache::ImageDesc> bound_desc;
+        return !CheckBindableImage(tsharp, image_desc, bound_desc, false);
+    };
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
@@ -1669,85 +1674,88 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     }
 }
 
-void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
-    image_bindings.clear();
-    const u32 first_image_idx = image_infos.size();
-    // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
-    boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
+bool Rasterizer::CheckBindableImage(const AmdGpu::Image& tsharp,
+                                    const Shader::ImageResource& image_desc,
+                                    std::optional<VideoCore::TextureCache::ImageDesc>& bound_desc,
+                                    bool log) {
+    const auto data_fmt = tsharp.GetDataFmt();
+    const auto num_fmt = tsharp.GetNumberFmt();
+    if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
+        return false;
+    }
 
-    // Reuse the description built by the shared validation path
-    using ImageDesc = VideoCore::TextureCache::ImageDesc;
-    const auto is_bindable = [&](const AmdGpu::Image& tsharp, const Shader::ImageResource& image_desc,
-                                 std::optional<ImageDesc>& bound_desc) {
-        const auto data_fmt = tsharp.GetDataFmt();
-        const auto num_fmt = tsharp.GetNumberFmt();
-        if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
-            return false;
-        }
-
-        if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
-            !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
+    if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
+        !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
+        if (log) {
             LOG_WARNING(Render_Vulkan,
                         "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
                         "data_format={}, num_format={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt));
-            return false;
         }
+        return false;
+    }
 
-        // A garbage T# can also carry a valid format pair that has no Vulkan format (seen in SotC: 10_11_11
-        // Unorm, 40/11); ImageInfo would assert in SurfaceFormat or PromoteFormatToDepth. The hardware would
-        // read zeros, so it is bound as null
-        const auto vk_fmt = LiverpoolToVK::TrySurfaceFormat(data_fmt, num_fmt);
-        const bool depth_ok = !image_desc.is_depth || vk_fmt == vk::Format::eR32Sfloat ||
-                              vk_fmt == vk::Format::eR32Uint || vk_fmt == vk::Format::eR16Unorm;
-        if (vk_fmt == vk::Format::eUndefined || !depth_ok) {
+    // Reject format pairs with no Vulkan format before ImageInfo can assert
+    // Bind them as null so reads return zero
+    const auto vk_fmt = LiverpoolToVK::TrySurfaceFormat(data_fmt, num_fmt);
+    const bool depth_ok = !image_desc.is_depth || vk_fmt == vk::Format::eR32Sfloat ||
+                          vk_fmt == vk::Format::eR32Uint || vk_fmt == vk::Format::eR16Unorm;
+    if (vk_fmt == vk::Format::eUndefined || !depth_ok) {
+        if (log) {
             LOG_WARNING(Render_Vulkan,
                         "Rejecting T# with no host format address={:#x}, pitch={}, width={}, "
                         "data_format={}, num_format={}, depth={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt), image_desc.is_depth);
-            return false;
         }
+        return false;
+    }
 
-        // The warnings of these rejections are capped: a garbage T# left in a table is rebound every draw
-        static std::atomic<u32> layout_rejections{0};
-        static std::atomic<u32> low_address_rejections{0};
-        constexpr u32 MaxRejectionWarnings = 32;
-        if (const char* reason = UnsupportedImageLayout(tsharp)) {
-            if (layout_rejections.fetch_add(1, std::memory_order_relaxed) >= MaxRejectionWarnings) {
-                return false;
-            }
+    // Limit warnings because an invalid descriptor can be rebound every draw
+    static std::atomic<u32> layout_rejections{0};
+    static std::atomic<u32> low_address_rejections{0};
+    constexpr u32 MaxRejectionWarnings = 32;
+    if (const char* reason = UnsupportedImageLayout(tsharp)) {
+        if (log && layout_rejections.fetch_add(1, std::memory_order_relaxed) < MaxRejectionWarnings) {
             LOG_WARNING(Render_Vulkan,
                         "Rejecting T# with an unsupported layout ({}) address={:#x}, width={}, "
                         "tiling_index={}, data_format={}, samples={}",
                         reason, tsharp.Address(), tsharp.width, u32(tsharp.tiling_index),
                         static_cast<u32>(data_fmt), tsharp.NumSamples());
-            return false;
         }
+        return false;
+    }
 
-        const auto& desc = bound_desc.emplace(tsharp, image_desc);
-        if (!IsPlausibleImage(desc.info)) {
-            return false;
-        }
+    const auto& desc = bound_desc.emplace(tsharp, image_desc);
+    if (!IsPlausibleImage(desc.info, log)) {
+        return false;
+    }
 
-        // A garbage T# with a low address (seen in SotC: 0x0, 0x29000, 0x5c000) passes the 40-bit check above;
-        // the texture cache then tracks pages below the guest address space and Protect asserts ("out of
-        // bounds"). No guest memory lies below the first region of the address space
-        if (desc.info.guest_address < memory->SystemManagedVirtualBase()) {
-            if (low_address_rejections.fetch_add(1, std::memory_order_relaxed) >=
-                MaxRejectionWarnings) {
-                return false;
-            }
+    // Reject texture addresses below guest memory before page tracking
+    // They can pass the 40-bit check but still fail Protect
+    if (desc.info.guest_address < memory->SystemManagedVirtualBase()) {
+        if (log &&
+            low_address_rejections.fetch_add(1, std::memory_order_relaxed) < MaxRejectionWarnings) {
             LOG_WARNING(Render_Vulkan,
                         "Rejecting T# below the guest address space address={:#x}, size={:#x}, "
                         "width={}, data_format={}",
                         desc.info.guest_address, desc.info.guest_size, tsharp.width,
                         static_cast<u32>(data_fmt));
-            return false;
         }
-        return true;
-    };
+        return false;
+    }
+    return true;
+}
+
+void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    image_bindings.clear();
+    const u32 first_image_idx = image_infos.size();
+    // To emulate storing to explicit mip levels, build a descriptor
+    // array with each mip level
+    boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
+
+    using ImageDesc = VideoCore::TextureCache::ImageDesc;
     const auto count_lod_stats = [&](const AmdGpu::Image& tsharp, bool is_written) {
         if (tsharp.lod_hw_cnt_en && lod_stats_enabled) {
             u32& uses = lod_stats_uses[tsharp.counter_bank_id];
@@ -1815,7 +1823,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     AmdGpu::IsInteger(element.GetNumberFmt()) == is_integer &&
                     element.GetNumberConversion() == tsharp.GetNumberConversion();
                 std::optional<ImageDesc> element_desc;
-                if (!compatible || !is_bindable(element, image_desc, element_desc)) {
+                if (!compatible || !CheckBindableImage(element, image_desc, element_desc, true)) {
                     null_elements += i < image_desc.array_size;
                     append_null_binding(image_desc);
                     continue;
@@ -1946,7 +1954,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
 
         std::optional<ImageDesc> bound_desc;
-        if (!is_bindable(tsharp, image_desc, bound_desc)) {
+        if (!CheckBindableImage(tsharp, image_desc, bound_desc, true)) {
             append_null_bindings();
             finish_slot(true);
             continue;
@@ -2550,7 +2558,7 @@ void Rasterizer::VerifyCleanRead(VAddr addr, const void* served, u64 size) {
     }
 }
 
-bool Rasterizer::IsPlausibleImage(const VideoCore::ImageInfo& info) {
+bool Rasterizer::IsPlausibleImage(const VideoCore::ImageInfo& info, bool log) {
     // A garbage T# (e.g. read from a constant buffer the guest has not written yet) can pass the address and
     // format checks and still describe an image that Vulkan cannot create. Creating it exhausts device memory
     // (image.cpp allocation assert), so it is bound as null instead
@@ -2568,7 +2576,7 @@ bool Rasterizer::IsPlausibleImage(const VideoCore::ImageInfo& info) {
                            (!is_3d || info.size.depth <= max_dim) &&
                            info.resources.layers <= limits.maxImageArrayLayers &&
                            host_bytes <= MaxPlausibleImageBytes;
-    if (!plausible) {
+    if (!plausible && log) {
         LOG_WARNING(Render_Vulkan,
                     "Rejecting implausible T# address={:#x} {}x{}x{} layers={} levels={} "
                     "bits={} (~{} MiB)",

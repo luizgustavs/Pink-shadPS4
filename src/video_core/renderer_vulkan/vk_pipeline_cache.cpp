@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <ranges>
@@ -831,7 +832,7 @@ private:
 
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
-                                              Shader::Backend::Bindings& binding) {
+                                              Shader::Backend::Bindings& binding, bool store) {
     const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::ShaderCompiles,
                                                     Common::PerfStats::Id::ShaderCompileNs};
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
@@ -863,7 +864,9 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         broken_watch->Finish();
     }
 
-    RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+    if (store) {
+        RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+    }
 
     const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
     Vulkan::SetObjectName(instance.GetDevice(), module, name);
@@ -911,7 +914,26 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 
     vk::ShaderModule module{};
 
-    const auto found = program->FindPermut(spec);
+    auto found = program->FindPermut(spec);
+    // A null texture can reuse any permutation matching the other resources
+    // Run this extra lookup only on a miss because checking builds image descriptions
+    bool null_images = false;
+    if (!found && is_null_image) {
+        auto relaxed = spec;
+        null_images = relaxed.IgnoreNullImages(is_null_image);
+        if (null_images) {
+            found = program->FindPermut(relaxed);
+        }
+        if (found) {
+            static std::atomic<u32> reused{};
+            if (reused.fetch_add(1, std::memory_order_relaxed) == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "Shader {:#x}: invalid T# bound as null, reusing permutation {} instead "
+                            "of compiling a new one (reported once)",
+                            params.hash, *found);
+            }
+        }
+    }
     if (!found) {
         // Choose an index above all permutations in memory and on disk so this compile cannot
         // overwrite an existing shader binary
@@ -919,9 +941,21 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             params.hash, static_cast<u32>(program->modules.size()));
         perm_hash = HashCombine(params.hash, perm_idx);
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
-
-        RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+        // Keep permutations based on invalid texture descriptors out of the disk cache
+        // Loading them again would only make shader lookups slower
+        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding,
+                               !null_images);
+        if (null_images) {
+            static std::atomic<u32> unstored{};
+            if (unstored.fetch_add(1, std::memory_order_relaxed) == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "Shader {:#x}: new permutation {} with T#s bound as null, not stored "
+                            "in the shader cache (reported once)",
+                            params.hash, perm_idx);
+            }
+        } else {
+            RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+        }
         program->InsertPermut(module, std::move(spec), perm_idx);
     } else {
         info.AddBindings(binding);

@@ -191,6 +191,23 @@ struct StageSpecialization {
         return info != nullptr;
     }
 
+    /// Ignore images that BindTextures will bind as null during permutation lookup
+    /// Invalid descriptors would otherwise compile and cache redundant shaders
+    /// Return false when no images were ignored
+    bool IgnoreNullImages(auto&& is_null_image) {
+        bool ignored = false;
+        // Images follow the buffers in the binding order of the constructor
+        u32 binding = static_cast<u32>(info->buffers.size());
+        for (const auto& desc : info->images) {
+            const u32 index = binding++;
+            if (bitset[index] && desc.array_size == 0 && is_null_image(desc.GetSharp(*info), desc)) {
+                bitset[index] = false;
+                ignored = true;
+            }
+        }
+        return ignored;
+    }
+
     bool operator==(const StageSpecialization& other) const {
         if (!Valid()) {
             return false;
