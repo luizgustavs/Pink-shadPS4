@@ -1861,6 +1861,19 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                                 : VideoCore::TextureCache::BindingType::Texture;
     };
 
+    // The T# reuse counters go to the perf stats once per call
+    struct ReuseCounts {
+        u64 tsharp_cache{};
+        u64 slots{};
+        ~ReuseCounts() {
+            if (tsharp_cache) {
+                Common::PerfStats::Add(Common::PerfStats::Id::TsharpCacheHits, tsharp_cache);
+            }
+            if (slots) {
+                Common::PerfStats::Add(Common::PerfStats::Id::BindReusedImages, slots);
+            }
+        }
+    } reuse_counts;
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
         const u32 num_bindings = image_desc.NumBindings(stage);
@@ -1939,8 +1952,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
         }
         if (cached && !incremental_bind_verify && !tsharp_cache_verify) {
-            Common::PerfStats::Add(from_tsharp_cache ? Common::PerfStats::Id::TsharpCacheHits
-                                                     : Common::PerfStats::Id::BindReusedImages);
+            ++(from_tsharp_cache ? reuse_counts.tsharp_cache : reuse_counts.slots);
             if (from_tsharp_cache && slot) {
                 slot->sharp = tsharp;
                 slot->valid = true;
@@ -2240,7 +2252,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             image = &texture_cache.GetImage(image_id);
         }
-        texture_cache.UpdateImage(image_id);
+        texture_cache.UpdateTarget(image_id);
         runtime.SetBackingSamples(image, key.color_samples[cb]);
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
         const auto slice = image_view.info.range.base.layer;

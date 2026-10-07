@@ -150,6 +150,13 @@ public:
     ImageFlagBits flags = ImageFlagBits::Dirty;
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
+    /// Remember the last GC tick that touched this image so repeated cached bindings
+    /// update its LRU position only once per tick
+    u64 lru_touch_tick{~0ULL};
+    /// Write generation at the last TextureCache::UpdateTarget that left
+    /// the image clean, 0 for none
+    /// Next to the other fields UpdateTarget reads, on one cache line
+    u64 target_write_gen{};
     ImageId depth_id{};
     u64 depth_uid{};
 
@@ -176,9 +183,6 @@ public:
     u64 image_uid{};
     u64 lru_id{};
     u64 tick_accessed_last{};
-    /// Remember the last GC tick that touched this image so repeated cached bindings update its LRU
-    /// position only once per tick
-    u64 lru_touch_tick{~0ULL};
     u64 hash{};
 
     struct {

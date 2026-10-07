@@ -87,6 +87,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/common/ntapi.cpp
     ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
     ${CMAKE_SOURCE_DIR}/src/common/perf_stats.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/rdtsc.cpp
     ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
 
     # Stubs that replace dependencies
@@ -160,6 +161,11 @@ foreach(t ${TEST_TARGETS})
         endif()
     endif()
 endforeach()
+
+# 128-bit division (GetFixedPoint64Factor, PerfStats' TSC clock), as for the emulator
+if (WIN32 AND MSVC)
+    target_link_libraries(shadps4_gcn_test PRIVATE clang_rt.builtins-x86_64.lib)
+endif()
 
 include(GoogleTest)
 foreach(t ${TEST_TARGETS})

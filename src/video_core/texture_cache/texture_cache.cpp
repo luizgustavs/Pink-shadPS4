@@ -171,6 +171,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     std::scoped_lock lock{mutex};
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
+    StampWrite(pages_start, pages_end - pages_start);
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
@@ -213,6 +214,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     std::scoped_lock lk{mutex};
+    StampWrite(cpu_addr, size);
 
     ImageIds deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
@@ -682,7 +684,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
         download_images.emplace(image_id);
     }
     image.usage.render_target = 1u;
-    UpdateImage(image_id);
+    UpdateTarget(image_id);
 
     // Register meta data for this color buffer
     if (desc.info.meta_info.cmask_addr) {
@@ -704,7 +706,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
-    UpdateImage(image_id);
+    UpdateTarget(image_id);
 
     // Register meta data for this depth buffer
     if (desc.info.meta_info.htile_addr) {
@@ -871,6 +873,10 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
+    // UpdateTarget: an image can also be freed off the command processor thread
+    // outside InvalidateMemory and UnmapMemory (FindImage of a video out buffer
+    // registered by the guest)
+    StampWrite(image.info.guest_address, image.info.guest_size);
     image.flags &= ~ImageFlagBits::Registered;
     StampPages(image.info.guest_address, image.info.guest_size,
                image_set_generation.fetch_add(1, std::memory_order_acq_rel) + 1);
@@ -1150,6 +1156,74 @@ void TextureCache::StampPages(VAddr addr, u64 size, u64 generation) {
             page_stamps[page].store(generation, std::memory_order_release);
         }
     });
+}
+
+void TextureCache::StampWrite(VAddr addr, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    const u64 generation = write_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+    const u64 page_end = std::min((addr + size - 1) >> Traits::PAGE_BITS, NumStampPages - 1);
+    for (u64 page = addr >> Traits::PAGE_BITS; page <= page_end; ++page) {
+        write_stamps[page].store(generation, std::memory_order_relaxed);
+    }
+    // The stamps go before the image fields the caller changes next (UpdateTarget reads
+    // them the other way round)
+    std::atomic_thread_fence(std::memory_order_release);
+}
+
+bool TextureCache::PagesWrittenSince(VAddr addr, u64 size, u64 generation) const noexcept {
+    const u64 page_end = (addr + size - 1) >> Traits::PAGE_BITS;
+    if (size == 0 || page_end >= NumStampPages) {
+        return true;
+    }
+    for (u64 page = addr >> Traits::PAGE_BITS; page <= page_end; ++page) {
+        if (write_stamps[page].load(std::memory_order_relaxed) > generation) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void TextureCache::UpdateTarget(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    const VAddr begin = image.info.guest_address;
+    const VAddr end = begin + image.info.guest_size;
+    const auto unchanged = [&] {
+        return True(image.flags & ImageFlagBits::Registered) &&
+               False(image.flags & ImageFlagBits::Dirty) && image.track_addr == begin &&
+               image.track_addr_end == end && image.lru_touch_tick == gc_tick;
+    };
+    // Read image fields before page stamps when checking an update without the lock
+    // Guest writes stamp the pages first, so a concurrent change rejects the skip
+    if (image.target_write_gen != 0 && Common::PerfStats::AbToggleOn(target_fast_toggle) &&
+        unchanged()) {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (!PagesWrittenSince(begin, end - begin, image.target_write_gen)) {
+            Common::PerfStats::Add(Common::PerfStats::Id::TargetUpdatesSkipped);
+            if (!target_fast_verify) {
+                return;
+            }
+            std::scoped_lock lk{mutex};
+            if (!unchanged()) {
+                Common::PerfStats::Add(Common::PerfStats::Id::TargetSkipMismatches);
+                static std::atomic<u32> reports{};
+                if (reports.fetch_add(1, std::memory_order_relaxed) < 20) {
+                    LOG_ERROR(Render_Vulkan,
+                              "Target fast verify: skipped the update of addr={:#x} size={:#x} "
+                              "flags={:#x} track={:#x}-{:#x} touch={} gc_tick={}",
+                              begin, end - begin, static_cast<u32>(image.flags), image.track_addr,
+                              image.track_addr_end, image.lru_touch_tick, gc_tick);
+                }
+            }
+        }
+    }
+    std::scoped_lock lk{mutex};
+    TrackImage(image_id);
+    TouchImage(image);
+    RefreshImage(image);
+    // Writers bump the generation under the lock: any later one stamps a newer value
+    image.target_write_gen = write_generation.load(std::memory_order_relaxed);
 }
 
 void TextureCache::TouchReusedImage(ImageId image_id) {

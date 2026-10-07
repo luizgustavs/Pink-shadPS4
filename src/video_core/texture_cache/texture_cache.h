@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -15,6 +16,7 @@
 
 #include "common/lru_cache.h"
 #include "common/multi_level_page_table.h"
+#include "common/perf_stats.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/texture_cache/blit_helper.h"
@@ -127,6 +129,12 @@ public:
         TouchImage(image);
         RefreshImage(image);
     }
+
+    /// Update a render or depth target on the command processor thread
+    /// Skip the lock only if the image is clean, tracked and
+    /// already touched this GC tick
+    /// Guest writes and image unmaps must not have changed its pages
+    void UpdateTarget(ImageId image_id);
 
     /// Resolves overlap between existing cache image and pending merged image
     [[nodiscard]] std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info,
@@ -318,6 +326,19 @@ private:
 
     std::atomic<u64> image_set_generation{0};
     std::unique_ptr<std::atomic<u64>[]> page_stamps;
+
+    /// Stamp affected 1 MiB pages before guest writes or unmaps change any image
+    void StampWrite(VAddr addr, u64 size);
+    [[nodiscard]] bool PagesWrittenSince(VAddr addr, u64 size, u64 generation) const noexcept;
+    std::atomic<u64> write_generation{1};
+    std::unique_ptr<std::atomic<u64>[]> write_stamps{
+        std::make_unique<std::atomic<u64>[]>(NumStampPages)};
+    /// SHADPS4_TARGET_FAST_VERIFY: each skip is checked under the lock, then
+    /// the full update runs anyway
+    const bool target_fast_verify{std::getenv("SHADPS4_TARGET_FAST_VERIFY") != nullptr};
+    /// In-run A/B of the skip: SHADPS4_AB_TOGGLE with "target_fast_update" in
+    /// SHADPS4_AB_TOGGLE_KEYS (no setting)
+    const bool target_fast_toggle{Common::PerfStats::AbToggleFollows("target_fast_update")};
     std::atomic<u64> stat_images{0};
     std::atomic<u64> stat_largest_image{0};
     /// Iterate over all page indices in a range
