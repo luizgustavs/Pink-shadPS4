@@ -203,7 +203,7 @@ private:
 
     /// readback_hot_regions: a readback window requested now;
     /// returns whether the key is on
-    bool TouchHotReadback(const Buffer* arena, VAddr addr, u64 size);
+    bool TouchHotReadback(VAddr addr, u64 size);
 
     /// readback_hot_regions: records copies of the GPU-written bytes of the other
     /// recent readback windows into hot_buffer, before the readback drains the GPU
@@ -277,7 +277,6 @@ private:
     const bool track_writers;
     /// readback_hot_regions: readback windows requested in the last seconds
     struct HotReadback {
-        const Buffer* arena;
         VAddr addr;
         u64 size;
         std::chrono::steady_clock::time_point last_request;

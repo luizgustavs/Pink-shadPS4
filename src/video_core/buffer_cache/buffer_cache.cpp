@@ -260,7 +260,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
-    const bool hot_regions = TouchHotReadback(arena, device_addr, size);
+    const bool hot_regions = TouchHotReadback(device_addr, size);
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     const VAddr arena_base = arena->cpu_addr;
@@ -387,7 +387,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     }
 }
 
-bool BufferCache::TouchHotReadback(const Buffer* arena, VAddr addr, u64 size) {
+bool BufferCache::TouchHotReadback(VAddr addr, u64 size) {
     if (!readback_hot_regions || !Common::PerfStats::AbToggleOn(readback_hot_toggle)) {
         return false;
     }
@@ -396,16 +396,16 @@ bool BufferCache::TouchHotReadback(const Buffer* arena, VAddr addr, u64 size) {
     static constexpr size_t MaxHotReadbacks = 64;
     const auto now = std::chrono::steady_clock::now();
     for (auto& hot : hot_readbacks) {
-        if (hot.arena == arena && hot.addr == addr && hot.size == size) {
+        if (hot.addr == addr && hot.size == size) {
             hot.last_request = now;
             return true;
         }
     }
     if (hot_readbacks.size() < MaxHotReadbacks) {
-        hot_readbacks.push_back({arena, addr, size, now});
+        hot_readbacks.push_back({addr, size, now});
     } else {
-        *std::ranges::min_element(hot_readbacks, {}, &HotReadback::last_request) = {arena, addr,
-                                                                                     size, now};
+        *std::ranges::min_element(hot_readbacks, {}, &HotReadback::last_request) = {addr, size,
+                                                                                     now};
     }
     return true;
 }
@@ -423,7 +423,21 @@ void BufferCache::RecordHotDownloads(VAddr skip_addr) {
         if (hot.addr == skip_addr || now - hot.last_request > HotReadbackLifetime) {
             continue;
         }
-        const VAddr arena_base = hot.arena->cpu_addr;
+        // Bindings count as GPU-written before their command runs
+        // Do not clear those pending writes in a grouped download
+        // Read overlapping windows back separately
+        if (std::ranges::any_of(open_writes, [&](const auto& write) {
+                return write.first < hot.addr + hot.size && hot.addr < write.first + write.second;
+            })) {
+            continue;
+        }
+        // Use the current arena because a migration leaves later resident
+        // blocks out of the old one
+        const Buffer* arena = address_space[hot.addr >> ARENA_PAGE_BITS];
+        if (!arena) {
+            continue;
+        }
+        const VAddr arena_base = arena->cpu_addr;
         const u32 first_copy = static_cast<u32>(hot_copies.size());
         bool gpu_modified = false;
         memory_tracker->ForEachDownloadRange<false>(
@@ -450,13 +464,18 @@ void BufferCache::RecordHotDownloads(VAddr skip_addr) {
         // Windows the tracker marks GPU-written without GPU-written
         // bytes left are only unmarked
         const u32 num_copies = static_cast<u32>(hot_copies.size()) - first_copy;
-        hot_downloads.push_back({hot.arena, hot.addr, hot.size, first_copy, num_copies});
+        hot_downloads.push_back({arena, hot.addr, hot.size, first_copy, num_copies});
     }
     hot_total = total_size_bytes;
     if (total_size_bytes == 0) {
         return;
     }
     if (!hot_buffer || hot_buffer->SizeBytes() < total_size_bytes) {
+        // The drain may have returned on its wait_marker before the
+        // driver reported the tick
+        if (hot_buffer) {
+            scheduler.DeferOperation([old = std::move(hot_buffer)] {});
+        }
         hot_buffer = std::make_unique<Buffer>(instance, 0,
                                               std::bit_ceil(std::max<u64>(total_size_bytes, 1_MB)),
                                               MemoryType::HostCached, "Readback Hot Regions");
@@ -598,11 +617,17 @@ void BufferCache::InvalidateCleanPages(VAddr addr, u64 size) {
 }
 
 void BufferCache::RecordGpuWrite(VAddr addr, u64 size, bool open) {
-    if (!track_writers || size == 0) {
+    if (size == 0) {
         return;
     }
     if (open) {
-        open_writes.emplace_back(addr, size);
+        // readback_hot_regions leaves windows with open writes out of its downloads
+        if (track_writers || readback_hot_regions) {
+            open_writes.emplace_back(addr, size);
+        }
+        return;
+    }
+    if (!track_writers) {
         return;
     }
     // A readback only needs to know whether the writer is in the current tick; older ticks are kept for
