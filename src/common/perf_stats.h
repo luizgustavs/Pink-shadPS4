@@ -209,6 +209,10 @@ enum class Id : u32 {
     // locked check found wrong
     TargetUpdatesSkipped,
     TargetSkipMismatches,
+    // unbounded_vsharp_cap_mb: read-only V# with num_records 0xffffffff cut at the
+    // cap, and the bytes cut off
+    UnboundedClamps,
+    UnboundedClampBytes,
     Count,
 };
 

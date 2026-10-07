@@ -524,7 +524,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       depth_target_sampled_toggle{
           Common::PerfStats::AbToggleFollows("depth_target_sampled_layout")},
       gcn_unordered_dispatches{EmulatorSettings.IsGcnUnorderedDispatches()},
-      gcn_unordered_toggle{Common::PerfStats::AbToggleFollows("gcn_unordered_dispatches")} {
+      gcn_unordered_toggle{Common::PerfStats::AbToggleFollows("gcn_unordered_dispatches")},
+      unbounded_cap_bytes{u64{EmulatorSettings.GetUnboundedVsharpCapMb()} << 20} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -591,6 +592,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     }
     if (gcn_unordered_dispatches) {
         LOG_WARNING(Render_Vulkan, "Workaround gcn_unordered_dispatches enabled");
+    }
+    if (unbounded_cap_bytes != 0) {
+        LOG_WARNING(Render_Vulkan, "Workaround unbounded_vsharp_cap_mb enabled: {} MiB",
+                    unbounded_cap_bytes >> 20);
     }
     scheduler.SkipRedundantPipelineBinds(EmulatorSettings.IsGpuOverheadCuts());
 }
@@ -1688,10 +1693,20 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     !IsMapped(vsharp.base_address, 1)) {
                     buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
                 } else {
-                    const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                    u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
                     if (size != vsharp.GetSize()) {
                         LOG_DEBUG(Render, "Clamped size from {} to {} for stage {:#x}",
                                   vsharp.GetSize(), size, stage.pgm_hash);
+                    }
+                    // unbounded_vsharp_cap_mb: a read-only V# without a size binds at
+                    // most the cap from its base, so a bind made while the game's
+                    // memory is still one mapping does not make GBs resident
+                    if (unbounded_cap_bytes != 0 && size > unbounded_cap_bytes &&
+                        !desc.is_written && vsharp.num_records == 0xffffffffu) {
+                        Common::PerfStats::Add(Common::PerfStats::Id::UnboundedClamps);
+                        Common::PerfStats::Add(Common::PerfStats::Id::UnboundedClampBytes,
+                                               size - unbounded_cap_bytes);
+                        size = unbounded_cap_bytes;
                     }
                     const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                         vsharp.base_address, size, desc.is_written, desc.is_formatted);

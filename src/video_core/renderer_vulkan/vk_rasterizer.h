@@ -312,6 +312,7 @@ private:
     // barrier tracking does not see)
     s8 unordered_ring{-1};
     bool game_dispatch_accesses{};
+    const u64 unbounded_cap_bytes; ///< unbounded_vsharp_cap_mb in bytes, 0 = off
     u64 bind_verify_checks{};
     u64 bind_verify_mismatches{};
     u64 bind_verify_raced{};
