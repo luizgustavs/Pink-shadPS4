@@ -1186,18 +1186,18 @@ bool TextureCache::PagesWrittenSince(VAddr addr, u64 size, u64 generation) const
 }
 
 void TextureCache::UpdateTarget(ImageId image_id) {
-    Image& image = slot_images[image_id];
+    const Image& image = slot_images[image_id];
     const VAddr begin = image.info.guest_address;
     const VAddr end = begin + image.info.guest_size;
-    const auto unchanged = [&] {
-        return True(image.flags & ImageFlagBits::Registered) &&
-               False(image.flags & ImageFlagBits::Dirty) && image.track_addr == begin &&
-               image.track_addr_end == end && image.lru_touch_tick == gc_tick;
+    const auto unchanged = [&](const Image& img) {
+        return True(img.flags & ImageFlagBits::Registered) &&
+               False(img.flags & ImageFlagBits::Dirty) && img.track_addr == begin &&
+               img.track_addr_end == end && img.lru_touch_tick == gc_tick;
     };
     // Read image fields before page stamps when checking an update without the lock
     // Guest writes stamp the pages first, so a concurrent change rejects the skip
     if (image.target_write_gen != 0 && Common::PerfStats::AbToggleOn(target_fast_toggle) &&
-        unchanged()) {
+        unchanged(image)) {
         std::atomic_thread_fence(std::memory_order_acquire);
         if (!PagesWrittenSince(begin, end - begin, image.target_write_gen)) {
             Common::PerfStats::Add(Common::PerfStats::Id::TargetUpdatesSkipped);
@@ -1205,25 +1205,29 @@ void TextureCache::UpdateTarget(ImageId image_id) {
                 return;
             }
             std::scoped_lock lk{mutex};
-            if (!unchanged()) {
+            if (const Image& locked = slot_images[image_id]; !unchanged(locked)) {
                 Common::PerfStats::Add(Common::PerfStats::Id::TargetSkipMismatches);
                 static std::atomic<u32> reports{};
                 if (reports.fetch_add(1, std::memory_order_relaxed) < 20) {
                     LOG_ERROR(Render_Vulkan,
                               "Target fast verify: skipped the update of addr={:#x} size={:#x} "
                               "flags={:#x} track={:#x}-{:#x} touch={} gc_tick={}",
-                              begin, end - begin, static_cast<u32>(image.flags), image.track_addr,
-                              image.track_addr_end, image.lru_touch_tick, gc_tick);
+                              begin, end - begin, static_cast<u32>(locked.flags),
+                              locked.track_addr, locked.track_addr_end, locked.lru_touch_tick,
+                              gc_tick);
                 }
             }
         }
     }
     std::scoped_lock lk{mutex};
+    // Fetch the image again under the lock
+    // Guest video buffer registration can grow slot_images while this thread waits
+    Image& locked = slot_images[image_id];
     TrackImage(image_id);
-    TouchImage(image);
-    RefreshImage(image);
+    TouchImage(locked);
+    RefreshImage(locked);
     // Writers bump the generation under the lock: any later one stamps a newer value
-    image.target_write_gen = write_generation.load(std::memory_order_relaxed);
+    locked.target_write_gen = write_generation.load(std::memory_order_relaxed);
 }
 
 void TextureCache::TouchReusedImage(ImageId image_id) {
