@@ -238,6 +238,7 @@ std::vector<u8> HexBytes(std::string_view hex) {
 // Force every Pro resolution entry to 3840x2160 for Shadow of the Colossus 01.01
 // Keep the branch that creates the render target heap and grow it for the 4K targets
 // Default to display mode 2 so the final pass and UI also use the 4K surfaces
+// Ignore both CVar overrides so a saved r_Wants4K_Game cannot change the mode
 void ApplySotcPro4k() {
     if (!EmulatorSettings.IsSotcPro4k()) {
         return;
@@ -253,8 +254,9 @@ void ApplySotcPro4k() {
         LOG_WARNING(Loader, "sotc_pro_4k: neo_mode is off, ignored");
         return;
     }
-    const std::array<BuiltinPatch, 5> patches{{
+    const std::array<BuiltinPatch, 6> patches{{
         {0x90d26, HexBytes("be03000000"), HexBytes("be02000000")},
+        {0x90d37, HexBytes("85c00f45f085c90f45f1"), HexBytes("85c090909085c9909090")},
         {0x95d8d,
          HexBytes("c5f810056b95f0008b855cffffff488db560ffffffba0004000031c94531c041b900040000"
                   "4c89f7c5f8118560ffffff4489ad70ffffff4489bd74ffffff4489a578ffffff89857cffffff"),
