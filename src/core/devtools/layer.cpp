@@ -37,6 +37,9 @@ static bool show_quit_window = false;
 static bool show_volume = false;
 static float volume_start_time;
 
+static bool show_dlss_nr = false;
+static float dlss_nr_start_time;
+
 static float fps_scale = 1.0f;
 static int dump_frame_count = 1;
 
@@ -510,6 +513,27 @@ void L::Draw() {
         }
     }
 
+    if (show_dlss_nr) {
+        // Show the live DLSS Neural Rendering state for 3 seconds
+        // Replace "starting" with the failure reason if the model cannot start
+        if (ImGui::GetTime() - dlss_nr_start_time >= 3.0) {
+            show_dlss_nr = false;
+        } else {
+            SetNextWindowPos(ImVec2(ImGui::GetMainViewport()->WorkPos.x +
+                                        ImGui::GetMainViewport()->WorkSize.x - 10,
+                                    ImGui::GetMainViewport()->WorkPos.y + 10),
+                             ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+
+            if (ImGui::Begin("DLSS NR Window", &show_dlss_nr,
+                             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoDecoration |
+                                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDocking)) {
+                const std::string status = Vulkan::HostPasses::DlssNrPass::StatusText();
+                Text("%s", status.c_str());
+            }
+            End();
+        }
+    }
+
     PopID();
 }
 
@@ -541,6 +565,11 @@ void ToggleQuitWindow() {
 void ShowVolume() {
     volume_start_time = ImGui::GetTime();
     show_volume = true;
+}
+
+void ShowDlssNr() {
+    dlss_nr_start_time = ImGui::GetTime();
+    show_dlss_nr = true;
 }
 
 } // namespace Overlay

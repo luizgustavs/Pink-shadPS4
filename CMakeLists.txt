@@ -1175,6 +1175,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
                src/video_core/renderer_vulkan/vk_swapchain.cpp
                src/video_core/renderer_vulkan/vk_swapchain.h
+               src/video_core/renderer_vulkan/host_passes/dlssnr_pass.cpp
+               src/video_core/renderer_vulkan/host_passes/dlssnr_pass.h
                src/video_core/renderer_vulkan/host_passes/fsr_pass.cpp
                src/video_core/renderer_vulkan/host_passes/fsr_pass.h
                src/video_core/renderer_vulkan/host_passes/pp_pass.cpp
@@ -1424,6 +1426,20 @@ endif()
 
 if (WIN32)
     target_sources(shadps4 PRIVATE src/dist/shadps4.rc)
+
+    # Load the DLSS Neural Rendering bridge from the folder of shadps4.exe
+    # Include "nvngx.dll" in its name because the model checks the caller's module path
+    add_library(dlssnr_bridge SHARED
+        src/video_core/renderer_vulkan/host_passes/dlssnr_bridge/dlssnr_bridge.cpp
+        src/video_core/renderer_vulkan/host_passes/dlssnr_bridge/dlssnr_bridge.h
+    )
+    set_target_properties(dlssnr_bridge PROPERTIES
+        OUTPUT_NAME "nvngx.dll_dlssnr"
+        PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    )
+    target_link_libraries(dlssnr_bridge PRIVATE advapi32)
+    add_dependencies(shadps4 dlssnr_bridge)
 endif()
 
 if (NOT MSVC)

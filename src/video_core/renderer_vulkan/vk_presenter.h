@@ -7,6 +7,7 @@
 
 #include "core/libraries/videoout/buffer.h"
 #include "imgui/imgui_texture.h"
+#include "video_core/renderer_vulkan/host_passes/dlssnr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -59,6 +60,10 @@ public:
 
     HostPasses::FsrPass::Settings& GetFsrSettingsRef() {
         return fsr_settings;
+    }
+
+    HostPasses::DlssNrPass::Settings& GetDlssNrSettingsRef() {
+        return dlssnr_settings;
     }
 
     Frontend::WindowSDL& GetWindow() const {
@@ -122,6 +127,8 @@ private:
     HostPasses::FsrPass::Settings fsr_settings{};
     HostPasses::PostProcessingPass::Settings pp_settings{};
     HostPasses::PostProcessingPass pp_pass;
+    HostPasses::DlssNrPass::Settings dlssnr_settings{};
+    HostPasses::DlssNrPass dlssnr_pass;
     AmdGpu::Liverpool* liverpool;
     Scheduler draw_scheduler;
     Scheduler present_scheduler;

@@ -43,6 +43,7 @@
 #define SDL_EVENT_RDOC_CAPTURE SDL_EVENT_USER + 13
 #define SDL_EVENT_SCREENSHOT_WITH_OVERLAYS SDL_EVENT_USER + 14
 #define SDL_EVENT_TOGGLE_FRIENDS SDL_EVENT_USER + 15
+#define SDL_EVENT_TOGGLE_DLSS_NR SDL_EVENT_USER + 16
 
 #define LEFTJOYSTICK_HALFMODE 0x00010000
 #define RIGHTJOYSTICK_HALFMODE 0x00020000
@@ -67,6 +68,7 @@
 #define HOTKEY_SCREENSHOT_WITH_OVERLAYS 0xf000000e
 #define HOTKEY_OPEN_EMULATOR_SETTINGS 0xf000000f
 #define HOTKEY_TOGGLE_FRIENDS 0xf0000010
+#define HOTKEY_TOGGLE_DLSS_NR 0xf0000011
 
 #define SDL_UNMAPPED UINT32_MAX - 1
 
@@ -175,6 +177,7 @@ const std::map<std::string, u32> string_to_hotkey_map = {
     {"hotkey_volume_down", HOTKEY_VOLUME_DOWN},
     {"hotkey_emulator_settings", HOTKEY_OPEN_EMULATOR_SETTINGS},
     {"hotkey_toggle_friends", HOTKEY_TOGGLE_FRIENDS},
+    {"hotkey_toggle_dlss_nr", HOTKEY_TOGGLE_DLSS_NR},
 };
 
 const std::map<std::string, AxisMapping> string_to_axis_map = {
@@ -540,7 +543,7 @@ public:
 
 class ControllerAllOutputs {
 public:
-    static constexpr u64 output_count = 43;
+    static constexpr u64 output_count = 44;
     std::array<ControllerOutput, output_count> data = {
         // Important: these have to be the first, or else they will update in the wrong order
         ControllerOutput(LEFTJOYSTICK_HALFMODE),
@@ -595,6 +598,7 @@ public:
         ControllerOutput(HOTKEY_VOLUME_DOWN),
         ControllerOutput(HOTKEY_OPEN_EMULATOR_SETTINGS),
         ControllerOutput(HOTKEY_TOGGLE_FRIENDS),
+        ControllerOutput(HOTKEY_TOGGLE_DLSS_NR),
 
         ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_INVALID),
     };

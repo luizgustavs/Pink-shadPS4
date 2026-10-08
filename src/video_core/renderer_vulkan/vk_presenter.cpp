@@ -496,6 +496,13 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
+    dlssnr_settings.style = std::min(EmulatorSettings.GetDlssNrStyle(), 2u);
+    dlssnr_settings.intensity =
+        std::clamp(static_cast<float>(EmulatorSettings.GetDlssNrIntensity()), 0.0f, 2.0f);
+    dlssnr_settings.ui_correction = EmulatorSettings.IsDlssNrUiCorrection();
+    HostPasses::DlssNrPass::SetEnabled(EmulatorSettings.IsDlssNrEnabled());
+    dlssnr_pass.Create(instance, draw_scheduler);
+
     ImGui::Layer::AddLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
     ImGui::Friends::Register();
     ImGui::ShadNetNotify::Register();
@@ -517,6 +524,7 @@ Presenter::~Presenter() {
     Check(draw_scheduler.CommandBuffer().reset());
     Check(present_scheduler.CommandBuffer().reset());
     Check(flip_scheduler.CommandBuffer().reset());
+    dlssnr_pass.Destroy();
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
@@ -761,6 +769,12 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // The FSR and post-process passes bind their pipelines directly
     draw_scheduler.InvalidatePipelineBinds();
 
+    // Run DLSS Neural Rendering on the finished frame before drawing overlays
+    // Submit the frame so far and make the final submit wait for the model
+    SubmitInfo info{};
+    dlssnr_pass.Render(frame->image, swapchain.GetSurfaceFormat().format, frame->width,
+                       frame->height, frame->is_hdr, dlssnr_settings, info);
+
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
 
@@ -774,7 +788,6 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // Flush frame creation commands.
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
-    SubmitInfo info{};
     draw_scheduler.Flush(info);
     return frame;
 }

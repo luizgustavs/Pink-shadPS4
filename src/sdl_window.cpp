@@ -29,6 +29,7 @@
 #include "input/input_mouse.h"
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/host_passes/dlssnr_pass.h"
 
 #ifdef __APPLE__
 #include <SDL3/SDL_metal.h>
@@ -293,6 +294,10 @@ void WindowSDL::WaitEvent() {
         break;
     case SDL_EVENT_TOGGLE_FRIENDS:
         ImGui::Friends::Toggle();
+        break;
+    case SDL_EVENT_TOGGLE_DLSS_NR:
+        Vulkan::HostPasses::DlssNrPass::Toggle();
+        Overlay::ShowDlssNr();
         break;
     case SDL_EVENT_RELOAD_INPUTS:
         Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));

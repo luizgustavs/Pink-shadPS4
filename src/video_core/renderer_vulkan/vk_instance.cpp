@@ -240,7 +240,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 48> enabled_extensions;
+    boost::container::static_vector<const char*, 64> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -368,6 +368,12 @@ bool Instance::CreateDevice() {
     // ReportDeviceFault)
     device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME) &&
                    feature_chain.get<vk::PhysicalDeviceFaultFeaturesEXT>().deviceFault;
+#ifdef _WIN32
+    // DLSS Neural Rendering runs on a D3D12 device of the same GPU and shares the frame and a
+    // fence with it
+    d3d12_interop = add_extension("VK_KHR_external_memory_win32") &&
+                    add_extension("VK_KHR_external_semaphore_win32");
+#endif
     // Per-game gpu_checkpoints: the host command ring and submit ledger work on any GPU; NVIDIA queue
     // checkpoints also name the command that was executing. Automatic driver checkpoints would replace the
     // emulator's own markers, so the diagnostics config only enables resource tracking and shader error

@@ -474,6 +474,16 @@ struct GPUSettings {
     Setting<bool> fsr_enabled{false};
     Setting<bool> rcas_enabled{true};
     Setting<int> rcas_attenuation{250};
+    // Run DLSS Neural Rendering over the final frame without motion vectors or depth
+    // Require Windows, an NVIDIA RTX GPU and nvngx_dlssnr.dll next to shadps4.exe
+    // Leave it off by default and use hotkey_toggle_dlss_nr to switch it in game
+    Setting<bool> dlss_nr_enabled{false};
+    // Select the model style: 0 Default, 1 Natural, 2 Cinematic
+    Setting<u32> dlss_nr_style{0};
+    // Set detail strength from 0 to 2
+    Setting<double> dlss_nr_intensity{1.0};
+    // Preserve the game's HUD
+    Setting<bool> dlss_nr_ui_correction{true};
     Setting<bool> userfaultfd{false};
     // Per-game loop limit (0 = off): stop runaway compute shaders after this many back edges
     // Shadow of the Colossus uses 1048576 to avoid a GPU timeout
@@ -614,6 +624,11 @@ struct GPUSettings {
             make_override<GPUSettings>("fsr_enabled", &GPUSettings::fsr_enabled),
             make_override<GPUSettings>("rcas_enabled", &GPUSettings::rcas_enabled),
             make_override<GPUSettings>("rcas_attenuation", &GPUSettings::rcas_attenuation),
+            make_override<GPUSettings>("dlss_nr_enabled", &GPUSettings::dlss_nr_enabled),
+            make_override<GPUSettings>("dlss_nr_style", &GPUSettings::dlss_nr_style),
+            make_override<GPUSettings>("dlss_nr_intensity", &GPUSettings::dlss_nr_intensity),
+            make_override<GPUSettings>("dlss_nr_ui_correction",
+                                       &GPUSettings::dlss_nr_ui_correction),
             make_override<GPUSettings>("dump_shaders", &GPUSettings::dump_shaders),
             make_override<GPUSettings>("patch_shaders", &GPUSettings::patch_shaders),
             make_override<GPUSettings>("readbacks_mode", &GPUSettings::readbacks_mode),
@@ -716,7 +731,8 @@ struct GPUSettings {
         readback_hot_regions, depth_target_sampled_layout, gcn_unordered_dispatches,                \
         access_bitmap_tracking, page_spin_locks, range_fast_paths, unbounded_vsharp_cap_mb,         \
         texture_gc_full_scan, texture_gc_trigger_mb, image_pool_texture_max_kb,                     \
-        arena_evict_idle_s))
+        arena_evict_idle_s, dlss_nr_enabled, dlss_nr_style, dlss_nr_intensity,                      \
+        dlss_nr_ui_correction))
 template <typename BasicJsonType,
           nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0>
 void to_json(BasicJsonType& nlohmann_json_j, const GPUSettings& nlohmann_json_t) {
@@ -1016,6 +1032,10 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, FsrEnabled, fsr_enabled)
     SETTING_FORWARD_BOOL(m_gpu, RcasEnabled, rcas_enabled)
     SETTING_FORWARD(m_gpu, RcasAttenuation, rcas_attenuation)
+    SETTING_FORWARD_BOOL(m_gpu, DlssNrEnabled, dlss_nr_enabled)
+    SETTING_FORWARD(m_gpu, DlssNrStyle, dlss_nr_style)
+    SETTING_FORWARD(m_gpu, DlssNrIntensity, dlss_nr_intensity)
+    SETTING_FORWARD_BOOL(m_gpu, DlssNrUiCorrection, dlss_nr_ui_correction)
     SETTING_FORWARD(m_gpu, ReadbacksMode, readbacks_mode)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
