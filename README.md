@@ -5,9 +5,9 @@ The focus is Windows with NVIDIA graphics cards. I do not have the means to test
 
 # DOWNLOAD
 
-[![Download latest release](https://img.shields.io/badge/Download-Latest%20Release-pink?style=for-the-badge)](https://github.com/luizgustavs/Pink-shadPS4/releases/download/0.2.0/Pink-shardPS4.0.2.0.zip)
+[![Download latest release](https://img.shields.io/badge/Download-Latest%20Release-pink?style=for-the-badge)](https://github.com/luizgustavs/Pink-shadPS4/releases/download/0.3.0/Pink-shardPS4.0.3.0.zip)
 
-[Download Pink-shardPS4 0.2.0 ZIP](https://github.com/luizgustavs/Pink-shadPS4/releases/download/0.2.0/Pink-shardPS4.0.2.0.zip)
+[Download Pink-shardPS4 0.3.0 ZIP](https://github.com/luizgustavs/Pink-shadPS4/releases/download/0.3.0/Pink-shardPS4.0.3.0.zip)
 
 The ZIP already includes the launcher and emulator with specific settings for the game. Use the launcher included in this version; other launchers won't enable the required workarounds.
 
@@ -16,6 +16,7 @@ The ZIP already includes the launcher and emulator with specific settings for th
 1. Download the ZIP and extract it into a folder.
 2. Run the launcher once to create the `games` folder, then put your game folder (`CUSAXXXXX`) inside it.
 3. Play! The launcher should apply every setting for and and automatically import the correct shadPS4.exe for you 
+4. About the audio, you need to install the PS4 libs on user/sys_modules
 
 ### Recommended settings
 
