@@ -287,10 +287,10 @@ struct LogSettings {
     Setting<unsigned long long> size_limit{100_MB};
     Setting<bool> skip_duplicate{true};
     Setting<bool> sync{true};
-    // "all": the console mirrors the log file. "events": the console only shows crash/broken
-    // shader/render problem events, Critical messages and a session summary on exit (the log file
-    // keeps everything and also gets the events)
-    Setting<std::string> console_mode{"all"};
+    // Default to "events" for crash, shader and render problems, Critical messages and exit summaries
+    // Keep all messages in the log file and use "all" to mirror them in the console
+    // With "all" and a synced log, each warning also writes to the launcher's pipe on its logging thread
+    Setting<std::string> console_mode{"events"};
 #ifdef _WIN32
     Setting<std::string> type{"wincolor"};
 #endif

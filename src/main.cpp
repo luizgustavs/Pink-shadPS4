@@ -167,11 +167,8 @@ int main(int argc, char* argv[]) {
     std::shared_ptr<EmulatorSettingsImpl> emu_settings = std::make_shared<EmulatorSettingsImpl>();
     EmulatorSettingsImpl::SetInstance(emu_settings);
     emu_settings->Load();
-    // The log was set up with defaults; with Log.console_mode = "events", apply the loaded settings
-    // before the boot messages. "all" keeps the default sinks until Log::Switch, as before
-    if (EmulatorSettings.GetLogConsoleMode() == "events") {
-        Common::Log::UpdateSinks();
-    }
+    // Apply the loaded Log.console_mode and Log.sync before logging boot messages
+    Common::Log::UpdateSinks();
 
     if (bigPicture) {
         BigPictureMode::Launch(argv[0], sameProcess);
