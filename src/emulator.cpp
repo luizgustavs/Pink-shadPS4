@@ -379,6 +379,17 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     // Certain games may use /hostapp as well such as CUSA001100
     mnt->Mount(game_folder, "/hostapp", true);
 
+    // PKG extractors (e.g. PS4-PKG-Tool) put sce_sys in a sibling Sc0/ folder next to Image0/.
+    // Expose it where the game and the emulator expect it.
+    const auto split_sce_sys = Common::FS::FindSplitSceSys(game_folder);
+    if (split_sce_sys) {
+        LOG_WARNING(Loader,
+                    "No sce_sys/param.sfo in {}; mounting split PKG folder {} as /app0/sce_sys",
+                    Common::FS::PathToUTF8String(game_folder),
+                    Common::FS::PathToUTF8String(*split_sce_sys));
+        mnt->Mount(*split_sce_sys, "/app0/sce_sys", true);
+    }
+
     // Load param.sfo details if it exists
     std::string id;
     std::string title;
@@ -443,6 +454,18 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
                                                                           : "shad_log.txt",
                         append_log);
+    // Logged after the switch so it lands in the log file users attach to reports.
+    if (split_sce_sys) {
+        LOG_WARNING(Loader, "sce_sys mounted from split PKG folder {}",
+                    Common::FS::PathToUTF8String(*split_sce_sys));
+    }
+    if (!param_sfo_exists) {
+        LOG_CRITICAL(Loader,
+                     "No /app0/sce_sys/param.sfo under {}: title ID, game-specific config and "
+                     "sceAppContent will not work. The game folder must contain sce_sys/param.sfo "
+                     "(for PKG-tool extractions, sce_sys is the Sc0 folder next to Image0)",
+                     Common::FS::PathToUTF8String(game_folder));
+    }
 #ifdef _WIN32
     // H1: cpu_affinity_mask pins the process (its current threads and every thread it creates), not a
     // thread: pinning the command processor to one core was 5-12 ms per frame slower in SotC

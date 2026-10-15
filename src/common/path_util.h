@@ -122,4 +122,18 @@ void SetUserPath(PathType user_path, const std::filesystem::path& new_path);
                                                                 const std::string& game_id,
                                                                 int max_depth);
 
+/**
+ * PKG extractors such as PS4-PKG-Tool split a package into sibling folders: Image0/ holds the
+ * app0 contents (eboot.bin, data) and Sc0/ holds what the console exposes as /app0/sce_sys
+ * (param.sfo, npbind.dat, trophy/, icons). Booting Image0/eboot.bin then finds no
+ * sce_sys/param.sfo.
+ *
+ * @param game_folder The folder that will be mounted as /app0
+ *
+ * @returns The sibling Sc0 folder when game_folder has no sce_sys/param.sfo but Sc0/param.sfo
+ *          exists; std::nullopt otherwise.
+ */
+[[nodiscard]] std::optional<std::filesystem::path> FindSplitSceSys(
+    const std::filesystem::path& game_folder);
+
 } // namespace Common::FS

@@ -198,6 +198,21 @@ void SetUserPath(PathType shad_path, const fs::path& new_path) {
     UserPaths.insert_or_assign(shad_path, new_path);
 }
 
+std::optional<fs::path> FindSplitSceSys(const fs::path& game_folder) {
+    std::error_code ec;
+    if (!fs::is_directory(game_folder, ec) || ec) {
+        return std::nullopt;
+    }
+    if (fs::exists(game_folder / "sce_sys" / "param.sfo", ec)) {
+        return std::nullopt;
+    }
+    auto sc0 = game_folder.parent_path() / "Sc0";
+    if (fs::is_regular_file(sc0 / "param.sfo", ec) && !ec) {
+        return sc0;
+    }
+    return std::nullopt;
+}
+
 std::optional<fs::path> FindGameByID(const fs::path& dir, const std::string& game_id,
                                      int max_depth) {
     if (max_depth < 0) {
@@ -207,7 +222,7 @@ std::optional<fs::path> FindGameByID(const fs::path& dir, const std::string& gam
     const auto boot_path_for = [](const fs::path& root) -> std::optional<fs::path> {
         std::error_code ec;
         if (fs::is_directory(root, ec) && !ec) {
-            if (!fs::exists(root / "sce_sys" / "param.sfo")) {
+            if (!fs::exists(root / "sce_sys" / "param.sfo") && !FindSplitSceSys(root)) {
                 return std::nullopt;
             }
             if (auto eboot_path = root / "eboot.bin"; fs::exists(eboot_path)) {

@@ -298,10 +298,14 @@ int PS4_SYSV_ABI sceAppContentInitialize(const OrbisAppContentInitParam* initPar
     if (const auto value = param_sfo->GetString("TITLE_ID"); value.has_value()) {
         title_id = *value;
     } else {
-        UNREACHABLE_MSG("Failed to get TITLE_ID");
+        // Without a title ID the addon lookup below would scan the whole addcont directory.
+        LOG_CRITICAL(Lib_AppContent,
+                     "param.sfo has no TITLE_ID (is sce_sys/param.sfo missing from the game "
+                     "folder?); additional content will not be loaded");
+        title_id.clear();
     }
     const auto addon_path = addons_dir / title_id;
-    if (std::filesystem::exists(addon_path)) {
+    if (!title_id.empty() && std::filesystem::exists(addon_path)) {
         for (const auto& entry : std::filesystem::directory_iterator(addon_path)) {
             if (entry.is_directory()) {
                 // Look for a param.sfo in the additional content directory.
